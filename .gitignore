@@ -2,3 +2,19 @@
 .gradle/
 .vscode/
 build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Test iteration artifacts (development scratch)
+*.log
+test_rdbg*.sh
+test_rdbg*.py
+test_full*.sh
+test_full*.log
+test_quick*.sh
+
+# VS Code extension builds
+*.vsix
