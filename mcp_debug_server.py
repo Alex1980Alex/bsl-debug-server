@@ -304,13 +304,41 @@ class RDBGClient:
         except asyncio.CancelledError:
             pass
 
+    # Real-world finding 2026-05-09 §13.18: RDBG может emit `cmdIDNum=N` без
+    # literal `cmdId="literal"`. Map ordinal → cmdId per yukon39 DBGUIExtCmds
+    # enum order (see DBGUIExtCmds.java).
+    _CMD_ID_NUM_TO_LITERAL = {
+        "0": "unknown",
+        "1": "targetStarted",
+        "2": "targetQuit",
+        "3": "correctedBP",
+        "4": "rteProcessing",
+        "5": "rteOnBPConditionProcessing",
+        "6": "measureResultProcessing",
+        "7": "callStackFormed",
+        "8": "exprEvaluated",
+        "9": "valueModified",
+        "10": "errorViewInfo",
+        "11": "ForegroundHelperSet",
+        "12": "ForegroundHelperRequest",
+        "13": "ForegroundHelperProcess",
+    }
+
     async def _handle_command(self, cmd: dict) -> None:
         """Process single DBGUIExtCmdInfo* event from ping response.
 
         Roadmap §13.12 spec — see cache/dbgs-rdbg-debug-server.md.
-        XML wire literal `cmdId` (lowercase) is matched, NOT enum names.
+        XML wire literal `cmdId` (lowercase) is matched; if absent, fallback
+        on `cmdIDNum` ordinal mapping (real-world finding §13.18 — production
+        RDBG sometimes emits cmdIDNum without literal cmdId).
         """
         cmd_type = cmd.get("cmdId") or ""
+        if not cmd_type:
+            num = cmd.get("cmdIDNum") or ""
+            if isinstance(num, str) and num in self._CMD_ID_NUM_TO_LITERAL:
+                cmd_type = self._CMD_ID_NUM_TO_LITERAL[num]
+                log.debug("[event] cmdId derived from cmdIDNum=%s -> %s",
+                          num, cmd_type)
         # Extract target_id — payload может иметь nested targetID или targetIDStr
         target_id = self._extract_target_id(cmd)
 

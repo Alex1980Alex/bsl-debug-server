@@ -262,6 +262,36 @@ class TestHandleCommand:
         await client._handle_command({"cmdId": "BogusEvent", "targetID": GOOD_UUID})
         assert client._stopped_targets == set()
 
+    async def test_cmdidnum_fallback_target_started(self, client):
+        # Real-world finding 2026-05-09 §13.18: RDBG может emit cmdIDNum=1 без cmdId
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        await client._handle_command({
+            "cmdIDNum": "1",  # 1 = targetStarted per DBGUIExtCmds enum
+            "targetID": GOOD_UUID,
+        })
+        client.attach_debug_targets.assert_awaited_once_with([GOOD_UUID])
+        assert GOOD_UUID in client._known_attached_targets
+
+    async def test_cmdidnum_fallback_call_stack_formed(self, client):
+        await client._handle_command({
+            "cmdIDNum": "7",  # 7 = callStackFormed
+            "targetID": GOOD_UUID,
+            "callStack": [{"_tag": "frame"}],
+            "stopByBP": "true",
+        })
+        assert client._last_stopped_target_id == GOOD_UUID
+        assert client._stop_reason_by_target[GOOD_UUID] == "breakpoint"
+
+    async def test_explicit_cmdid_overrides_cmdidnum(self, client):
+        # If both present, literal cmdId wins (yukon39 wire format expectation)
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        await client._handle_command({
+            "cmdId": "targetStarted",
+            "cmdIDNum": "999",  # bogus ordinal — must be ignored
+            "targetID": GOOD_UUID,
+        })
+        client.attach_debug_targets.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # _ensure_target_attached — idempotent guard
