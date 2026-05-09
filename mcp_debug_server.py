@@ -11,6 +11,7 @@ URL format: {debugServerURL}/e1crdbg/rdbg?cmd={command}
 Note: only 'ping' uses &dbgui={sessionId} in URL.
 """
 
+import asyncio
 import json
 import logging
 import sys
@@ -36,6 +37,17 @@ NS = {
     "auto": "http://v8.1c.ru/8.3/debugger/debugAutoAttach",
     "bp": "http://v8.1c.ru/8.3/debugger/debugBreakpoints",
 }
+
+# Magic propertyID UUIDs per BSL module kind (yukon39/bsl-debug-server ModulePropertyId.java)
+MODULE_PROPERTY_IDS = {
+    "CommonModule":  "d5963243-262e-4398-b4d7-fb16d06484f6",
+    "ManagerModule": "d1b64a2c-8078-4982-8190-8f81aefda192",
+    "ObjectModule":  "a637f77f-3840-441d-a1c3-699c8c5cb7e0",
+    "RecordSetModule": "9f36fd70-4bf4-47f6-b235-935f73aab43f",
+    "FormModule":    "32e087ab-1491-49b6-aba7-43571b41ac2b",
+    "CommandModule": "078a6af8-d22c-4248-9c33-7e90075a3d2c",
+}
+ZERO_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 def _build_request(*children_xml: str) -> str:
@@ -136,6 +148,17 @@ class RDBGClient:
         self._http = httpx.AsyncClient(timeout=30.0, headers=self.HEADERS)
         self._attached = False
         self._registered = False
+        self._ping_task: Optional[asyncio.Task] = None
+
+        # Roadmap §13 (post-BP-fire handshake): event-loop state.
+        # Set by _handle_command() when ping returns DBGUIExtCmdInfo* events.
+        # Mirrors yukon39 ContextServerEventSubscriber + Debugee.run() dispatch.
+        self._stopped_targets: set[str] = set()  # targets currently in stop state
+        self._last_stopped_target_id: Optional[str] = None
+        self._last_stack_by_target: dict[str, list[dict]] = {}
+        self._stop_reason_by_target: dict[str, str] = {}  # "breakpoint" | "step" | "exception"
+        self._last_exception_by_target: dict[str, dict] = {}
+        self._known_attached_targets: set[str] = set()  # idempotency for auto-attach
 
     async def _post(self, command: str, body: str,
                     include_dbgui_url: bool = False) -> ET.Element:
@@ -145,7 +168,13 @@ class RDBGClient:
             url += f"&dbgui={self.session_id}"
         log.debug("POST %s", url)
         resp = await self._http.post(url, content=body)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            err_body = (resp.text or "")[:2000]
+            log.error("RDBG %s -> HTTP %s body=%s", command, resp.status_code, err_body)
+            raise httpx.HTTPStatusError(
+                f"RDBG {command} {resp.status_code}: {err_body}",
+                request=resp.request, response=resp,
+            )
         text = resp.text.lstrip("\ufeff")
         if not text:
             return ET.Element("empty")
@@ -193,8 +222,145 @@ class RDBGClient:
                 result = elem.text.strip()
         self._attached = True
         self._registered = result == "registered"
+        # Background ping keeps RDBG session alive — без него dbgs.exe GC-нет UI
+        if self._registered and (self._ping_task is None or self._ping_task.done()):
+            self._ping_task = asyncio.create_task(self._ping_loop())
         return {"result": result, "session_id": self.session_id,
                 "fully_registered": self._registered}
+
+    async def _ping_loop(self) -> None:
+        """Periodic ping: keep session alive AND dispatch DBGUIExtCmdInfo events.
+
+        Roadmap §13 (post-BP-fire handshake): mirrors yukon39 Debugee.run()
+        dispatch loop. ping() returns list of DBGUIExtCmdInfo* commands;
+        each is fed to _handle_command() which auto-attaches new targets,
+        caches stack on stop events, etc.
+
+        Sequential await per command (NO asyncio.gather) — preserves event
+        ordering. Race condition `targetStarted` + `callStackFormed` для
+        одного target обрабатывается корректно: attach-then-cache.
+        """
+        try:
+            while self._attached and self._registered:
+                await asyncio.sleep(2.0)
+                try:
+                    commands = await self.ping()
+                    for cmd in commands:
+                        try:
+                            await self._handle_command(cmd)
+                        except Exception as e:
+                            log.warning("event handler failed for %s: %s",
+                                        cmd.get("cmdId") or cmd.get("_tag"), e)
+                except Exception as e:
+                    log.debug("ping failed: %s", e)
+        except asyncio.CancelledError:
+            pass
+
+    async def _handle_command(self, cmd: dict) -> None:
+        """Process single DBGUIExtCmdInfo* event from ping response.
+
+        Roadmap §13.12 spec — see cache/dbgs-rdbg-debug-server.md.
+        XML wire literal `cmdId` (lowercase) is matched, NOT enum names.
+        """
+        cmd_type = cmd.get("cmdId") or ""
+        # Extract target_id — payload может иметь nested targetID или targetIDStr
+        target_id = self._extract_target_id(cmd)
+
+        if cmd_type == "targetStarted":
+            # 🔴 CRITICAL: auto-attach NEW targets (rphost при posting документа)
+            if target_id and target_id not in self._known_attached_targets:
+                try:
+                    await self.attach_debug_targets([target_id])
+                    self._known_attached_targets.add(target_id)
+                    log.info("[event] Started: target %s → attached", target_id[:8])
+                except Exception as e:
+                    log.warning("auto-attach failed for %s: %s", target_id[:8], e)
+
+        elif cmd_type == "callStackFormed":
+            # 🔴 CRITICAL: stop event — stack уже в payload, no pull request needed
+            if not target_id:
+                log.warning("callStackFormed without target_id, skipping")
+                return
+            self._stopped_targets.add(target_id)
+            self._last_stopped_target_id = target_id
+            stack_raw = cmd.get("callStack")
+            stack: list[dict] = []
+            if isinstance(stack_raw, list):
+                stack = stack_raw
+            elif isinstance(stack_raw, dict):
+                stack = [stack_raw]
+            self._last_stack_by_target[target_id] = stack
+            stop_by_bp = str(cmd.get("stopByBP", "")).lower() == "true"
+            self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
+            log.info("[event] CallStackFormed: target=%s frames=%d reason=%s",
+                     target_id[:8], len(stack), self._stop_reason_by_target[target_id])
+
+        elif cmd_type == "rteProcessing":
+            # 🟠 IMPORTANT: unhandled exception — also a stop event
+            if not target_id:
+                log.warning("rteProcessing without target_id, skipping")
+                return
+            self._stopped_targets.add(target_id)
+            self._last_stopped_target_id = target_id
+            stack_raw = cmd.get("callStack")
+            stack = stack_raw if isinstance(stack_raw, list) else \
+                    [stack_raw] if isinstance(stack_raw, dict) else []
+            self._last_stack_by_target[target_id] = stack
+            self._stop_reason_by_target[target_id] = "exception"
+            exc = cmd.get("exception")
+            if isinstance(exc, dict):
+                self._last_exception_by_target[target_id] = exc
+            log.warning("[event] RTE: target=%s exception_present=%s frames=%d",
+                        target_id[:8], bool(exc), len(stack))
+
+        elif cmd_type == "targetQuit":
+            if target_id:
+                self._stopped_targets.discard(target_id)
+                self._last_stack_by_target.pop(target_id, None)
+                self._stop_reason_by_target.pop(target_id, None)
+                self._last_exception_by_target.pop(target_id, None)
+                self._known_attached_targets.discard(target_id)
+                log.info("[event] Quit: target=%s", target_id[:8])
+
+        elif cmd_type == "correctedBP":
+            log.warning("[event] BP corrected to adjusted line for target %s",
+                        (target_id or "?")[:8])
+
+        elif cmd_type in ("ForegroundHelperSet", "ForegroundHelperRequest",
+                           "ForegroundHelperProcess", "measureResultProcessing",
+                           "errorViewInfo", "rteOnBPConditionProcessing",
+                           "exprEvaluated", "valueModified", "unknown", ""):
+            log.debug("[event] Skipping %s", cmd_type or "<empty>")
+
+        else:
+            log.debug("[event] Unrecognised cmdId=%r tag=%r", cmd_type, cmd.get("_tag"))
+
+    _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+    @classmethod
+    def _extract_target_id(cls, cmd: dict) -> Optional[str]:
+        """Extract target UUID from event payload (reviewer-recommended fix 2026-05-09).
+
+        Payload может содержать:
+          - "targetID": {"_tag": "DebugTargetIdStr", "id": "<uuid>"}
+          - "targetID": "<uuid>" (flat)
+          - "targetIDStr": ...
+
+        Last-resort fallback ОТБРОШЕН — раньше брал первое попавшееся
+        non-_tag string, что могло вернуть `requestQueueID` или другой
+        non-UUID. Теперь strict UUID-format validation на all paths.
+        """
+        for key in ("targetID", "targetIDStr"):
+            val = cmd.get(key)
+            if isinstance(val, str) and cls._UUID_RE.match(val):
+                return val
+            if isinstance(val, dict):
+                # Nested struct — try common id fields, validate UUID format
+                for inner_key in ("id", "_value", "uuid"):
+                    inner = val.get(inner_key)
+                    if isinstance(inner, str) and cls._UUID_RE.match(inner):
+                        return inner
+        return None
 
     async def init_settings(self, target_types: list[str] | None = None) -> bool:
         """Initialize debug settings with autoAttach configuration."""
@@ -210,6 +376,8 @@ class RDBGClient:
         return True
 
     async def detach(self) -> bool:
+        if self._ping_task and not self._ping_task.done():
+            self._ping_task.cancel()
         body = _build_request(
             _rdbg("infoBaseAlias", self.infobase_alias),
             _rdbg("idOfDebuggerUI", self.session_id),
@@ -264,8 +432,69 @@ class RDBGClient:
                                 include_dbgui_url=True)
         return _parse_response(root)
 
-    async def get_call_stack(self, target_uuid: str) -> list[dict]:
-        """Get call stack. Note: uses 'id' field, not 'targetID'."""
+    # -- Post-BP-fire helpers (roadmap §13) --------------------------------
+
+    @property
+    def last_stopped_target_id(self) -> Optional[str]:
+        """Last target that hit BP / step / exception (set by ping event-loop).
+
+        Public accessor для wrapper'ов и external callers (replaces
+        accessing private `_last_stopped_target_id` — reviewer fix 2026-05-09).
+        """
+        return self._last_stopped_target_id
+
+    def _resolve_target_uuid(self, target_uuid: Optional[str]) -> Optional[str]:
+        """Fallback to last stopped target if caller didn't specify.
+
+        Roadmap §13.12 / P1.3: tools без явного target_id (например,
+        debug_stack_trace) подхватывают последний stopped target из
+        ping event-loop'а, а не делают get_targets pull (который может
+        lag за несколько секунд).
+        """
+        if target_uuid:
+            return target_uuid
+        return self._last_stopped_target_id
+
+    async def _ensure_target_attached(self, target_uuid: str) -> None:
+        """Idempotent attach перед eval/step (roadmap §13 P1.2 race-window).
+
+        Если ping event-loop уже attached target — это NO-OP (по факту
+        повторный POST attachDetachDbgTargets, который RDBG accepts).
+        Защищает tools от race window: ping взялся каждые 2с, а tool
+        вызывается через 0.1с после BP-fire — без этой страховки RDBG
+        вернёт 400 «Предмет отладки не зарегистрирован».
+        """
+        if not target_uuid:
+            return
+        if target_uuid in self._known_attached_targets:
+            return  # already attached via ping event
+        try:
+            await self.attach_debug_targets([target_uuid])
+            self._known_attached_targets.add(target_uuid)
+            log.debug("[ensure_attached] target %s attached on demand", target_uuid[:8])
+        except Exception as e:
+            log.warning("[ensure_attached] %s failed: %s", target_uuid[:8], e)
+
+    async def get_call_stack(self, target_uuid: Optional[str] = None) -> list[dict]:
+        """Get call stack. Roadmap §13: prefer cached stack from ping events.
+
+        yukon39 pattern: stack arrives push в DBGUIExtCmdInfoCallStackFormed.
+        Сначала проверяем cache, fallback на pull-request только если miss.
+        """
+        target_uuid = self._resolve_target_uuid(target_uuid)
+        if not target_uuid:
+            log.warning("get_call_stack: no target_uuid and no last_stopped")
+            return []
+
+        # Cached push-stack (preferred path)
+        cached = self._last_stack_by_target.get(target_uuid)
+        if cached:
+            log.debug("[get_call_stack] cache hit target=%s frames=%d",
+                      target_uuid[:8], len(cached))
+            return cached
+
+        # Pull fallback — может вернуть 400 если target не attached
+        await self._ensure_target_attached(target_uuid)
         body = _build_request(
             self._base_fields(),
             _rdbg("id", _target_id_light(target_uuid)),
@@ -279,9 +508,17 @@ class RDBGClient:
 
     # -- Evaluation API ----------------------------------------------------
 
-    async def eval_local_variables(self, target_uuid: str,
+    async def eval_local_variables(self, target_uuid: Optional[str] = None,
                                     stack_level: int = 0) -> list[dict]:
-        """Evaluate local variables at a breakpoint (list all variables)."""
+        """Evaluate local variables at a breakpoint (list all variables).
+
+        Roadmap §13 P1.2: idempotent re-attach перед запросом для защиты
+        от race window (ping event-loop не успел обработать stop event).
+        """
+        target_uuid = self._resolve_target_uuid(target_uuid)
+        if not target_uuid:
+            raise ValueError("eval_local_variables: no target_uuid and no last_stopped")
+        await self._ensure_target_attached(target_uuid)
         body = _build_request(
             self._base_fields(),
             _rdbg("calcWaitingTime", "3"),
@@ -291,9 +528,19 @@ class RDBGClient:
         root = await self._post("evalLocalVariables", body)
         return _parse_response(root)
 
-    async def eval_expression(self, target_uuid: str, expression: str,
+    async def eval_expression(self, expression: str,
+                               target_uuid: Optional[str] = None,
                                stack_level: int = 0) -> list[dict]:
-        """Evaluate a specific BSL expression at a breakpoint."""
+        """Evaluate a specific BSL expression at a breakpoint.
+
+        Roadmap §13 P1.2: idempotent re-attach + fallback на last_stopped.
+        Note: signature reordered — `expression` теперь первый positional
+        param, `target_uuid` опциональный (defaults to last stopped).
+        """
+        target_uuid = self._resolve_target_uuid(target_uuid)
+        if not target_uuid:
+            raise ValueError("eval_expression: no target_uuid and no last_stopped")
+        await self._ensure_target_attached(target_uuid)
         expr_result_id = str(uuid.uuid4())
         src_calc_info = (
             _calc("expressionResultID", expr_result_id)
@@ -301,7 +548,7 @@ class RDBGClient:
                     _calc("itemType", "expression")
                     + _calc("expression", expression))
         )
-        pres_options = _calc("maxTextSize", "1000")
+        pres_options = _calc("maxTextSize", "4096")  # P2.3: was 1000, raised для composite types
         expr_xml = (
             _calc("stackLevel", str(stack_level))
             + _calc("srcCalcInfo", src_calc_info)
@@ -318,14 +565,35 @@ class RDBGClient:
 
     # -- Control API -------------------------------------------------------
 
-    async def step(self, target_uuid: str, action: str = "Continue") -> list[dict]:
-        """Step execution. Actions: Continue, Step, StepIn, StepOut."""
+    async def step(self, action: str = "Continue",
+                   target_uuid: Optional[str] = None) -> list[dict]:
+        """Step execution. Actions: Continue, Step, StepIn, StepOut.
+
+        Roadmap §13 P1.2 + P2.2 Continue resume semantic:
+          1. Resolve target_uuid (fallback to last_stopped_target_id)
+          2. Idempotent re-attach
+          3. Send step action
+          4. Drop target из _stopped_targets (running again)
+        Note: signature reordered — `action` первый, `target_uuid` опциональный.
+        """
+        target_uuid = self._resolve_target_uuid(target_uuid)
+        if not target_uuid:
+            raise ValueError("step: no target_uuid and no last_stopped")
+        await self._ensure_target_attached(target_uuid)
         body = _build_request(
             self._base_fields(),
             _rdbg("targetID", _target_id_light(target_uuid)),
             _rdbg("action", action),
         )
         root = await self._post("step", body)
+        # After step, target is running — drop from stopped set.
+        # Next CallStackFormed/RTE event will re-add it if hit again.
+        # Reviewer fix 2026-05-09: also clear stale exception cache so
+        # subsequent step.Continue from RTE doesn't see ghost exception.
+        self._stopped_targets.discard(target_uuid)
+        self._last_exception_by_target.pop(target_uuid, None)
+        if self._last_stopped_target_id == target_uuid:
+            self._last_stopped_target_id = None
         return _parse_response(root)
 
     # -- Breakpoints API -----------------------------------------------------
@@ -442,9 +710,12 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
         targets = await _client.get_targets()
         stopped = _find_stopped_target(targets)
 
-        # Auto-attach to stopped target if found
-        if stopped and _client._registered:
-            await _client.attach_debug_targets([stopped])
+        # Auto-attach to ALL targets (not just stopped) — RDBG delivers BP stops
+        # only to attached targets. Без этого BPs ставятся, но никогда не fire.
+        if _client._registered and targets:
+            all_target_ids = [t.get("id") for t in targets if t.get("id")]
+            if all_target_ids:
+                await _client.attach_debug_targets(all_target_ids)
 
         result = {
             "status": "connected",
@@ -524,16 +795,23 @@ async def debug_variables(target_id: str = "", stack_level: int = 0) -> str:
     """Read local variables at current breakpoint.
 
     Args:
-        target_id: UUID from debug_targets. If empty, auto-finds stopped target.
+        target_id: UUID from debug_targets. If empty, использует cached
+            _last_stopped_target_id (roadmap §13 P1.3) или fallback на
+            get_targets pull.
         stack_level: 0 = current frame, 1 = caller, etc.
     """
     client = _get_client()
     if not target_id:
-        targets = await client.get_targets()
-        target_id = _find_stopped_target(targets) or ""
+        # P1.3: prefer ping event-loop cached state vs slower pull
+        target_id = client.last_stopped_target_id or ""
+        if not target_id:
+            targets = await client.get_targets()
+            target_id = _find_stopped_target(targets) or ""
         if not target_id:
             return json.dumps({"error": "No stopped targets"})
-    variables = await client.eval_local_variables(target_id, stack_level)
+    variables = await client.eval_local_variables(
+        target_uuid=target_id, stack_level=stack_level,
+    )
     return json.dumps({"target_id": target_id, "variables": variables,
                        "count": len(variables), "stack_level": stack_level},
                       ensure_ascii=False, indent=2)
@@ -546,16 +824,21 @@ async def debug_evaluate(expression: str, target_id: str = "",
 
     Args:
         expression: BSL expression (e.g. "Контрагент.ИНН", "ТекущаяДата()")
-        target_id: UUID from debug_targets. If empty, auto-finds stopped target.
+        target_id: UUID from debug_targets. If empty, использует ping
+            cached state (P1.3) или fallback на get_targets pull.
         stack_level: 0 = current frame.
     """
     client = _get_client()
     if not target_id:
-        targets = await client.get_targets()
-        target_id = _find_stopped_target(targets) or ""
+        target_id = client.last_stopped_target_id or ""
+        if not target_id:
+            targets = await client.get_targets()
+            target_id = _find_stopped_target(targets) or ""
         if not target_id:
             return json.dumps({"error": "No stopped targets"})
-    result = await client.eval_expression(target_id, expression, stack_level)
+    result = await client.eval_expression(
+        expression=expression, target_uuid=target_id, stack_level=stack_level,
+    )
     return json.dumps({"expression": expression, "result": result},
                       ensure_ascii=False, indent=2)
 
@@ -563,26 +846,38 @@ async def debug_evaluate(expression: str, target_id: str = "",
 @mcp.tool()
 async def debug_set_breakpoint(
     object_id: str,
-    property_id: str,
     line: int,
-    module_type: str = "ExtMDModule",
+    module_type: str = "CommonModule",
+    property_id: str = "",
 ) -> str:
     """Set a breakpoint in a BSL module.
 
-    Use edt-mcp get_metadata_details to find objectID and propertyID UUIDs.
-
     Args:
-        object_id: UUID of metadata object (DataProcessor, Document, etc.)
-        property_id: UUID of the form or module within the object.
-        line: Line number to set breakpoint on.
-        module_type: BSLModuleType: ExtMDModule (form modules),
-                     ConfigModule (common modules), SystemModule (session module).
+        object_id: UUID of metadata object (CommonModule UUID, Document UUID, ...)
+            from edt-mcp get_metadata_details.
+        property_id: Optional explicit propertyID UUID. Leave empty to auto-resolve
+            from module_type via MODULE_PROPERTY_IDS magic UUIDs.
+        line: Line number.
+        module_type: BSL module kind: CommonModule | ManagerModule | ObjectModule |
+            RecordSetModule | FormModule | CommandModule. When this matches a known
+            kind, propertyID auto-resolves and XML type is set to "ConfigModule"
+            (platform disambiguates by propertyID, not type literal).
     """
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
+    # Auto-resolve propertyID from MODULE_PROPERTY_IDS when zero/empty (RDBG silently
+    # ignores BPs with zero propertyID — see cache/dbgs-rdbg-debug-server.md §11).
+    # Re-attach moved out: debug_connect handles initial attach; повторный attach
+    # перед каждым set_breakpoint ломает established BP-delivery state в dbgs.exe.
+    xml_module_type = module_type
+    if not property_id or property_id == ZERO_UUID:
+        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
+        if kind_uuid:
+            property_id = kind_uuid
+            xml_module_type = "ConfigModule"
     result = await client.set_breakpoints(
-        module_type=module_type,
+        module_type=xml_module_type,
         object_id=object_id,
         property_id=property_id,
         lines=[line],
@@ -603,15 +898,18 @@ async def debug_step(action: str = "Continue", target_id: str = "") -> str:
 
     Args:
         action: Continue | Step | StepIn | StepOut
-        target_id: UUID from debug_targets. If empty, auto-finds stopped target.
+        target_id: UUID from debug_targets. If empty, использует ping
+            cached state (P1.3) или fallback на get_targets pull.
     """
     client = _get_client()
     if not target_id:
-        targets = await client.get_targets()
-        target_id = _find_stopped_target(targets) or ""
+        target_id = client.last_stopped_target_id or ""
+        if not target_id:
+            targets = await client.get_targets()
+            target_id = _find_stopped_target(targets) or ""
         if not target_id:
             return json.dumps({"error": "No stopped targets"})
-    result = await client.step(target_id, action)
+    result = await client.step(action=action, target_uuid=target_id)
     return json.dumps({"action": action, "target_id": target_id, "result": result},
                       ensure_ascii=False, indent=2)
 
