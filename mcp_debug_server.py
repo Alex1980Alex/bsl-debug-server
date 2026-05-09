@@ -14,6 +14,7 @@ Note: only 'ping' uses &dbgui={sessionId} in URL.
 import asyncio
 import json
 import logging
+import re
 import sys
 import uuid
 import xml.etree.ElementTree as ET
