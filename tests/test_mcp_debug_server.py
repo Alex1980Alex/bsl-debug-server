@@ -595,6 +595,17 @@ class TestCleanupStaleSession:
         ]
         assert len(detach_calls) == 0
 
+    async def test_zero_uuid_not_detached(self, client):
+        # Real-world finding 2026-05-09: getDebugID returns "00000000-..." when
+        # no stale session exists. Code must skip detach (otherwise 400 from RDBG).
+        client.get_debug_id = AsyncMock(return_value=mds.ZERO_UUID)
+        await client._cleanup_stale_session()
+        detach_calls = [
+            call for call in client._post.call_args_list
+            if call.args and call.args[0] == "detachDebugUI"
+        ]
+        assert len(detach_calls) == 0
+
     async def test_get_debug_id_failure_swallowed(self, client):
         client.get_debug_id = AsyncMock(side_effect=RuntimeError("RDBG 500"))
         # Must not raise

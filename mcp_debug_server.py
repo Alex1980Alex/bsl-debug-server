@@ -260,7 +260,8 @@ class RDBGClient:
         """
         try:
             stale_id = await self.get_debug_id()
-            if stale_id and stale_id != self.session_id:
+            if (stale_id and stale_id != self.session_id
+                    and stale_id != ZERO_UUID):
                 log.info("[cleanup_stale] existing debug UI session %s found, "
                          "attempting detach", stale_id[:8])
                 detach_body = _build_request(
