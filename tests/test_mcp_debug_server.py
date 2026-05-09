@@ -428,3 +428,185 @@ class TestEvalReattach:
         post_call = client._post.call_args
         body = post_call.args[1] if len(post_call.args) > 1 else post_call.kwargs.get("body", "")
         assert "<debugCalculations:maxTextSize>4096</debugCalculations:maxTextSize>" in body
+
+    async def test_eval_view_interface_opt_in(self, client):
+        # P2.3: viewInterface tag included only when explicitly passed
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        client._last_stopped_target_id = GOOD_UUID
+        await client.eval_expression(
+            expression="Контрагент.Ссылка", view_interface="context",
+        )
+        body = client._post.call_args.args[1]
+        assert "<debugCalculations:viewInterface>context</debugCalculations:viewInterface>" in body
+
+    async def test_eval_no_view_interface_by_default(self, client):
+        # Default behavior — viewInterface tag absent (backward compat)
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        client._last_stopped_target_id = GOOD_UUID
+        await client.eval_expression(expression="x")
+        body = client._post.call_args.args[1]
+        assert "viewInterface" not in body
+
+    async def test_eval_custom_max_text_size(self, client):
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        client._last_stopped_target_id = GOOD_UUID
+        await client.eval_expression(expression="БольшаяТаблица", max_text_size=16384)
+        body = client._post.call_args.args[1]
+        assert "<debugCalculations:maxTextSize>16384</debugCalculations:maxTextSize>" in body
+
+
+# ---------------------------------------------------------------------------
+# P2.4 Diagnostic methods (get_breakpoints, get_target_state)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestGetBreakpointsCache:
+    async def test_empty_cache_initially(self, client):
+        assert await client.get_breakpoints() == []
+
+    async def test_cache_populated_on_set_breakpoints(self, client):
+        await client.set_breakpoints(
+            module_type="ConfigModule",
+            object_id=GOOD_UUID,
+            property_id=ANOTHER_UUID,
+            lines=[10, 20],
+        )
+        bps = await client.get_breakpoints()
+        assert len(bps) == 1
+        assert bps[0]["lines"] == [10, 20]
+        assert bps[0]["object_id"] == GOOD_UUID
+
+    async def test_multiple_set_breakpoints_accumulate(self, client):
+        for line in (5, 15, 25):
+            await client.set_breakpoints(
+                module_type="CommonModule",
+                object_id=GOOD_UUID,
+                property_id=ANOTHER_UUID,
+                lines=[line],
+            )
+        bps = await client.get_breakpoints()
+        assert len(bps) == 3
+        assert [bp["lines"][0] for bp in bps] == [5, 15, 25]
+
+    async def test_cache_returns_copy_not_reference(self, client):
+        await client.set_breakpoints(
+            module_type="CommonModule",
+            object_id=GOOD_UUID, property_id=ANOTHER_UUID, lines=[1],
+        )
+        bps = await client.get_breakpoints()
+        bps.clear()  # mutate returned list
+        # Internal cache still intact
+        assert len(await client.get_breakpoints()) == 1
+
+    async def test_set_breakpoints_with_version(self, client):
+        # §6.1: version field propagates to XML body when non-empty
+        await client.set_breakpoints(
+            module_type="ConfigModule",
+            object_id=GOOD_UUID, property_id=ANOTHER_UUID, lines=[1],
+            version="1.0.42",
+        )
+        body = client._post.call_args.args[1]
+        assert "<debugBaseData:version>1.0.42</debugBaseData:version>" in body
+        cached = (await client.get_breakpoints())[0]
+        assert cached["version"] == "1.0.42"
+
+    async def test_set_breakpoints_empty_version_omits_xml(self, client):
+        await client.set_breakpoints(
+            module_type="CommonModule",
+            object_id=GOOD_UUID, property_id=ANOTHER_UUID, lines=[1],
+        )
+        body = client._post.call_args.args[1]
+        # Namespaced tag absent (note: XML declaration `<?xml version=...?>`
+        # has substring "version" — match the full debugBaseData:version tag)
+        assert "<debugBaseData:version>" not in body
+
+
+@pytest.mark.asyncio
+class TestGetTargetState:
+    async def test_session_state_when_no_uuid(self, client):
+        # yukon39 pattern: getDbgTargetState без id → state UI session
+        root = ET.Element("root")
+        ET.SubElement(root, "state").text = "Worked"
+        ET.SubElement(root, "name").text = "Background server"
+        client._post = AsyncMock(return_value=root)
+
+        result = await client.get_target_state(target_uuid=None)
+
+        client._post.assert_awaited_once()
+        assert result["state"] == "Worked"
+        assert result["name"] == "Background server"
+
+    async def test_per_target_via_get_targets_filter(self, client):
+        # When target_uuid given → filter through get_targets()
+        client.get_targets = AsyncMock(return_value=[
+            {"id": GOOD_UUID, "state": "StopOnNextLine", "userName": "Admin"},
+            {"id": ANOTHER_UUID, "state": "Worked"},
+        ])
+        result = await client.get_target_state(target_uuid=GOOD_UUID)
+        assert result["state"] == "StopOnNextLine"
+        assert result["userName"] == "Admin"
+
+    async def test_per_target_not_found(self, client):
+        client.get_targets = AsyncMock(return_value=[
+            {"id": ANOTHER_UUID, "state": "Worked"},
+        ])
+        result = await client.get_target_state(target_uuid=GOOD_UUID)
+        assert result["_tag"] == "not_found"
+        assert result["target_uuid"] == GOOD_UUID
+
+
+# ---------------------------------------------------------------------------
+# §6.3 Stale Debug UI session cleanup
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestCleanupStaleSession:
+    async def test_no_stale_session_no_op(self, client):
+        # get_debug_id returns None — nothing to clean
+        client.get_debug_id = AsyncMock(return_value=None)
+        await client._cleanup_stale_session()
+        # _post was never called for detach
+        assert all(
+            "detachDebugUI" not in (call.args[0] if call.args else "")
+            for call in client._post.call_args_list
+        )
+
+    async def test_stale_session_detached(self, client):
+        stale_uuid = "deadbeef-dead-beef-dead-beefdeadbeef"
+        client.get_debug_id = AsyncMock(return_value=stale_uuid)
+        await client._cleanup_stale_session()
+
+        # Verify detachDebugUI was called for the stale id
+        detach_calls = [
+            call for call in client._post.call_args_list
+            if call.args and call.args[0] == "detachDebugUI"
+        ]
+        assert len(detach_calls) == 1
+        body = detach_calls[0].args[1]
+        assert stale_uuid in body
+
+    async def test_same_session_id_not_detached(self, client):
+        # Edge case: getDebugID returns OUR session_id (we are still alive) → skip
+        client.get_debug_id = AsyncMock(return_value=client.session_id)
+        await client._cleanup_stale_session()
+        detach_calls = [
+            call for call in client._post.call_args_list
+            if call.args and call.args[0] == "detachDebugUI"
+        ]
+        assert len(detach_calls) == 0
+
+    async def test_get_debug_id_failure_swallowed(self, client):
+        client.get_debug_id = AsyncMock(side_effect=RuntimeError("RDBG 500"))
+        # Must not raise
+        await client._cleanup_stale_session()
+
+    async def test_attach_invokes_cleanup_by_default(self, client):
+        client.get_debug_id = AsyncMock(return_value=None)
+        # _post mock returns empty Element — attach parses "registered" by absence
+        await client.attach()
+        client.get_debug_id.assert_awaited_once()
+
+    async def test_attach_skip_cleanup_when_disabled(self, client):
+        client.get_debug_id = AsyncMock(return_value=None)
+        await client.attach(cleanup_stale=False)
+        client.get_debug_id.assert_not_called()

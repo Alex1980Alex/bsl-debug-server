@@ -161,6 +161,11 @@ class RDBGClient:
         self._last_exception_by_target: dict[str, dict] = {}
         self._known_attached_targets: set[str] = set()  # idempotency for auto-attach
 
+        # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
+        # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
+        # Keyed by (object_id, property_id), value = full set_breakpoints request payload.
+        self._set_breakpoints_cache: list[dict] = []
+
     async def _post(self, command: str, body: str,
                     include_dbgui_url: bool = False) -> ET.Element:
         """POST to RDBG endpoint. Only ping uses dbgui in URL."""
@@ -210,8 +215,18 @@ class RDBGClient:
                 return elem.text.strip()
         return None
 
-    async def attach(self) -> dict:
-        """Attach as debug UI. Returns 'registered' or 'ibInDebug'."""
+    async def attach(self, cleanup_stale: bool = True) -> dict:
+        """Attach as debug UI. Returns 'registered' or 'ibInDebug'.
+
+        Roadmap §6.3 (2026-05-09): cleanup_stale=True пытается detach
+        существующую Debug UI session с тем же infobase_alias перед attach —
+        защита от race window после wrapper crash без graceful detach (старая
+        session живёт в dbgs.exe ~60с до GC, новый wrapper попадает на
+        `ibInDebug`). Не bullet-proof: getDebugID возвращает только OUR
+        session_id, чужие debug UI (EDT/Конфигуратор) этим не сбросить.
+        """
+        if cleanup_stale:
+            await self._cleanup_stale_session()
         body = _build_request(
             self._base_fields(),
             _rdbg("options", _rdbg("foregroundAbility", "false")),
@@ -228,6 +243,37 @@ class RDBGClient:
             self._ping_task = asyncio.create_task(self._ping_loop())
         return {"result": result, "session_id": self.session_id,
                 "fully_registered": self._registered}
+
+    async def _cleanup_stale_session(self) -> None:
+        """Probe getDebugID — если existing session ID найден, попытаться detach.
+
+        Roadmap §6.3: После wrapper crash без detach старая session живёт в
+        dbgs.exe ~60с. Новый wrapper-instance с FRESH session_id всё равно
+        получит «ibInDebug» т.к. RDBG считает infobase занятой. Workaround:
+        перед attach спросить getDebugID и для каждой найденной (читай:
+        нашей prior session, ассоциированной с infoBaseAlias) попытаться
+        detachDebugUI с её session_id.
+
+        Лимиты: getDebugID возвращает ОДИН id (а не список); если у RDBG
+        нет конкретно-нашей prior session, вернёт пустоту. Если есть —
+        detach по нему очистит slot.
+        """
+        try:
+            stale_id = await self.get_debug_id()
+            if stale_id and stale_id != self.session_id:
+                log.info("[cleanup_stale] existing debug UI session %s found, "
+                         "attempting detach", stale_id[:8])
+                detach_body = _build_request(
+                    _rdbg("infoBaseAlias", self.infobase_alias),
+                    _rdbg("idOfDebuggerUI", stale_id),
+                )
+                try:
+                    await self._post("detachDebugUI", detach_body)
+                    log.info("[cleanup_stale] stale session %s detached", stale_id[:8])
+                except Exception as e:
+                    log.debug("[cleanup_stale] detach failed (may be OK): %s", e)
+        except Exception as e:
+            log.debug("[cleanup_stale] getDebugID failed (no stale session): %s", e)
 
     async def _ping_loop(self) -> None:
         """Periodic ping: keep session alive AND dispatch DBGUIExtCmdInfo events.
@@ -405,6 +451,42 @@ class RDBGClient:
 
     # -- Observation API ---------------------------------------------------
 
+    async def get_target_state(self, target_uuid: Optional[str] = None) -> dict:
+        """Get state of a single debug target (RDBGGetDbgTargetStateRequest).
+
+        Roadmap §4.4 P2.4 diagnostic. yukon39 не передаёт `id` в этом запросе —
+        Java-ской `getTargetState()` шлёт без targetID и сервер возвращает
+        состояние UI session (а не конкретного target). Наш wrapper делает
+        то же поведение если target_uuid не задан, иначе ищет в результатах
+        get_targets() (RDBG single-state endpoint имеет недокументированный
+        contract — safe path: фильтр по нашему `get_targets`).
+        """
+        if target_uuid is None:
+            body = _build_request(self._base_fields())
+            root = await self._post("getDbgTargetState", body)
+            result: dict = {"_tag": "session_state"}
+            for child in root:
+                tag = _strip_ns(child.tag)
+                if child.text and child.text.strip():
+                    result[tag] = child.text.strip()
+            return result
+        # Per-target: использовать get_targets() и отфильтровать
+        targets = await self.get_targets()
+        for t in targets:
+            if t.get("id") == target_uuid:
+                return t
+        return {"_tag": "not_found", "target_uuid": target_uuid}
+
+    async def get_breakpoints(self) -> list[dict]:
+        """Return client-side BP cache (yukon39 BreakpointsManager pattern).
+
+        Roadmap §4.4 P2.4 diagnostic. RDBG не expose'ит server-side
+        `getBreakpoints` URL command (yukon39 source HTTPDebugClient тоже
+        его не вызывает). Мы ведём local cache по каждому successful
+        `set_breakpoints` call.
+        """
+        return list(self._set_breakpoints_cache)
+
     async def get_targets(self) -> list[dict]:
         """Get all debug target states."""
         body = _build_request(self._base_fields())
@@ -531,12 +613,26 @@ class RDBGClient:
 
     async def eval_expression(self, expression: str,
                                target_uuid: Optional[str] = None,
-                               stack_level: int = 0) -> list[dict]:
+                               stack_level: int = 0,
+                               view_interface: Optional[str] = None,
+                               max_text_size: int = 4096) -> list[dict]:
         """Evaluate a specific BSL expression at a breakpoint.
 
         Roadmap §13 P1.2: idempotent re-attach + fallback на last_stopped.
         Note: signature reordered — `expression` теперь первый positional
         param, `target_uuid` опциональный (defaults to last stopped).
+
+        Args:
+            expression: BSL выражение
+            target_uuid: explicit target или None (fallback на last_stopped)
+            stack_level: 0 = текущий кадр
+            view_interface: §4.3 P2.3 — opt-in tag для composite types
+                (СправочникСсылка/ДокументСсылка/Структура). Передаётся
+                в presOptions.viewInterface; платформа форматирует значение
+                согласно interface (например "context" для programmer-view).
+                Default None = используем default presentation.
+            max_text_size: Максимум char для текстового представления
+                (default 4096; для очень больших таблиц поднимайте до 16384).
         """
         target_uuid = self._resolve_target_uuid(target_uuid)
         if not target_uuid:
@@ -549,11 +645,13 @@ class RDBGClient:
                     _calc("itemType", "expression")
                     + _calc("expression", expression))
         )
-        pres_options = _calc("maxTextSize", "4096")  # P2.3: was 1000, raised для composite types
+        pres_options_xml = _calc("maxTextSize", str(max_text_size))
+        if view_interface:
+            pres_options_xml += _calc("viewInterface", view_interface)
         expr_xml = (
             _calc("stackLevel", str(stack_level))
             + _calc("srcCalcInfo", src_calc_info)
-            + _calc("presOptions", pres_options)
+            + _calc("presOptions", pres_options_xml)
         )
         body = _build_request(
             self._base_fields(),
@@ -620,7 +718,10 @@ class RDBGClient:
             ext_id: Extension ID (default 0).
             url: Module URL (usually empty).
             extension_name: Extension name (usually empty).
-            version: Config version (usually empty).
+            version: Config version. Roadmap §6.1: RDBG может silently
+                дропать BPs если version не совпадает с running configVersion.
+                Empty (default) обычно works для standard configs; передавайте
+                для extensions.
         """
         module_id_xml = _base("type", module_type)
         module_id_xml += _base("objectID", object_id)
@@ -646,6 +747,17 @@ class RDBGClient:
                 + bp_infos))
         body = _build_request(self._base_fields(), workspace_xml)
         root = await self._post("setBreakpoints", body)
+        # P2.4: cache successful BP-set for client-side debug_get_breakpoints
+        self._set_breakpoints_cache.append({
+            "module_type": module_type,
+            "object_id": object_id,
+            "property_id": property_id,
+            "lines": list(lines),
+            "ext_id": ext_id,
+            "url": url,
+            "extension_name": extension_name,
+            "version": version,
+        })
         return _parse_response(root)
 
     async def close(self):
@@ -912,6 +1024,74 @@ async def debug_step(action: str = "Continue", target_id: str = "") -> str:
             return json.dumps({"error": "No stopped targets"})
     result = await client.step(action=action, target_uuid=target_id)
     return json.dumps({"action": action, "target_id": target_id, "result": result},
+                      ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic tools (roadmap §4.4 P2.4)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def debug_get_breakpoints() -> str:
+    """List currently registered breakpoints (client-side cache).
+
+    Roadmap §4.4 P2.4: RDBG не expose'ит server-side getBreakpoints URL,
+    поэтому wrapper ведёт local cache по каждому successful set_breakpoint
+    call. Используется для verification что BPs реально применились.
+    """
+    client = _get_client()
+    bps = await client.get_breakpoints()
+    return json.dumps({"breakpoints": bps, "count": len(bps)},
+                      ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_attach_targets(target_ids: list[str], attach: bool = True) -> str:
+    """Explicitly attach (or detach) debug targets to current Debug UI session.
+
+    Roadmap §4.4 P2.4: troubleshooting tool на случай если ping event-loop
+    пропустил `targetStarted` event и BPs не fire'ят на каком-то rphost.
+
+    Args:
+        target_ids: список UUIDs (получить через debug_targets)
+        attach: True = attach (default), False = detach
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    try:
+        await client.attach_debug_targets(target_ids, attach=attach)
+        if attach:
+            client._known_attached_targets.update(target_ids)
+        else:
+            for tid in target_ids:
+                client._known_attached_targets.discard(tid)
+        return json.dumps({
+            "status": "ok",
+            "action": "attach" if attach else "detach",
+            "target_ids": target_ids,
+            "count": len(target_ids),
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def debug_target_state(target_id: str = "") -> str:
+    """Get state of a single debug target (or current Debug UI session).
+
+    Roadmap §4.4 P2.4 diagnostic. Если target_id пуст — возвращает state
+    самой Debug UI session (yukon39 getTargetState без targetID); иначе
+    фильтрует результат get_targets() по target_id.
+
+    Args:
+        target_id: UUID цели или пусто для UI session state.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    state = await client.get_target_state(target_uuid=target_id or None)
+    return json.dumps({"target_id": target_id or None, "state": state},
                       ensure_ascii=False, indent=2)
 
 
