@@ -18,6 +18,7 @@ Coverage targets (lines 134..654 of mcp_debug_server.py):
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -780,6 +781,11 @@ class TestGetBreakpointsCache:
         assert bps[0]["object_id"] == GOOD_UUID
 
     async def test_multiple_set_breakpoints_accumulate(self, client):
+        # Fix #5 (2026-05-10): cache consolidates multiple set calls на one
+        # (module, property) tuple в один entry с merged lines, чтобы каждый
+        # submit отправлял FULL workspace (RDBG setBreakpoints REPLACES
+        # workspace per-call). Pre-fix expectation было «3 separate entries» —
+        # post-fix correct expectation: 1 entry с 3 lines.
         for line in (5, 15, 25):
             await client.set_breakpoints(
                 module_type="CommonModule",
@@ -788,8 +794,8 @@ class TestGetBreakpointsCache:
                 lines=[line],
             )
         bps = await client.get_breakpoints()
-        assert len(bps) == 3
-        assert [bp["lines"][0] for bp in bps] == [5, 15, 25]
+        assert len(bps) == 1
+        assert sorted(bps[0]["lines"]) == [5, 15, 25]
 
     async def test_cache_returns_copy_not_reference(self, client):
         await client.set_breakpoints(
@@ -923,13 +929,19 @@ class TestClearBreakOnNextStatement:
 @pytest.mark.asyncio
 class TestSetAutoAttachSettings:
     async def test_default_targets_server_and_managed_client(self, client):
+        # Fix #1 ROLLBACK 2026-05-10 (autonomous L2 test detected regression):
+        # RDBG XSD enum для targetType ограничен [Server, ManagedClient]; values
+        # HTTPService/WebService/BackgroundJob → HTTP 400. Default возвращён к
+        # 2 safe types. Multi-rphost IIS scenario → force-recycle (Fix #2).
         await client.set_auto_attach_settings()
         cmd, body = client._post.await_args.args
         assert cmd == "setAutoAttachSettings"
         assert "<debugAutoAttach:targetType>Server</debugAutoAttach:targetType>" in body
         assert "<debugAutoAttach:targetType>ManagedClient</debugAutoAttach:targetType>" in body
-        # Anti-regression: must NOT route through cmd=initSettings (pre-fix bug)
-        # and must NOT include initSettings-only field breakOnNextLine.
+        # Anti-regression: НЕ должно быть invalid XSD enum values
+        for invalid in ("HTTPService", "WebService", "BackgroundJob"):
+            assert invalid not in body
+        # Anti-regression: must NOT route через cmd=initSettings (pre-fix bug)
         assert "breakOnNextLine" not in body
 
     async def test_custom_target_types(self, client):
@@ -1006,3 +1018,1034 @@ class TestCleanupStaleSession:
         client.get_debug_id = AsyncMock(return_value=None)
         await client.attach(cleanup_stale=False)
         client.get_debug_id.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# §12.7 — cluster_load probe + session_diff + scenario validation
+# ---------------------------------------------------------------------------
+
+class TestStaleDetection:
+    """Fix A+D §12.9 — wrapper file mtime vs MCP startup timestamp."""
+
+    def test_no_stale_when_file_unchanged(self, monkeypatch):
+        # mtime <= _MODULE_LOADED_AT → no warning
+        import os
+        monkeypatch.setattr(os.path, "getmtime",
+                             lambda p: mds._MODULE_LOADED_AT - 100)
+        assert mds._get_stale_hint() is None
+
+    def test_stale_detected_when_file_newer(self, monkeypatch):
+        import os
+        # Симулируем что файл был изменён ПОСЛЕ MCP startup
+        monkeypatch.setattr(os.path, "getmtime",
+                             lambda p: mds._MODULE_LOADED_AT + 60)
+        hint = mds._get_stale_hint()
+        assert hint is not None
+        assert "/mcp reconnect" in hint
+        assert "60s" in hint
+
+    def test_oserror_returns_none_safe(self, monkeypatch):
+        import os
+        def _boom(p): raise OSError("file gone")
+        monkeypatch.setattr(os.path, "getmtime", _boom)
+        # Не raise, не блокирует — graceful None
+        assert mds._get_stale_hint() is None
+
+
+@pytest.mark.asyncio
+class TestStaleHintInResponses:
+    """Fix D §12.9 — _stale_hint propagates в MCP tool responses."""
+
+    async def test_health_check_no_stale_hint_when_fresh(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_stale_hint", lambda: None)
+        monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
+        mds._client = None
+        raw = await mds.debug_health_check()
+        result = json.loads(raw)
+        assert "stale_warning" not in result
+
+    async def test_health_check_includes_stale_warning(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_stale_hint",
+                             lambda: "Wrapper modified — reconnect please")
+        monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
+        mds._client = None
+        raw = await mds.debug_health_check()
+        result = json.loads(raw)
+        assert result["stale_warning"] == "Wrapper modified — reconnect please"
+
+    async def test_session_summary_includes_stale_hint(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_stale_hint", lambda: "stale-msg")
+        from mcp_debug_server import RDBGClient
+        c = RDBGClient(debug_url="http://test", infobase_alias="X")
+        mds._client = c
+        raw = await mds.debug_session_summary()
+        result = json.loads(raw)
+        assert result["_stale_hint"] == "stale-msg"
+
+    async def test_session_diff_includes_stale_hint(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_stale_hint", lambda: "stale-msg")
+        prev = {"session_id": "p1", "breakpoints": {}, "evaluations": {},
+                "ui_plus_retries": 0, "stop_events": []}
+        curr = {"session_id": "c1", "breakpoints": {}, "evaluations": {},
+                "ui_plus_retries": 0, "stop_events": []}
+        store = {"p1": prev, "c1": curr}
+        monkeypatch.setattr(mds, "_load_session_summary",
+                             lambda sid: store.get(sid))
+        raw = await mds.debug_session_diff(prev_session_id="p1",
+                                            curr_session_id="c1")
+        result = json.loads(raw)
+        assert result["_stale_hint"] == "stale-msg"
+
+
+class TestClusterLoadProbe:
+    """L1 §12.7 — warn если rphost connections > threshold."""
+
+    def test_no_rac_returns_warn_skip(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        result = mds._hc_probe_cluster_load()
+        assert result["status"] == "warn"
+        assert "rac.exe not found" in result["detail"]
+
+    def test_low_load_returns_pass(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda *a: "cuuid")
+        fake = MagicMock(returncode=0, stdout=(
+            "process : aaa\npid : 100\nconnections : 3\n"
+            "process : bbb\npid : 200\nconnections : 5\n"
+        ))
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        monkeypatch.delenv("BSL_DEBUG_CONN_THRESHOLD", raising=False)
+        result = mds._hc_probe_cluster_load()
+        assert result["status"] == "pass"
+        assert "≤10" in result["detail"]
+
+    def test_high_load_returns_warn_with_pids(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda *a: "cuuid")
+        fake = MagicMock(returncode=0, stdout=(
+            "process : aaa\npid : 100\nconnections : 25\n"
+            "process : bbb\npid : 200\nconnections : 3\n"
+        ))
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._hc_probe_cluster_load()
+        assert result["status"] == "warn"
+        assert "high-load" in result["detail"]
+        assert "100" in result["detail"] and "25" in result["detail"]
+        assert "fix" in result
+
+    def test_threshold_via_env_var(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda *a: "cuuid")
+        fake = MagicMock(returncode=0, stdout=(
+            "process : aaa\npid : 100\nconnections : 5\n"
+        ))
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        monkeypatch.setenv("BSL_DEBUG_CONN_THRESHOLD", "3")  # threshold ниже 5
+        result = mds._hc_probe_cluster_load()
+        assert result["status"] == "warn"
+
+
+@pytest.mark.asyncio
+class TestSessionDiff:
+    """L3 §12.7 — cross-session diff для regression detection."""
+
+    def _summary(self, sid: str, fired: int, evals: int = 0,
+                 failures: int = 0, ui_retries: int = 0) -> dict:
+        return {
+            "session_id": sid,
+            "started_at": "2026-05-10T10:00:00",
+            "infobase_alias": "X",
+            "breakpoints": {"set_count": 3, "fire_count": fired,
+                             "by_location": {}, "fire_rate": fired / 3},
+            "evaluations": {"count": evals, "failures": failures, "errors": []},
+            "ui_plus_retries": ui_retries,
+            "recycle": {"force_invoked": False, "method_used": None},
+            "stop_events": [{"ts": "t1"}] * fired,
+            "rphosts_seen": [],
+            "attached": False,
+        }
+
+    def test_diff_summaries_no_regression(self):
+        prev = self._summary("p1", fired=3, evals=5)
+        curr = self._summary("c1", fired=3, evals=5)
+        diff = mds._diff_summaries(prev, curr)
+        assert diff["verdict"] == "NO_REGRESSION"
+        assert diff["regression_indicators"] == []
+        assert diff["deltas"]["bp_fire_count"] == 0
+
+    def test_diff_summaries_detects_bp_regression(self):
+        prev = self._summary("p1", fired=3, evals=5)
+        curr = self._summary("c1", fired=2, evals=5)  # 1 BP перестал fire
+        diff = mds._diff_summaries(prev, curr)
+        assert diff["verdict"] == "REGRESSION"
+        assert diff["deltas"]["bp_fire_count"] == -1
+        assert any("regressed" in i for i in diff["regression_indicators"])
+
+    def test_diff_summaries_detects_eval_failures(self):
+        prev = self._summary("p1", fired=3, evals=5, failures=0)
+        curr = self._summary("c1", fired=3, evals=5, failures=2)
+        diff = mds._diff_summaries(prev, curr)
+        assert diff["verdict"] == "REGRESSION"
+        assert any("eval failures" in i for i in diff["regression_indicators"])
+
+    def test_diff_summaries_detects_ui_plus_retries_increase(self):
+        prev = self._summary("p1", fired=3, ui_retries=0)
+        curr = self._summary("c1", fired=3, ui_retries=4)
+        diff = mds._diff_summaries(prev, curr)
+        assert diff["verdict"] == "REGRESSION"
+        assert any("UI+ retries" in i for i in diff["regression_indicators"])
+
+    async def test_session_diff_tool_handles_missing_prev(self, monkeypatch):
+        monkeypatch.setattr(mds, "_load_session_summary", lambda sid: None)
+        raw = await mds.debug_session_diff(prev_session_id="nonexistent")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert "not found" in result["error"]
+
+    async def test_session_diff_tool_compares_two_loaded(self, monkeypatch):
+        prev = self._summary("p1", fired=3)
+        curr = self._summary("c1", fired=2)
+        store = {"p1": prev, "c1": curr}
+        monkeypatch.setattr(mds, "_load_session_summary",
+                            lambda sid: store.get(sid))
+        raw = await mds.debug_session_diff(prev_session_id="p1",
+                                            curr_session_id="c1")
+        result = json.loads(raw)
+        assert result["verdict"] == "REGRESSION"
+        assert result["prev_session"] == "p1"
+        assert result["curr_session"] == "c1"
+
+
+# ---------------------------------------------------------------------------
+# §12 Level 1 — debug_health_check probes + tool
+# ---------------------------------------------------------------------------
+
+class TestHealthCheckProbes:
+    """Pure probe helpers — mocked subprocess + socket layers."""
+
+    def test_dbgs_port_probe_pass_when_listening(self, monkeypatch):
+        # Mock socket.connect → success (no exception)
+        import socket
+        captured = {}
+
+        class FakeSocket:
+            def __init__(self, family, type_): captured["init"] = True
+            def settimeout(self, t): pass
+            def connect(self, addr): captured["addr"] = addr
+            def close(self): pass
+
+        monkeypatch.setattr(socket, "socket", FakeSocket)
+        result = mds._hc_probe_dbgs_port("localhost", 1550)
+        assert result["status"] == "pass"
+        assert "1550" in result["detail"]
+
+    def test_dbgs_port_probe_fail_on_refused(self, monkeypatch):
+        import socket
+
+        class FakeSocket:
+            def __init__(self, *a): pass
+            def settimeout(self, t): pass
+            def connect(self, addr): raise ConnectionRefusedError("nope")
+            def close(self): pass
+
+        monkeypatch.setattr(socket, "socket", FakeSocket)
+        result = mds._hc_probe_dbgs_port()
+        assert result["status"] == "fail"
+        assert "fix" in result
+
+    def test_ragent_debug_flag_pass_when_both_present(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        fake = MagicMock(returncode=0,
+                         stdout='"path\\to\\ragent.exe" -srvc -agent -debug -http -d "..."',
+                         stderr="")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._hc_probe_ragent_debug_flag()
+        assert result["status"] == "pass"
+
+    def test_ragent_debug_flag_fail_when_missing(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        fake = MagicMock(returncode=0,
+                         stdout='"path\\to\\ragent.exe" -srvc -agent', stderr="")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._hc_probe_ragent_debug_flag()
+        assert result["status"] == "fail"
+        assert "missing flags" in result["detail"]
+        assert "fix" in result
+
+    def test_ragent_debug_flag_skip_on_non_windows(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "linux")
+        result = mds._hc_probe_ragent_debug_flag()
+        assert result["status"] == "warn"
+
+    def test_rphost_baseline_pass_when_empty(self, monkeypatch):
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
+        result = mds._hc_probe_rphost_baseline()
+        assert result["status"] == "pass"
+
+    def test_rphost_baseline_warn_when_pre_existing(self, monkeypatch):
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 100, "name": "rphost.exe"},
+                                     {"pid": 200, "name": "rphost.exe"}])
+        result = mds._hc_probe_rphost_baseline()
+        assert result["status"] == "warn"
+        assert "100" in result["detail"] and "200" in result["detail"]
+        assert result["fix"] == "kill-stale-rphosts (auto-prepare action)"
+
+    def test_rac_available_pass_with_cluster(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "C:/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid",
+                            lambda *a: "11111111-2222-3333-4444-555555555555")
+        result = mds._hc_probe_rac_available()
+        assert result["status"] == "pass"
+        assert "11111111" in result["detail"]
+
+    def test_rac_available_warn_when_missing(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        result = mds._hc_probe_rac_available()
+        assert result["status"] == "warn"
+
+    def test_env_vars_reports_extras(self, monkeypatch):
+        monkeypatch.setenv("RAC_CLUSTER_USER", "Admin")
+        monkeypatch.delenv("RAC_CLUSTER_PWD", raising=False)
+        monkeypatch.setenv("BSL_DEBUG_ALLOW_SERVICE_RESTART", "true")
+        result = mds._hc_probe_env_vars()
+        assert result["status"] == "pass"
+        assert result["_extras"]["RAC_CLUSTER_USER"] is True
+        assert result["_extras"]["RAC_CLUSTER_PWD"] is False
+        assert result["_extras"]["BSL_DEBUG_ALLOW_SERVICE_RESTART"] is True
+
+    def test_sddl_au_grant_pass_when_present(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        fake = MagicMock(returncode=0,
+                         stdout="D:(A;;LCSWRPWPCR;;;AU)(A;;CCDC;;;BA)",
+                         stderr="")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._hc_probe_sddl_au_grant()
+        assert result["status"] == "pass"
+
+    def test_sddl_au_grant_warn_without_au(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        fake = MagicMock(returncode=0,
+                         stdout="D:(A;;CCDC;;;BA)(A;;CCDC;;;SY)",
+                         stderr="")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._hc_probe_sddl_au_grant()
+        assert result["status"] == "warn"
+        assert "fix" in result
+
+    def test_active_session_pass_when_no_client(self):
+        result = mds._hc_probe_active_session(None)
+        assert result["status"] == "pass"
+        assert "no active" in result["detail"]
+
+
+class TestHealthCheckRecommendation:
+    """Workflow recommender — picks path based on probe results."""
+
+    def test_read_only_when_dbgs_down(self):
+        checks = {"dbgs_port_1550": {"status": "fail"}}
+        assert mds._hc_recommend_workflow(checks) == "read-only"
+
+    def test_thin_client_when_no_pre_existing(self):
+        checks = {
+            "dbgs_port_1550": {"status": "pass"},
+            "rphost_count_baseline": {"status": "pass"},
+            "rac_exe_path": {"status": "pass"},
+        }
+        assert mds._hc_recommend_workflow(checks) == "thin-client"
+
+    def test_force_recycle_when_rphost_warn_rac_ok(self):
+        checks = {
+            "dbgs_port_1550": {"status": "pass"},
+            "rphost_count_baseline": {"status": "warn"},
+            "rac_exe_path": {"status": "pass"},
+        }
+        assert mds._hc_recommend_workflow(checks) == "force-recycle"
+
+    def test_service_restart_when_rphost_warn_rac_missing_svc_ok(self):
+        checks = {
+            "dbgs_port_1550": {"status": "pass"},
+            "rphost_count_baseline": {"status": "warn"},
+            "rac_exe_path": {"status": "warn"},
+            "env_vars": {"_extras": {"BSL_DEBUG_ALLOW_SERVICE_RESTART": True}},
+            "sddl_au_grant": {"status": "pass"},
+        }
+        assert mds._hc_recommend_workflow(checks) == "service-restart"
+
+
+@pytest.mark.asyncio
+class TestDebugHealthCheckTool:
+    """End-to-end health_check MCP tool."""
+
+    async def test_probe_mode_returns_structured_json(self, monkeypatch):
+        # Mock all probes to known-good
+        monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {
+            "dbgs_port_1550": {"status": "pass", "detail": "ok"},
+            "rphost_count_baseline": {"status": "pass", "detail": "no rphost"},
+            "env_vars": {"_extras": {"BSL_DEBUG_ALLOW_SERVICE_RESTART": False}},
+        })
+        mds._client = None
+        raw = await mds.debug_health_check()
+        result = json.loads(raw)
+        assert result["ready"] is True
+        assert result["mode"] == "probe"
+        assert "checks" in result
+        assert "elapsed_ms" in result
+        assert "recommended_workflow" in result
+
+    async def test_prepare_mode_requires_actions(self, monkeypatch):
+        monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
+        mds._client = None
+        raw = await mds.debug_health_check(mode="prepare")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert "actions" in result["error"]
+
+    async def test_prepare_rejects_non_whitelisted_actions(self, monkeypatch):
+        monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
+        mds._client = None
+        raw = await mds.debug_health_check(mode="prepare",
+                                            actions=["modify-sddl"])
+        result = json.loads(raw)
+        # action rejected, not in whitelist
+        assert any("rejected" in a.get("result", "")
+                   for a in result["actions_executed"])
+
+    async def test_prepare_kill_stale_calls_recycle(self, monkeypatch):
+        monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 999, "name": "rphost.exe"}])
+        called = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids: called.append(pids) or
+                            {"killed": pids, "failed": [], "method": "rac.turn_off"})
+        mds._client = None
+        raw = await mds.debug_health_check(mode="prepare",
+                                            actions=["kill-stale-rphosts"])
+        result = json.loads(raw)
+        assert called == [[999]]
+        assert result["actions_executed"][0]["action"] == "kill-stale-rphosts"
+
+
+# ---------------------------------------------------------------------------
+# §12.3 Level 3 — debug_session_summary metrics
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSessionSummary:
+    """Session metrics tracking + summary tool."""
+
+    async def test_no_session_returns_marker(self, monkeypatch):
+        mds._client = None
+        raw = await mds.debug_session_summary()
+        result = json.loads(raw)
+        assert result["status"] == "no_session"
+
+    async def test_summary_returns_structure(self, monkeypatch):
+        from mcp_debug_server import RDBGClient
+        c = RDBGClient(debug_url="http://test", infobase_alias="X")
+        mds._client = c
+        raw = await mds.debug_session_summary()
+        result = json.loads(raw)
+        assert "session_id" in result
+        assert "started_at" in result
+        assert result["infobase_alias"] == "X"
+        assert result["breakpoints"]["set_count"] == 0
+        assert result["breakpoints"]["fire_count"] == 0
+        assert result["evaluations"]["count"] == 0
+        assert result["ui_plus_retries"] == 0
+        assert result["recycle"]["force_invoked"] is False
+
+    async def test_summary_counts_set_breakpoints(self, monkeypatch):
+        from mcp_debug_server import RDBGClient
+        c = RDBGClient(debug_url="http://test", infobase_alias="X")
+
+        async def _fake_post(cmd, body, **kw):
+            return ET.Element("empty")
+
+        monkeypatch.setattr(c, "_post", _fake_post)
+        await c.set_breakpoints("ConfigModule", "obj1", "prop1", [10, 20])
+        await c.set_breakpoints("ConfigModule", "obj2", "prop2", [30])
+        mds._client = c
+        raw = await mds.debug_session_summary()
+        result = json.loads(raw)
+        # 3 lines total across consolidated cache
+        assert result["breakpoints"]["set_count"] == 3
+
+    async def test_markdown_format_renders(self, monkeypatch):
+        from mcp_debug_server import RDBGClient
+        c = RDBGClient(debug_url="http://test", infobase_alias="X")
+        mds._client = c
+        raw = await mds.debug_session_summary(format="markdown")
+        assert raw.startswith("## Debug Session")
+        assert "Infobase: **X**" in raw
+        assert "BPs:" in raw
+        assert "UI+ retries:" in raw
+
+    async def test_eval_count_increments(self, monkeypatch):
+        from mcp_debug_server import RDBGClient
+        c = RDBGClient(debug_url="http://test", infobase_alias="X")
+        c._stopped_targets.add("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        c._last_stopped_target_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        c._known_attached_targets.add("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+
+        async def _fake_post(cmd, body, **kw):
+            # Return immediately с inline result чтобы eval не висел в await
+            root = ET.Element("response")
+            child = ET.SubElement(root, "evalExprResBaseData")
+            child.text = "result"
+            return root
+
+        monkeypatch.setattr(c, "_post", _fake_post)
+        await c.eval_expression("1+1", async_wait_timeout=0)
+        await c.eval_expression("2+2", async_wait_timeout=0)
+        assert c._eval_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Fix #5 (live finding 2026-05-10) — BP aggregation across modules
+# ---------------------------------------------------------------------------
+
+class TestAggregateBreakpoints:
+    """Pure helper: merge cached BPs + new entry into per-module groups."""
+
+    def _entry(self, oid, pid, lines, mt="ConfigModule"):
+        return {
+            "module_type": mt, "object_id": oid, "property_id": pid,
+            "lines": list(lines),
+            "ext_id": 0, "url": "", "extension_name": "", "version": "",
+        }
+
+    def test_empty_cache_single_entry(self):
+        new = self._entry("obj1", "prop1", [10, 20])
+        groups = mds._aggregate_breakpoints([], new)
+        assert len(groups) == 1
+        key = ("ConfigModule", "obj1", "prop1", 0, "", "", "")
+        assert groups[key] == [10, 20]
+
+    def test_two_lines_same_module_dedupe(self):
+        cache = [self._entry("objA", "propA", [10])]
+        new = self._entry("objA", "propA", [20])
+        groups = mds._aggregate_breakpoints(cache, new)
+        # Same module → consolidated into single key with 2 lines
+        assert len(groups) == 1
+        assert list(groups.values())[0] == [10, 20]
+
+    def test_duplicate_lines_dedupe_to_one(self):
+        cache = [self._entry("objA", "propA", [42])]
+        new = self._entry("objA", "propA", [42])
+        groups = mds._aggregate_breakpoints(cache, new)
+        assert list(groups.values())[0] == [42]
+
+    def test_different_modules_keep_separate(self):
+        cache = [self._entry("objA", "propA", [10])]
+        new = self._entry("objB", "propB", [20])
+        groups = mds._aggregate_breakpoints(cache, new)
+        assert len(groups) == 2
+
+    def test_different_property_keep_separate(self):
+        cache = [self._entry("objA", "propObj", [10])]
+        new = self._entry("objA", "propMan", [20])
+        groups = mds._aggregate_breakpoints(cache, new)
+        assert len(groups) == 2
+
+    def test_lines_sorted_in_output(self):
+        cache = [self._entry("objA", "propA", [50, 10])]
+        new = self._entry("objA", "propA", [30])
+        groups = mds._aggregate_breakpoints(cache, new)
+        assert list(groups.values())[0] == [10, 30, 50]
+
+
+@pytest.mark.asyncio
+class TestSetBreakpointsAggregation:
+    """End-to-end: set_breakpoints submits full workspace + reconciles cache."""
+
+    @pytest.fixture
+    def client_mock_post(self, monkeypatch):
+        from mcp_debug_server import RDBGClient
+        c = RDBGClient(debug_url="http://test", infobase_alias="X")
+        captured = []
+
+        async def _fake_post(cmd, body, **kwargs):
+            captured.append((cmd, body))
+            return ET.Element("empty")
+
+        monkeypatch.setattr(c, "_post", _fake_post)
+        return c, captured
+
+    async def test_two_lines_same_module_in_one_workspace(self, client_mock_post):
+        c, captured = client_mock_post
+        await c.set_breakpoints("ConfigModule", "obj1", "prop1", [10])
+        await c.set_breakpoints("ConfigModule", "obj1", "prop1", [20])
+        last_body = captured[-1][1]
+        assert "<debugBreakpoints:line>10</debugBreakpoints:line>" in last_body
+        assert "<debugBreakpoints:line>20</debugBreakpoints:line>" in last_body
+        assert last_body.count("<debugBreakpoints:moduleBPInfo>") == 1
+
+    async def test_two_modules_produce_two_module_bp_infos(self, client_mock_post):
+        c, captured = client_mock_post
+        await c.set_breakpoints("ConfigModule", "obj1", "prop1", [10])
+        await c.set_breakpoints("ConfigModule", "obj2", "prop2", [20])
+        last_body = captured[-1][1]
+        assert last_body.count("<debugBreakpoints:moduleBPInfo>") == 2
+        assert "obj1" in last_body and "obj2" in last_body
+
+    async def test_cache_reconciled_after_submit(self, client_mock_post):
+        c, _ = client_mock_post
+        await c.set_breakpoints("ConfigModule", "obj1", "prop1", [10])
+        await c.set_breakpoints("ConfigModule", "obj1", "prop1", [20])
+        assert len(c._set_breakpoints_cache) == 1
+        assert sorted(c._set_breakpoints_cache[0]["lines"]) == [10, 20]
+
+    async def test_three_bps_two_modules_full_workspace(self, client_mock_post):
+        c, captured = client_mock_post
+        # Mirror live test 2026-05-10 что вскрыл Fix #5
+        await c.set_breakpoints("ConfigModule", "obj-doc", "prop-obj", [141])
+        await c.set_breakpoints("ConfigModule", "obj-doc", "prop-obj", [145])
+        await c.set_breakpoints("ConfigModule", "obj-cm", "prop-cm", [208])
+        last_body = captured[-1][1]
+        for L in (141, 145, 208):
+            assert f"<debugBreakpoints:line>{L}</debugBreakpoints:line>" in last_body
+        assert last_body.count("<debugBreakpoints:moduleBPInfo>") == 2
+        assert len(c._set_breakpoints_cache) == 2
+
+
+# ---------------------------------------------------------------------------
+# §11 Roadmap Solutions A/B — pre-existing rphost detection + force-recycle
+# ---------------------------------------------------------------------------
+
+class TestDetectPreExistingRphosts:
+    """Solution B preflight detection (module-level helper, no client)."""
+
+    def test_non_windows_returns_empty(self, monkeypatch):
+        # Detection is Windows-only by design (taskkill / tasklist tooling)
+        monkeypatch.setattr(mds.sys, "platform", "linux")
+        assert mds.detect_pre_existing_rphosts() == []
+
+    def test_subprocess_failure_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+
+        def _boom(*args, **kwargs):
+            raise FileNotFoundError("tasklist.exe not on PATH")
+
+        monkeypatch.setattr(mds.subprocess, "run", _boom)
+        assert mds.detect_pre_existing_rphosts() == []
+
+    def test_no_rphosts_running_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "INFO: No tasks are running which match the specified criteria."
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        assert mds.detect_pre_existing_rphosts() == []
+
+    def test_parses_csv_with_pids(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        fake = MagicMock()
+        fake.returncode = 0
+        # tasklist /FO CSV /NH format: "name","pid","session","#","mem"
+        fake.stdout = (
+            '"rphost.exe","12345","Services","0","123 K"\n'
+            '"rphost.exe","67890","Services","0","456 K"\n'
+        )
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        rphosts = mds.detect_pre_existing_rphosts()
+        assert rphosts == [
+            {"pid": 12345, "name": "rphost.exe"},
+            {"pid": 67890, "name": "rphost.exe"},
+        ]
+
+    def test_skips_malformed_pid(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = (
+            '"rphost.exe","NOT_A_PID","Services","0","123 K"\n'
+            '"rphost.exe","42","Services","0","456 K"\n'
+        )
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        rphosts = mds.detect_pre_existing_rphosts()
+        assert rphosts == [{"pid": 42, "name": "rphost.exe"}]
+
+
+class TestForceRecycleRphost:
+    """Solution A recycle helper (rac graceful → taskkill fallback)."""
+
+    def test_non_windows_no_op(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "linux")
+        result = mds.force_recycle_rphost_processes([1, 2, 3])
+        assert result == {"killed": [], "failed": [], "method": "noop"}
+
+    def test_empty_pids_no_op(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        # Should NOT call subprocess at all
+        called = []
+        monkeypatch.setattr(
+            mds.subprocess, "run",
+            lambda *a, **kw: called.append(a) or MagicMock(returncode=0),
+        )
+        result = mds.force_recycle_rphost_processes([])
+        assert result == {"killed": [], "failed": [], "method": "noop"}
+        assert called == []
+
+    def test_taskkill_fallback_when_rac_missing(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        fake = MagicMock(returncode=0, stdout="SUCCESS", stderr="")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds.force_recycle_rphost_processes([100, 200])
+        assert result["killed"] == [100, 200]
+        assert result["failed"] == []
+        assert result["method"] == "taskkill"
+
+    def test_taskkill_partial_failure(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        call_count = {"n": 0}
+
+        def _run(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return MagicMock(returncode=0, stdout="ok", stderr="")
+            return MagicMock(returncode=128,
+                             stdout="", stderr="ERROR: not found")
+
+        monkeypatch.setattr(mds.subprocess, "run", _run)
+        result = mds.force_recycle_rphost_processes([100, 200])
+        assert result["killed"] == [100]
+        assert result["failed"] == [{"pid": 200, "error": "ERROR: not found"}]
+        assert result["method"] == "taskkill"
+
+    def test_taskkill_subprocess_exception(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+
+        def _boom(*args, **kwargs):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(mds.subprocess, "run", _boom)
+        result = mds.force_recycle_rphost_processes([42])
+        assert result["killed"] == []
+        assert result["failed"] == [{"pid": 42, "error": "permission denied"}]
+        assert result["method"] == "taskkill"
+
+    def test_dry_run_returns_would_kill_without_subprocess(self, monkeypatch):
+        # Fix #4 §12.8: dry_run mode для preview без destructive ops
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        called = []
+        monkeypatch.setattr(mds.subprocess, "run",
+                            lambda *a, **kw: called.append(a) or
+                            MagicMock(returncode=0))
+        result = mds.force_recycle_rphost_processes([100, 200], dry_run=True)
+        assert result["method"] == "dry_run"
+        assert result["would_kill"] == [100, 200]
+        assert result["killed"] == []
+        assert result["failed"] == []
+        assert "dry_run=True" in result["note"]
+        # Critical: subprocess MUST NOT have been called
+        assert called == []
+
+    def test_dry_run_with_empty_pids_no_op(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        result = mds.force_recycle_rphost_processes([], dry_run=True)
+        # Empty pids → noop (early return) даже при dry_run
+        assert result["method"] == "noop"
+
+
+class TestRacRecycle:
+    """Solution A — rac process turn-off path (no admin required)."""
+
+    def test_rac_full_chain_success(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "C:/fake/rac.exe")
+
+        # Mock cluster list, process list, turn-off in sequence
+        call_log = []
+
+        def _run(args, **kwargs):
+            call_log.append(args)
+            cmd = args[1] if len(args) > 1 else ""
+            if cmd == "cluster":
+                return MagicMock(returncode=0, stdout=(
+                    "cluster : 11111111-2222-3333-4444-555555555555\n"
+                    "host : LAB\n"
+                ))
+            if cmd == "process" and "list" in args:
+                return MagicMock(returncode=0, stdout=(
+                    "process : aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+                    "pid : 100\n"
+                    "process : ffff2222-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+                    "pid : 200\n"
+                ))
+            # turn-off
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(mds.subprocess, "run", _run)
+        result = mds.force_recycle_rphost_processes([100, 200])
+        assert result["killed"] == [100, 200]
+        assert result["failed"] == []
+        assert result["method"] == "rac.turn_off"
+        # Verify rac was actually invoked for cluster + process list + 2 turn-offs
+        assert len(call_log) == 4
+
+    def test_rac_unknown_pid_recorded_as_failed(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "C:/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid",
+                            lambda *a: "11111111-2222-3333-4444-555555555555")
+        monkeypatch.setattr(mds, "_rac_list_processes_by_pid",
+                            lambda *a: {})  # no PIDs found
+        result = mds.force_recycle_rphost_processes([999])
+        assert result["killed"] == []
+        assert result["method"] == "rac.turn_off"
+        assert len(result["failed"]) == 1
+        assert "no cluster process UUID" in result["failed"][0]["error"]
+
+    def test_rac_falls_back_to_taskkill_when_cluster_unknown(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "C:/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda *a: None)
+        # Now should fall through to taskkill
+        fake = MagicMock(returncode=0, stdout="ok", stderr="")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds.force_recycle_rphost_processes([42])
+        assert result["killed"] == [42]
+        assert result["method"] == "taskkill"
+
+    def test_find_rac_exe_returns_none_when_no_files_exist(self, monkeypatch):
+        monkeypatch.setattr("os.path.isfile", lambda p: False)
+        assert mds._find_rac_exe() is None
+
+    def test_rac_get_cluster_uuid_parses_first_uuid(self, monkeypatch):
+        fake = MagicMock(returncode=0, stdout=(
+            "cluster                                   : abcd1234-5678-90ab-cdef-1234567890ab\n"
+            "host                                      : LAB\n"
+            "port                                      : 1541\n"
+        ))
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._rac_get_cluster_uuid("/fake/rac")
+        assert result == "abcd1234-5678-90ab-cdef-1234567890ab"
+
+    def test_rac_get_cluster_uuid_returns_none_on_failure(self, monkeypatch):
+        fake = MagicMock(returncode=1, stdout="", stderr="connection refused")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        assert mds._rac_get_cluster_uuid("/fake/rac") is None
+
+    def test_rac_auth_args_empty_when_no_env(self, monkeypatch):
+        monkeypatch.delenv("RAC_CLUSTER_USER", raising=False)
+        monkeypatch.delenv("RAC_CLUSTER_PWD", raising=False)
+        assert mds._rac_auth_args() == []
+
+    def test_rac_auth_args_full_pair(self, monkeypatch):
+        monkeypatch.setenv("RAC_CLUSTER_USER", "Admin")
+        monkeypatch.setenv("RAC_CLUSTER_PWD", "secret123")
+        assert mds._rac_auth_args() == [
+            "--cluster-user=Admin", "--cluster-pwd=secret123",
+        ]
+
+    def test_rac_auth_args_user_only(self, monkeypatch):
+        monkeypatch.setenv("RAC_CLUSTER_USER", "ReadOnly")
+        monkeypatch.delenv("RAC_CLUSTER_PWD", raising=False)
+        assert mds._rac_auth_args() == ["--cluster-user=ReadOnly"]
+
+    def test_service_restart_success(self, monkeypatch):
+        # Path 2: BSL_DEBUG_ALLOW_SERVICE_RESTART=true + no rac → service.restart
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        monkeypatch.setenv("BSL_DEBUG_ALLOW_SERVICE_RESTART", "true")
+        captured = []
+
+        def _run(args, **kwargs):
+            captured.append(list(args))
+            return MagicMock(returncode=0, stdout="OK\n", stderr="")
+
+        monkeypatch.setattr(mds.subprocess, "run", _run)
+        result = mds.force_recycle_rphost_processes([100, 200])
+        assert result["killed"] == [100, 200]
+        assert result["failed"] == []
+        assert result["method"] == "service.restart"
+        assert any("Restart-Service" in " ".join(c) for c in captured)
+
+    def test_service_restart_failure_records_per_pid_error(self, monkeypatch):
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setenv("BSL_DEBUG_ALLOW_SERVICE_RESTART", "true")
+        fake = MagicMock(returncode=1, stdout="",
+                         stderr="Cannot open service. Access denied.")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._recycle_via_service([42, 99])
+        assert result["killed"] == []
+        assert result["method"] == "service.restart"
+        assert len(result["failed"]) == 2
+        assert all("Access denied" in f["error"] for f in result["failed"])
+
+    def test_service_restart_skipped_when_env_unset(self, monkeypatch):
+        # env unset → wrapper falls through to taskkill, NOT service.restart
+        monkeypatch.setattr(mds.sys, "platform", "win32")
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        monkeypatch.delenv("BSL_DEBUG_ALLOW_SERVICE_RESTART", raising=False)
+        fake = MagicMock(returncode=0, stdout="ok", stderr="")
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds.force_recycle_rphost_processes([42])
+        assert result["method"] == "taskkill"  # NOT service.restart
+
+    def test_rac_auth_args_injected_into_turn_off(self, monkeypatch):
+        # Verify _rac_auth_args output присутствует в subprocess call args
+        monkeypatch.setenv("RAC_CLUSTER_USER", "Admin")
+        monkeypatch.setenv("RAC_CLUSTER_PWD", "pwd")
+        captured: list = []
+
+        def _run(args, **kwargs):
+            captured.append(list(args))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(mds.subprocess, "run", _run)
+        mds._recycle_via_rac("/fake/rac", "C-UUID", [42],
+                             {42: "P-UUID"})
+        assert captured, "subprocess.run was not called"
+        cmd = captured[0]
+        assert "--cluster-user=Admin" in cmd
+        assert "--cluster-pwd=pwd" in cmd
+        assert "turn-off" in cmd
+
+    def test_rac_list_processes_by_pid_parses_blocks(self, monkeypatch):
+        fake = MagicMock(returncode=0, stdout=(
+            "process              : aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+            "host                 : LAB\n"
+            "pid                  : 12345\n"
+            "use                  : used\n"
+            "process              : ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+            "pid                  : 67890\n"
+        ))
+        monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
+        result = mds._rac_list_processes_by_pid("/fake/rac", "cluster-uuid")
+        assert result == {
+            12345: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            67890: "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee",
+        }
+
+
+@pytest.mark.asyncio
+class TestDebugConnectPreflight:
+    """Integration: debug_connect surfaces preflight + drives force-recycle."""
+
+    async def _setup_client_mocks(self, monkeypatch, registered=True):
+        """Wire RDBGClient methods to in-memory fakes; return captured kills."""
+        from mcp_debug_server import RDBGClient
+
+        async def _api_version(self): return "8.3.27"
+        async def _debug_id(self): return mds.ZERO_UUID
+        async def _attach(self, cleanup_stale=True):
+            self._attached = True
+            self._registered = registered
+            return {"result": "registered" if registered else "ibInDebug",
+                    "session_id": self.session_id,
+                    "fully_registered": registered}
+        async def _init_settings(self): return None
+        async def _clear_bons(self): return None
+        async def _set_aas(self, **kw): return None
+        async def _targets(self): return []
+        async def _attach_targets(self, ids, attach=True): return True
+        async def _close(self): pass
+
+        monkeypatch.setattr(RDBGClient, "get_api_version", _api_version)
+        monkeypatch.setattr(RDBGClient, "get_debug_id", _debug_id)
+        monkeypatch.setattr(RDBGClient, "attach", _attach)
+        monkeypatch.setattr(RDBGClient, "init_settings", _init_settings)
+        monkeypatch.setattr(RDBGClient, "clear_break_on_next_statement", _clear_bons)
+        monkeypatch.setattr(RDBGClient, "set_auto_attach_settings", _set_aas)
+        monkeypatch.setattr(RDBGClient, "get_targets", _targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach_targets)
+        monkeypatch.setattr(RDBGClient, "close", _close)
+
+        # Reset the module-level singleton so every test starts cold
+        mds._client = None
+
+    async def test_no_rphost_no_warning_no_recycle(self, monkeypatch):
+        await self._setup_client_mocks(monkeypatch)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids: kill_calls.append(pids) or
+                            {"killed": [], "failed": []})
+        # Skip the 3-second sleep
+        async def _no_sleep(_): return None
+        monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
+
+        raw = await mds.debug_connect(infobase_alias="X")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        assert "pre_existing_rphost_warning" not in result
+        assert "force_recycle" not in result
+        assert kill_calls == []
+
+    async def test_pre_existing_no_force_emits_warning(self, monkeypatch):
+        await self._setup_client_mocks(monkeypatch)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 999, "name": "rphost.exe"}])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids: kill_calls.append(pids) or
+                            {"killed": [], "failed": []})
+        async def _no_sleep(_): return None
+        monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
+
+        raw = await mds.debug_connect(infobase_alias="X")
+        result = json.loads(raw)
+        assert "pre_existing_rphost_warning" in result
+        warning = result["pre_existing_rphost_warning"]
+        assert warning["pre_existing_pids"] == [999]
+        assert "next_steps" in warning and len(warning["next_steps"]) >= 3
+        assert "roadmap_ref" in warning
+        # Crucially: NO recycle attempted
+        assert kill_calls == []
+        assert "force_recycle" not in result
+
+    async def test_force_recycle_invokes_kill(self, monkeypatch):
+        await self._setup_client_mocks(monkeypatch)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 111, "name": "rphost.exe"},
+                                     {"pid": 222, "name": "rphost.exe"}])
+        kill_calls = []
+
+        def _kill(pids, **kw):
+            kill_calls.append(list(pids))
+            return {"killed": list(pids), "failed": []}
+
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes", _kill)
+        slept = []
+        async def _record_sleep(secs):
+            slept.append(secs)
+
+        monkeypatch.setattr(mds.asyncio, "sleep", _record_sleep)
+
+        raw = await mds.debug_connect(infobase_alias="X",
+                                         force_recycle_rphost=True)
+        result = json.loads(raw)
+        assert kill_calls == [[111, 222]]
+        # Wait happened (should be ~3s for ragent to spawn fresh worker)
+        assert slept and slept[0] >= 1.0
+        assert "force_recycle" in result
+        rec = result["force_recycle"]
+        assert rec["requested_pids"] == [111, 222]
+        assert rec["killed"] == [111, 222]
+        assert rec["failed"] == []
+        # When force-recycle ran, preflight warning is suppressed
+        assert "pre_existing_rphost_warning" not in result
+
+    async def test_force_recycle_skipped_when_not_registered(self, monkeypatch):
+        # ibInDebug → _registered=False → recycle MUST NOT happen (filter not pushed)
+        await self._setup_client_mocks(monkeypatch, registered=False)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 333, "name": "rphost.exe"}])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids: kill_calls.append(pids) or
+                            {"killed": [], "failed": []})
+        async def _no_sleep(_): return None
+        monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
+
+        raw = await mds.debug_connect(infobase_alias="X",
+                                         force_recycle_rphost=True)
+        result = json.loads(raw)
+        assert kill_calls == []  # registered=False guard works
+        assert "force_recycle" not in result

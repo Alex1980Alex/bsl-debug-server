@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
@@ -142,6 +143,37 @@ def _parse_response(root: ET.Element) -> list[dict]:
     return results
 
 
+def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
+    """Merge cached BP entries + new entry into per-module groups.
+
+    RDBG `setBreakpoints` команда REPLACES workspace при каждом вызове —
+    multi-line BPs одного модуля и multi-module BPs должны идти ОДНИМ
+    request'ом (multiple `moduleBPInfo` elements в `bpWorkspace`). Wrapper
+    aggregates все cached BPs (плюс new_entry) и каждый submit отправляет
+    full workspace, иначе предыдущие BPs теряются (live finding 2026-05-10).
+
+    Returns: dict keyed by 7-tuple
+        (module_type, object_id, property_id, ext_id, url, extension_name, version)
+    value = sorted list[int] of dedupe'd line numbers.
+    """
+    grouped: dict = {}
+    for entry in list(cache) + [new_entry]:
+        key = (
+            entry["module_type"], entry["object_id"], entry["property_id"],
+            entry.get("ext_id", 0) or 0,
+            entry.get("url", "") or "",
+            entry.get("extension_name", "") or "",
+            entry.get("version", "") or "",
+        )
+        line_set: set = grouped.setdefault(key, set())
+        for line in entry.get("lines", []):
+            try:
+                line_set.add(int(line))
+            except (TypeError, ValueError):
+                continue
+    return {k: sorted(v) for k, v in grouped.items()}
+
+
 class RDBGClient:
     """HTTP client for 1C debug agent RDBG protocol (JAXB-compatible)."""
 
@@ -181,6 +213,21 @@ class RDBGClient:
         # via `exprEvaluated` event in ping_loop. Map expressionResultID → Future.
         # Resolved by _handle_command's exprEvaluated branch; awaited in eval_expression.
         self._pending_evals: dict[str, asyncio.Future] = {}
+
+        # §12.3 Level 3 — session metrics tracking (append-only counters)
+        from datetime import datetime as _dt
+        self._session_started_at = _dt.now().isoformat()
+        self._bp_set_count = 0
+        self._bp_fire_count = 0
+        self._bp_by_location: dict = {}    # "obj_id:line" → fire count
+        self._eval_count = 0
+        self._eval_failures = 0
+        self._eval_errors: list = []       # last N error strings
+        self._ui_plus_retry_count = 0
+        self._recycle_method_used: Optional[str] = None
+        self._force_recycle_invoked = False
+        self._stop_events: list = []       # [{ts, target_id, lineNo}]
+        self._rphosts_seen: set = set()
 
     async def _post(self, command: str, body: str,
                     include_dbgui_url: bool = False,
@@ -236,6 +283,8 @@ class RDBGClient:
         light retry fails), proceed unconditionally to Stage 2 re-attach.
         """
         log.warning("RDBG %s → UI+ revoked; trying light re-handshake", command)
+        # §12.3 Level 3 — track UI+ retry для session_summary
+        self._ui_plus_retry_count += 1
         light_failed = False
         try:
             await self.init_settings()
@@ -476,6 +525,27 @@ class RDBGClient:
             self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
             log.info("[event] CallStackFormed: target=%s frames=%d reason=%s",
                      target_id[:8], len(stack), self._stop_reason_by_target[target_id])
+            # §12.3 Level 3 — track stop event для session_summary
+            from datetime import datetime as _dt
+            top = stack[0] if stack else {}
+            line_no = top.get("lineNo", "?") if isinstance(top, dict) else "?"
+            obj_id_top = ""
+            if isinstance(top, dict):
+                mod_id = top.get("moduleID")
+                if isinstance(mod_id, dict):
+                    obj_id_top = mod_id.get("objectID", "")
+            self._stop_events.append({
+                "ts": _dt.now().isoformat(),
+                "target_id": target_id,
+                "lineNo": line_no,
+                "reason": self._stop_reason_by_target[target_id],
+            })
+            self._rphosts_seen.add(target_id)
+            if stop_by_bp:
+                self._bp_fire_count += 1
+                if obj_id_top and line_no != "?":
+                    key = f"{obj_id_top}:{line_no}"
+                    self._bp_by_location[key] = self._bp_by_location.get(key, 0) + 1
 
         elif cmd_type == "rteProcessing":
             # 🟠 IMPORTANT: unhandled exception — also a stop event
@@ -629,6 +699,16 @@ class RDBGClient:
         Settings). Default subscribes to Server (rphost) + ManagedClient
         (1cv8c.exe) — covers thin-client + server-side rphost session.
         """
+        # Fix #1 ROLLBACK 2026-05-10 (autonomous L2 test detected regression):
+        # RDBG returns HTTP 400 «Несоответствие свойства targetType» when XSD
+        # enum gets values вне [Server, ManagedClient]. HTTPService/WebService/
+        # BackgroundJob — НЕ valid в этой версии XSD. Default revert to safe
+        # 2-type set; per-scenario expansion должен передаваться явно через
+        # target_types kwarg + проверка XSD'а в roadmap §11.5 follow-up.
+        # Note: Server filter всё ещё ловит rphost'ы которые обрабатывают IIS
+        # HTTP-services (они тоже rphost workers), но не emit'ят отдельный
+        # HTTPService event. Multi-rphost IIS scenario требует force-recycle
+        # (Fix #2) для предсказуемого attach.
         types = target_types or ["Server", "ManagedClient"]
         auto_attach = "".join(_auto("targetType", t) for t in types)
         body = _build_request(
@@ -987,6 +1067,8 @@ class RDBGClient:
         if not target_uuid:
             raise ValueError("eval_expression: no target_uuid and no last_stopped")
         await self._ensure_target_attached(target_uuid)
+        # §12.3 Level 3 metrics
+        self._eval_count += 1
         expr_result_id = str(uuid.uuid4())
         # Pre-register Future BEFORE POST — async event may arrive before
         # the POST response if RDBG is fast enough; ping_loop must find a
@@ -1101,41 +1183,51 @@ class RDBGClient:
                 Empty (default) обычно works для standard configs; передавайте
                 для extensions.
         """
-        module_id_xml = _base("type", module_type)
-        module_id_xml += _base("objectID", object_id)
-        module_id_xml += _base("propertyID", property_id)
-        if url:
-            module_id_xml += _base("url", url)
-        if extension_name:
-            module_id_xml += _base("extensionName", extension_name)
-        if ext_id:
-            module_id_xml += _base("extId", str(ext_id))
-        if version:
-            module_id_xml += _base("version", version)
-        bp_infos = "".join(
-            _bp("bpInfo",
-                _bp("line", str(line))
-                + _bp("isActive", "true")
-                + _bp("temp", "false"))
-            for line in lines
-        )
-        workspace_xml = _rdbg("bpWorkspace",
-            _bp("moduleBPInfo",
-                _bp("id", module_id_xml)
-                + bp_infos))
+        # Fix #5 (live finding 2026-05-10): RDBG setBreakpoints REPLACES the
+        # workspace each call. Aggregating cache + new entry → submit FULL
+        # workspace XML с multiple moduleBPInfo, иначе предыдущие BPs теряются.
+        new_entry = {
+            "module_type": module_type, "object_id": object_id,
+            "property_id": property_id, "lines": list(lines),
+            "ext_id": ext_id, "url": url,
+            "extension_name": extension_name, "version": version,
+        }
+        groups = _aggregate_breakpoints(self._set_breakpoints_cache, new_entry)
+        module_bp_infos: list = []
+        for (mt, oid, pid, eid, url_, ext_, ver_), bp_lines in groups.items():
+            mod_xml = _base("type", mt) + _base("objectID", oid) + _base("propertyID", pid)
+            if url_:
+                mod_xml += _base("url", url_)
+            if ext_:
+                mod_xml += _base("extensionName", ext_)
+            if eid:
+                mod_xml += _base("extId", str(eid))
+            if ver_:
+                mod_xml += _base("version", ver_)
+            bp_xml = "".join(
+                _bp("bpInfo",
+                    _bp("line", str(L))
+                    + _bp("isActive", "true")
+                    + _bp("temp", "false"))
+                for L in bp_lines
+            )
+            module_bp_infos.append(
+                _bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml)
+            )
+        workspace_xml = _rdbg("bpWorkspace", "".join(module_bp_infos))
         body = _build_request(self._base_fields(), workspace_xml)
         root = await self._post("setBreakpoints", body)
-        # P2.4: cache successful BP-set for client-side debug_get_breakpoints
-        self._set_breakpoints_cache.append({
-            "module_type": module_type,
-            "object_id": object_id,
-            "property_id": property_id,
-            "lines": list(lines),
-            "ext_id": ext_id,
-            "url": url,
-            "extension_name": extension_name,
-            "version": version,
-        })
+        # Reconcile cache from groups (consolidates duplicate entries и
+        # сохраняет full state для следующего set call).
+        self._set_breakpoints_cache = [
+            {
+                "module_type": k[0], "object_id": k[1], "property_id": k[2],
+                "ext_id": k[3], "url": k[4],
+                "extension_name": k[5], "version": k[6],
+                "lines": list(v),
+            }
+            for k, v in groups.items()
+        ]
         return _parse_response(root)
 
     async def close(self):
@@ -1169,6 +1261,465 @@ def _find_stopped_target(targets: list[dict]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Roadmap §11 (Solutions A/B): pre-existing rphost detection + force-recycle
+# ---------------------------------------------------------------------------
+# RDBG protocol contract: setAutoAttachSettings filter применяется только к
+# rphost'ам, регистрирующимся ПОСЛЕ её установки. Pre-existing rphost'ы
+# (alive до attachDebugUI) невидимы; DBGUIExtCmdInfoStarted event не
+# replay'ится для них. Empirically validated 2026-05-10 (roadmap §0).
+# Эти helpers закрывают gap на OS-уровне.
+
+def detect_pre_existing_rphosts() -> list[dict]:
+    """Detect rphost.exe worker processes on local Windows machine.
+
+    Used by debug_connect() для surfacing «pre-existing rphost invisible» gap
+    (§10) — RDBG не attach'ит retroactively уже работающие rphost'ы.
+
+    Returns: list of {pid: int, name: str}; empty list on non-Windows
+    или если tasklist.exe недоступен (graceful — не blocking).
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        result = subprocess.run(
+            ["tasklist.exe", "/FI", "IMAGENAME eq rphost.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        return []
+    if result.returncode != 0:
+        return []
+    rphosts: list[dict] = []
+    for line in result.stdout.strip().splitlines():
+        # tasklist returns `INFO: No tasks are running ...` when none match
+        if "INFO:" in line.upper():
+            continue
+        # CSV-формат /NH: "rphost.exe","12345","Services","0","123 K"
+        parts = [p.strip().strip('"') for p in line.split('","')]
+        if len(parts) >= 2:
+            try:
+                rphosts.append({"pid": int(parts[1]), "name": parts[0]})
+            except ValueError:
+                continue
+    return rphosts
+
+
+_RAC_BIN_CANDIDATES = (
+    r"C:\Program Files (x86)\1cv8\8.3.27.1936\bin\rac.exe",
+    r"C:\Program Files\1cv8\8.3.27.1936\bin\rac.exe",
+    r"C:\Program Files (x86)\1cv8\common\rac.exe",
+)
+
+
+def _find_rac_exe() -> Optional[str]:
+    """Locate rac.exe (1С Remote Administrative Client) on disk."""
+    import os
+    for path in _RAC_BIN_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _rac_auth_args() -> list:
+    """Build rac auth CLI args from RAC_CLUSTER_USER/RAC_CLUSTER_PWD env.
+
+    Required для cluster security-level≠0 (когда требуется cluster admin
+    auth для process operations). Empty list когда env не задано —
+    backward compat с security-level=0 (default localhost).
+    """
+    import os
+    args: list = []
+    user = os.environ.get("RAC_CLUSTER_USER", "").strip()
+    pwd = os.environ.get("RAC_CLUSTER_PWD", "")
+    if user:
+        args.append(f"--cluster-user={user}")
+    if pwd:
+        args.append(f"--cluster-pwd={pwd}")
+    return args
+
+
+def force_recycle_rphost_processes(pids: list[int], dry_run: bool = False) -> dict:
+    """Recycle rphost.exe workers via rac (graceful) или taskkill fallback.
+
+    Live validation 2026-05-10: SYSTEM-owned rphost (запущен под service
+    account) НЕ kill'ится через non-elevated `taskkill /F` — Access Denied.
+    `rac process turn-off` работает БЕЗ admin elevation на cluster
+    security-level=0 (default для localhost) и graceful'но drain'ит активные
+    сессии другому worker'у. Если rac.exe не найден — fallback на taskkill.
+
+    Returns: {killed, failed: [{pid, error}], method: "rac.turn_off"|"taskkill"|"noop"}.
+    """
+    if sys.platform != "win32" or not pids:
+        return {"killed": [], "failed": [], "method": "noop"}
+    # Fix #4 §12.8: dry_run mode — preview без destructive ops
+    if dry_run:
+        return {"killed": [], "failed": [], "method": "dry_run",
+                "would_kill": list(pids),
+                "note": "dry_run=True — no subprocess invoked"}
+    # Path 1 — rac (graceful, no admin, only if rac.exe available + cluster reachable)
+    rac_exe = _find_rac_exe()
+    if rac_exe:
+        cluster = _rac_get_cluster_uuid(rac_exe)
+        if cluster:
+            pid_to_uuid = _rac_list_processes_by_pid(rac_exe, cluster)
+            return _recycle_via_rac(rac_exe, cluster, pids, pid_to_uuid)
+    # Path 2 — full service restart (kills ALL rphosts; gated by env opt-in
+    # т.к. invasive — обрывает чужие user sessions). Требует SDDL grant
+    # (scripts/grant-1c-debug-permissions.ps1) или admin elevation.
+    import os
+    if os.environ.get("BSL_DEBUG_ALLOW_SERVICE_RESTART", "").lower() == "true":
+        return _recycle_via_service(pids)
+    # Path 3 — taskkill fallback (Access Denied для SYSTEM-owned rphost)
+    return _recycle_via_taskkill(pids)
+
+
+def _rac_get_cluster_uuid(rac_exe: str) -> Optional[str]:
+    """Run `rac cluster list`, parse first cluster UUID."""
+    try:
+        result = subprocess.run(
+            [rac_exe, "cluster", "list"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.strip().startswith("cluster"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                u = parts[1].strip()
+                if len(u) >= 32 and "-" in u:
+                    return u
+    return None
+
+
+def _rac_list_processes_by_pid(rac_exe: str, cluster: str) -> dict:
+    """Map OS pid → cluster process UUID via `rac process list`."""
+    try:
+        result = subprocess.run(
+            [rac_exe, "process", "list", f"--cluster={cluster}",
+             *_rac_auth_args()],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    pid_to_uuid: dict = {}
+    current_uuid: Optional[str] = None
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("process"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                u = parts[1].strip()
+                current_uuid = u if (len(u) >= 32 and "-" in u) else None
+        elif line.startswith("pid") and current_uuid:
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                try:
+                    pid_to_uuid[int(parts[1].strip())] = current_uuid
+                except ValueError:
+                    pass
+    return pid_to_uuid
+
+
+def _recycle_via_rac(rac_exe: str, cluster: str, pids: list,
+                     pid_to_uuid: dict) -> dict:
+    """Turn off rphost workers через `rac process turn-off` (graceful drain)."""
+    killed: list = []
+    failed: list = []
+    for pid in pids:
+        proc_uuid = pid_to_uuid.get(pid)
+        if not proc_uuid:
+            failed.append({"pid": pid,
+                           "error": "no cluster process UUID for this PID"})
+            continue
+        try:
+            result = subprocess.run(
+                [rac_exe, "process", "turn-off",
+                 f"--cluster={cluster}", f"--process={proc_uuid}",
+                 *_rac_auth_args()],
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                killed.append(pid)
+            else:
+                err = (result.stderr or result.stdout or "").strip()
+                failed.append({"pid": pid,
+                               "error": err or f"rac exit={result.returncode}"})
+        except (subprocess.SubprocessError, OSError) as e:
+            failed.append({"pid": pid, "error": str(e)})
+    return {"killed": killed, "failed": failed, "method": "rac.turn_off"}
+
+
+def _recycle_via_service(pids: list) -> dict:
+    """Restart entire 1С service (kills ALL rphosts at once).
+
+    Requires: (1) admin elevation, OR (2) one-time SDDL grant via
+    `scripts/grant-1c-debug-permissions.ps1` которое выдаёт Authenticated
+    Users право Start/Stop сервиса. После grant `Restart-Service` работает
+    БЕЗ UAC. Опционально gated env `BSL_DEBUG_ALLOW_SERVICE_RESTART=true`
+    т.к. invasive (kills чужие user-sessions).
+
+    Note: pids аргумент игнорируется по содержанию — service restart kills
+    ВСЕ rphost workers; ragent респавнит fresh ones с активным filter.
+    На success returnem killed=list(pids) для unified API формы.
+    """
+    if sys.platform != "win32":
+        return {"killed": [], "failed": [], "method": "noop"}
+    cmd = ("Restart-Service -Name '1C:Enterprise 8.3 Server Agent' "
+           "-Force -ErrorAction Stop; Write-Output 'OK'")
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"killed": [],
+                "failed": [{"pid": p, "error": str(e)} for p in pids],
+                "method": "service.restart"}
+    if result.returncode == 0 and "OK" in (result.stdout or ""):
+        return {"killed": list(pids), "failed": [], "method": "service.restart"}
+    err = (result.stderr or result.stdout or "").strip()
+    return {"killed": [],
+            "failed": [{"pid": p, "error": err or f"powershell exit={result.returncode}"}
+                       for p in pids],
+            "method": "service.restart"}
+
+
+def _recycle_via_taskkill(pids: list) -> dict:
+    """Fallback: hard taskkill /F. SYSTEM-owned rphost → Access Denied."""
+    killed: list = []
+    failed: list = []
+    for pid in pids:
+        try:
+            result = subprocess.run(
+                ["taskkill.exe", "/F", "/PID", str(pid)],
+                capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0:
+                killed.append(pid)
+            else:
+                err = (result.stderr or result.stdout or "").strip()
+                failed.append({"pid": pid,
+                               "error": err or f"taskkill exit={result.returncode}"})
+        except (subprocess.SubprocessError, OSError) as e:
+            failed.append({"pid": pid, "error": str(e)})
+    return {"killed": killed, "failed": failed, "method": "taskkill"}
+
+
+# ---------------------------------------------------------------------------
+# §12 Level 1 — health-check probes (K8s-style readiness pattern)
+# ---------------------------------------------------------------------------
+
+def _hc_probe_dbgs_port(host: str = "localhost", port: int = 1550) -> dict:
+    """TCP probe для dbgs.exe RDBG endpoint. Cheap (50ms timeout)."""
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.05)
+    try:
+        sock.connect((host, port))
+        sock.close()
+        return {"status": "pass", "detail": f"listening on {host}:{port}"}
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        return {"status": "fail", "detail": f"{host}:{port} not reachable ({e})",
+                "fix": "start ragent service with -debug -http flags"}
+
+
+def _hc_probe_ragent_debug_flag() -> dict:
+    """Verify ragent service has -debug + -http flags (Windows-only)."""
+    if sys.platform != "win32":
+        return {"status": "warn", "detail": "non-Windows — skip"}
+    cmd = ('Get-CimInstance Win32_Service -Filter "Name=\'1C:Enterprise 8.3 Server Agent\'" '
+           '| Select-Object -ExpandProperty PathName')
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"status": "fail", "detail": f"PowerShell exec failed: {e}"}
+    if result.returncode != 0:
+        return {"status": "fail", "detail": "service not found"}
+    path = (result.stdout or "").strip()
+    has_debug = "-debug" in path
+    has_http = "-http" in path
+    if has_debug and has_http:
+        return {"status": "pass", "detail": "ragent has -debug -http"}
+    missing = [f for f, present in (("-debug", has_debug), ("-http", has_http)) if not present]
+    return {"status": "fail", "detail": f"ragent missing flags: {missing}",
+            "fix": "scripts/enable-1c-server-debug-http.cmd (run as admin)"}
+
+
+def _hc_probe_rphost_baseline() -> dict:
+    """Count pre-existing rphost.exe processes."""
+    rphosts = detect_pre_existing_rphosts()
+    if not rphosts:
+        return {"status": "pass", "detail": "no pre-existing rphost — fresh env"}
+    pids = [r["pid"] for r in rphosts]
+    return {"status": "warn",
+            "detail": f"{len(pids)} pre-existing rphost(s): {pids}",
+            "fix": "kill-stale-rphosts (auto-prepare action)"}
+
+
+def _hc_probe_rac_available() -> dict:
+    """rac.exe found + reachable cluster?"""
+    rac = _find_rac_exe()
+    if not rac:
+        return {"status": "warn", "detail": "rac.exe not found in standard paths",
+                "fix": "install 1С platform OR rely on taskkill fallback"}
+    cluster = _rac_get_cluster_uuid(rac)
+    if not cluster:
+        return {"status": "warn",
+                "detail": f"rac.exe found at {rac} but cluster unreachable",
+                "fix": "check ragent on :1540"}
+    return {"status": "pass",
+            "detail": f"rac.exe + cluster {cluster[:8]}…"}
+
+
+def _hc_probe_env_vars() -> dict:
+    """Env vars для force_recycle paths."""
+    import os
+    rac_user = bool(os.environ.get("RAC_CLUSTER_USER", "").strip())
+    rac_pwd = bool(os.environ.get("RAC_CLUSTER_PWD", ""))
+    svc_restart = (os.environ.get("BSL_DEBUG_ALLOW_SERVICE_RESTART", "")
+                   .lower() == "true")
+    flags = {
+        "RAC_CLUSTER_USER": rac_user, "RAC_CLUSTER_PWD": rac_pwd,
+        "BSL_DEBUG_ALLOW_SERVICE_RESTART": svc_restart,
+    }
+    return {"status": "pass", "detail": f"env: {flags}",
+            "_extras": flags}
+
+
+def _hc_probe_sddl_au_grant() -> dict:
+    """SDDL contains AU ACE for Service Stop/Start (Fix #4 enabler)?"""
+    if sys.platform != "win32":
+        return {"status": "warn", "detail": "non-Windows — skip"}
+    try:
+        result = subprocess.run(
+            ["sc.exe", "sdshow", "1C:Enterprise 8.3 Server Agent"],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"status": "warn", "detail": f"sc sdshow failed: {e}"}
+    if result.returncode != 0:
+        return {"status": "warn", "detail": "sc sdshow returned non-zero"}
+    sddl = (result.stdout or "").strip()
+    has_au = "(A;;LCSWRPWPCR;;;AU)" in sddl
+    if has_au:
+        return {"status": "pass", "detail": "AU ACE present (Fix #4 path enabled)"}
+    return {"status": "warn",
+            "detail": "AU ACE not found — service.restart требует admin",
+            "fix": "scripts/grant-1c-debug-permissions.ps1 (run as admin once)"}
+
+
+def _hc_probe_active_session(client) -> dict:
+    """wrapper-side state — есть ли активная debug session?"""
+    if client is None or not getattr(client, "_attached", False):
+        return {"status": "pass", "detail": "no active debug session"}
+    return {"status": "pass",
+            "detail": f"attached to {client.infobase_alias}, "
+                      f"session={client.session_id[:8]}…"}
+
+
+def _hc_probe_cluster_load() -> dict:
+    """Roadmap §12.7 — warn если rphost'ы под большой нагрузкой.
+
+    Threshold: env BSL_DEBUG_CONN_THRESHOLD (default 10). Высокая нагрузка
+    указывает что debug может тормозить prod-traffic; user должен решить
+    стоит ли force_recycle (kills active sessions) или подождать low-load
+    окно.
+    """
+    import os
+    rac = _find_rac_exe()
+    if not rac:
+        return {"status": "warn", "detail": "rac.exe not found — skip"}
+    cluster = _rac_get_cluster_uuid(rac)
+    if not cluster:
+        return {"status": "warn", "detail": "cluster unreachable — skip"}
+    threshold = int(os.environ.get("BSL_DEBUG_CONN_THRESHOLD", "10"))
+    try:
+        result = subprocess.run(
+            [rac, "process", "list", f"--cluster={cluster}",
+             *_rac_auth_args()],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        return {"status": "warn", "detail": f"rac process list failed: {e}"}
+    if result.returncode != 0:
+        return {"status": "warn", "detail": "rac process list non-zero"}
+    high_load: list = []
+    current_pid: Optional[int] = None
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("pid"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                try:
+                    current_pid = int(parts[1].strip())
+                except ValueError:
+                    current_pid = None
+        elif line.startswith("connections") and current_pid is not None:
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                try:
+                    conns = int(parts[1].strip())
+                    if conns > threshold:
+                        high_load.append({"pid": current_pid, "connections": conns})
+                except ValueError:
+                    pass
+    if high_load:
+        return {"status": "warn",
+                "detail": f"high-load rphost(s) >{threshold} conns: {high_load}",
+                "fix": "wait for low-load window OR force_recycle (kills active sessions)"}
+    return {"status": "pass", "detail": f"all rphost'ы ≤{threshold} connections"}
+
+
+def _hc_recommend_workflow(checks: dict) -> str:
+    """Pick workflow path based on probe results."""
+    if checks.get("dbgs_port_1550", {}).get("status") == "fail":
+        return "read-only"
+    rphost_warn = checks.get("rphost_count_baseline", {}).get("status") == "warn"
+    rac_ok = checks.get("rac_exe_path", {}).get("status") == "pass"
+    svc_ok = (checks.get("env_vars", {}).get("_extras", {})
+              .get("BSL_DEBUG_ALLOW_SERVICE_RESTART") and
+              checks.get("sddl_au_grant", {}).get("status") == "pass")
+    if not rphost_warn:
+        return "thin-client"  # no pre-existing → all paths work
+    if rac_ok:
+        return "force-recycle"  # Solution A (rac path)
+    if svc_ok:
+        return "service-restart"  # Solution A2 (Fix #4)
+    return "thin-client"  # fallback: trigger ТОЛЬКО через UI
+
+
+def _hc_collect_checks(client) -> dict:
+    """Run all probes in cheap-first order. Returns checks dict."""
+    return {
+        "dbgs_port_1550": _hc_probe_dbgs_port(),
+        "rac_exe_path": _hc_probe_rac_available(),
+        "ragent_debug_flag": _hc_probe_ragent_debug_flag(),
+        "rphost_count_baseline": _hc_probe_rphost_baseline(),
+        "cluster_load": _hc_probe_cluster_load(),
+        "env_vars": _hc_probe_env_vars(),
+        "sddl_au_grant": _hc_probe_sddl_au_grant(),
+        "active_session": _hc_probe_active_session(client),
+    }
+
+
+# ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
 mcp = FastMCP("1c-debug")
@@ -1176,7 +1727,8 @@ mcp = FastMCP("1c-debug")
 
 @mcp.tool()
 async def debug_connect(debug_url: str = "http://localhost:1550",
-                        infobase_alias: str = "TestDB") -> str:
+                        infobase_alias: str = "TestDB",
+                        force_recycle_rphost: bool = False) -> str:
     """Connect to 1C debug agent and attach as debug client.
 
     IMPORTANT: Only ONE debug UI can be active per infobase.
@@ -1186,10 +1738,23 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
     Args:
         debug_url: URL of 1C debug agent (default: http://localhost:1550)
         infobase_alias: Infobase name in 1C cluster
+        force_recycle_rphost: Solution A from roadmap §11.2. When True,
+            after successful attach + setAutoAttachSettings, taskkill /F
+            on every rphost.exe alive ДО connect. Ragent then spawns
+            fresh worker(s) which read the filter at registration time
+            → emit DBGUIExtCmdInfoStarted → wrapper auto-attaches → BPs
+            fire on subsequent BSL execution (closes §10 «pre-existing
+            rphost invisible» gap). Default False = preflight-warning
+            mode (response includes pre_existing_rphost_warning with
+            PIDs + next-step suggestions). RISK when True: разрыв
+            активных пользовательских сессий в killed rphost'ах.
     """
     global _client
     if _client and _client._attached:
         await _client.close()
+
+    # Preflight (Solution B): snapshot rphost.exe ДО attach. Roadmap §11.
+    pre_existing_rphosts = detect_pre_existing_rphosts()
 
     _client = RDBGClient(debug_url, infobase_alias)
     try:
@@ -1207,6 +1772,32 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
                 await _client.set_auto_attach_settings()
             except Exception as e:
                 log.warning("[connect] post-attach handshake failed: %s", e)
+
+        # Solution A: force-recycle ПОСЛЕ setAutoAttachSettings — фильтр уже
+        # pushed в dbgs, fresh rphost'ы прочитают его на регистрации.
+        recycle_info: Optional[dict] = None
+        if force_recycle_rphost and pre_existing_rphosts and _client._registered:
+            pids_to_kill = [r["pid"] for r in pre_existing_rphosts]
+            # Fix #4 §12.8: env BSL_DEBUG_DRY_RUN_RECYCLE=true → preview only
+            import os
+            dry_run = (os.environ.get("BSL_DEBUG_DRY_RUN_RECYCLE", "")
+                       .lower() == "true")
+            log.warning("[connect] force-recycling pre-existing rphost(s): %s%s",
+                        pids_to_kill, " (DRY-RUN)" if dry_run else "")
+            # §12.3 Level 3 — track recycle invocation
+            _client._force_recycle_invoked = True
+            kill_result = force_recycle_rphost_processes(pids_to_kill, dry_run=dry_run)
+            _client._recycle_method_used = kill_result.get("method")
+            # Дать ragent ~3с на spawn fresh rphost + ping_loop'у поймать event
+            # (DBGUIExtCmdInfoStarted → handler → attachDebugTarget).
+            await asyncio.sleep(3.0)
+            recycle_info = {
+                "_tag": "force_recycle_result",
+                "requested_pids": pids_to_kill,
+                "killed": kill_result["killed"],
+                "failed": kill_result["failed"],
+                "wait_after_kill_sec": 3.0,
+            }
 
         targets = await _client.get_targets()
         stopped = _find_stopped_target(targets)
@@ -1227,6 +1818,39 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
             "targets": targets,
             "stopped_target": stopped,
         }
+
+        # Solution B: preflight warning when есть pre-existing rphost'ы и
+        # пользователь НЕ запросил force-recycle — surface gap явно вместо
+        # silent BP-no-fire (root cause § 10).
+        if pre_existing_rphosts and not force_recycle_rphost:
+            result["pre_existing_rphost_warning"] = {
+                "_tag": "preflight_warning",
+                "message": (
+                    "Detected rphost.exe process(es) alive ДО debug_connect. "
+                    "RDBG protocol cannot retroactively attach them "
+                    "(DBGUIExtCmdInfoStarted event fires только на spawn, не "
+                    "replay'ится при регистрации новой debug session). BPs на "
+                    "BSL, исполняемом этими rphost'ами (например IIS HTTP-services, "
+                    "background jobs, web-client'ы), не будут fire."
+                ),
+                "pre_existing_pids": [r["pid"] for r in pre_existing_rphosts],
+                "next_steps": [
+                    "Solution C: триггер через UI запущенный ПОСЛЕ debug_connect "
+                    "(тонкий клиент с /Debug /DebuggerURL — validated)",
+                    "Solution A: retry с force_recycle_rphost=True (kills pre-"
+                    "existing, ragent spawn'ит fresh worker с активным filter; "
+                    "РИСК: разрыв активных пользовательских сессий)",
+                    "Manual: Console кластера → «Выключить» процесс (graceful "
+                    "drain активных сессий другому worker'у) → retry connect",
+                ],
+                "roadmap_ref": (
+                    "docs/roadmap/260508_ROADMAP_BSL_DEBUG_WRAPPER_POST_BP_HANDSHAKE.md"
+                    " §10 + §11"
+                ),
+            }
+        if recycle_info is not None:
+            result["force_recycle"] = recycle_info
+
         if not _client._registered:
             result["warning"] = (
                 "Got 'ibInDebug' — another debugger (EDT?) is active. "
@@ -1244,6 +1868,285 @@ async def debug_disconnect() -> str:
     client = _get_client()
     result = await client.detach()
     return json.dumps({"status": "disconnected", "result": result})
+
+
+_SESSION_STORE_DIR = "data/debug_sessions"
+
+# §12.9 Stale-detection: timestamp когда модуль был импортирован Python'ом.
+# При каждом MCP-вызове сравниваем mtime файла с _MODULE_LOADED_AT —
+# если файл новее, MCP-процесс крутит устаревший код, нужен /mcp reconnect.
+import time as _time
+_MODULE_LOADED_AT = _time.time()
+
+
+def _get_stale_hint() -> Optional[str]:
+    """Return user-facing hint если wrapper file изменён ПОСЛЕ старта процесса.
+
+    Returns None если файл свежий (нет stale) ИЛИ если mtime check failed.
+    Ненавязчивая подсказка — не блокирует, не raise.
+    """
+    import os
+    try:
+        mtime = os.path.getmtime(__file__)
+    except OSError:
+        return None
+    if mtime <= _MODULE_LOADED_AT:
+        return None
+    age_sec = int(mtime - _MODULE_LOADED_AT)
+    return (f"Wrapper file modified {age_sec}s after MCP start — "
+            f"running stale code. Run /mcp reconnect to pick up changes.")
+
+
+def _persist_session_summary(summary: dict) -> Optional[str]:
+    """Mirror session summary to data/debug_sessions/<id>.json для cross-session diff."""
+    import os
+    try:
+        os.makedirs(_SESSION_STORE_DIR, exist_ok=True)
+        path = os.path.join(_SESSION_STORE_DIR, f"{summary['session_id']}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        return path
+    except (OSError, KeyError):
+        return None
+
+
+def _load_session_summary(session_id: str) -> Optional[dict]:
+    """Load persisted session summary by ID."""
+    import os
+    path = os.path.join(_SESSION_STORE_DIR, f"{session_id}.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _diff_summaries(prev: dict, curr: dict) -> dict:
+    """Compute regression-relevant diff between 2 session summaries."""
+    p_bp = prev.get("breakpoints", {})
+    c_bp = curr.get("breakpoints", {})
+    p_ev = prev.get("evaluations", {})
+    c_ev = curr.get("evaluations", {})
+    diff = {
+        "prev_session": prev.get("session_id"),
+        "curr_session": curr.get("session_id"),
+        "regression_indicators": [],
+        "deltas": {
+            "bp_set_count": c_bp.get("set_count", 0) - p_bp.get("set_count", 0),
+            "bp_fire_count": c_bp.get("fire_count", 0) - p_bp.get("fire_count", 0),
+            "eval_count": c_ev.get("count", 0) - p_ev.get("count", 0),
+            "eval_failures": c_ev.get("failures", 0) - p_ev.get("failures", 0),
+            "ui_plus_retries": (curr.get("ui_plus_retries", 0)
+                                - prev.get("ui_plus_retries", 0)),
+            "stop_events_count": (len(curr.get("stop_events", []))
+                                  - len(prev.get("stop_events", []))),
+        },
+    }
+    if diff["deltas"]["bp_fire_count"] < 0:
+        diff["regression_indicators"].append(
+            f"BP fire_count regressed: -{abs(diff['deltas']['bp_fire_count'])}")
+    if diff["deltas"]["eval_failures"] > 0:
+        diff["regression_indicators"].append(
+            f"eval failures increased: +{diff['deltas']['eval_failures']}")
+    if diff["deltas"]["ui_plus_retries"] > 0:
+        diff["regression_indicators"].append(
+            f"UI+ retries increased: +{diff['deltas']['ui_plus_retries']}")
+    diff["verdict"] = ("REGRESSION" if diff["regression_indicators"]
+                        else "NO_REGRESSION")
+    return diff
+
+
+@mcp.tool()
+async def debug_session_diff(prev_session_id: str,
+                              curr_session_id: Optional[str] = None) -> str:
+    """Roadmap §12.7 Level 3 extension — cross-session diff для regression detection.
+
+    Compares 2 session summaries. Returns deltas + regression_indicators list.
+
+    Args:
+        prev_session_id: baseline session UUID
+        curr_session_id: comparison session UUID (default: current active session)
+    """
+    prev = _load_session_summary(prev_session_id)
+    if not prev:
+        return json.dumps({"status": "error",
+                            "error": f"prev_session_id {prev_session_id} not found"})
+    if curr_session_id:
+        curr = _load_session_summary(curr_session_id)
+        if not curr:
+            return json.dumps({"status": "error",
+                                "error": f"curr_session_id {curr_session_id} not found"})
+    else:
+        # Build summary from current _client
+        global _client
+        if _client is None:
+            return json.dumps({"status": "error",
+                                "error": "no current session and no curr_session_id"})
+        curr_raw = await debug_session_summary(format="json")
+        curr = json.loads(curr_raw)
+    diff = _diff_summaries(prev, curr)
+    # Fix D §12.9: passive stale hint в response
+    stale = _get_stale_hint()
+    if stale:
+        diff["_stale_hint"] = stale
+    return json.dumps(diff, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_session_summary(format: str = "json") -> str:
+    """Roadmap §12.3 Level 3 — post-mortem session metrics.
+
+    Returns aggregated metrics (BPs set/fired by location, eval count + UI+ retries,
+    recycle method used, stop event timeline) для текущей RDBGClient session.
+    Tracking is in-process counters (append-only); no DB persistence.
+
+    Args:
+        format: "json" (structured) | "markdown" (human-readable PR transcript)
+
+    Если нет активной session (debug_connect не вызывался) — возвращает
+    {"status": "no_session"}.
+    """
+    global _client
+    if _client is None:
+        return json.dumps({"status": "no_session"})
+
+    cache_lines_total = sum(len(e.get("lines", []))
+                            for e in _client._set_breakpoints_cache)
+    summary = {
+        "session_id": _client.session_id,
+        "started_at": _client._session_started_at,
+        "infobase_alias": _client.infobase_alias,
+        "attached": _client._attached,
+        "breakpoints": {
+            "set_count": cache_lines_total,
+            "fire_count": _client._bp_fire_count,
+            "by_location": dict(_client._bp_by_location),
+            "fire_rate": (_client._bp_fire_count / cache_lines_total
+                          if cache_lines_total else None),
+        },
+        "evaluations": {
+            "count": _client._eval_count,
+            "failures": _client._eval_failures,
+            "errors": list(_client._eval_errors[-10:]),  # last 10
+        },
+        "ui_plus_retries": _client._ui_plus_retry_count,
+        "recycle": {
+            "force_invoked": _client._force_recycle_invoked,
+            "method_used": _client._recycle_method_used,
+        },
+        "stop_events": list(_client._stop_events),
+        "rphosts_seen": list(_client._rphosts_seen),
+    }
+    # Persist для cross-session diff (§12.7)
+    _persist_session_summary(summary)
+    # Fix D §12.9: passive stale hint в response
+    stale = _get_stale_hint()
+    if stale:
+        summary["_stale_hint"] = stale
+    if format == "markdown":
+        bp = summary["breakpoints"]
+        ev = summary["evaluations"]
+        rec = summary["recycle"]
+        md_lines = [
+            f"## Debug Session {summary['session_id'][:8]} ({summary['started_at']})",
+            f"- Infobase: **{summary['infobase_alias']}**",
+            f"- BPs: **{bp['set_count']} set, {bp['fire_count']} fired** "
+            f"({(bp['fire_rate'] or 0) * 100:.0f}% fire rate)",
+            f"- Locations: {bp['by_location'] or '—'}",
+            f"- Evals: **{ev['count']}** (failures: {ev['failures']})",
+            f"- UI+ retries: **{summary['ui_plus_retries']}**",
+            f"- Recycle: invoked={rec['force_invoked']}, method={rec['method_used'] or '—'}",
+            f"- Stop events: **{len(summary['stop_events'])}**",
+            f"- Targets seen: {len(summary['rphosts_seen'])}",
+        ]
+        return "\n".join(md_lines)
+    return json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_health_check(mode: str = "probe", actions: Optional[list] = None) -> str:
+    """Roadmap §12.1 Level 1 — preflight environment readiness check.
+
+    JSON shape (K8s readiness pattern):
+        {
+          "ready": bool,
+          "version": str,
+          "mode": "probe"|"prepare",
+          "checks": {<probe_id>: {status, detail, fix?}},
+          "auto_prepare_available": [str],
+          "recommended_workflow": "thin-client|force-recycle|service-restart|read-only",
+          "elapsed_ms": int,
+          "actions_executed": [{action, result}]  # only когда mode=prepare
+        }
+
+    Args:
+        mode: "probe" (default, read-only) — collect probes, return status.
+              "prepare" — выполнить actions из whitelist для auto-fix.
+        actions: list of action tokens (только для mode=prepare). Whitelist:
+                 ["kill-stale-rphosts", "restart-ragent"]. NEVER auto-modify
+                 SDDL or env vars (security boundary, surface как manual fix).
+    """
+    import time
+    t0 = time.time()
+    global _client
+    checks = _hc_collect_checks(_client)
+    fails = [k for k, v in checks.items() if v.get("status") == "fail"]
+    warns = [k for k, v in checks.items() if v.get("status") == "warn"]
+    ready = len(fails) == 0
+    auto_prepare = []
+    if "rphost_count_baseline" in warns:
+        auto_prepare.append("kill-stale-rphosts")
+    sddl_pass = checks.get("sddl_au_grant", {}).get("status") == "pass"
+    svc_env = (checks.get("env_vars", {}).get("_extras", {})
+               .get("BSL_DEBUG_ALLOW_SERVICE_RESTART"))
+    if sddl_pass and svc_env:
+        auto_prepare.append("restart-ragent")
+
+    actions_executed: list = []
+    if mode == "prepare":
+        if not actions:
+            return json.dumps({"status": "error",
+                               "error": "mode=prepare requires non-empty actions list"})
+        whitelist = {"kill-stale-rphosts", "restart-ragent"}
+        for action in actions:
+            if action not in whitelist:
+                actions_executed.append({"action": action,
+                                          "result": "rejected: not in whitelist"})
+                continue
+            if action == "kill-stale-rphosts":
+                rphosts = detect_pre_existing_rphosts()
+                pids = [r["pid"] for r in rphosts]
+                if pids:
+                    res = force_recycle_rphost_processes(pids)
+                    actions_executed.append({"action": action, "result": res})
+                else:
+                    actions_executed.append({"action": action,
+                                              "result": "no rphosts to kill"})
+            elif action == "restart-ragent":
+                res = _recycle_via_service([])
+                actions_executed.append({"action": action, "result": res})
+        # Re-probe after actions
+        checks = _hc_collect_checks(_client)
+        ready = all(v.get("status") != "fail" for v in checks.values())
+
+    out = {
+        "ready": ready,
+        "version": "mcp_debug_server@2026-05-10",
+        "mode": mode,
+        "checks": checks,
+        "auto_prepare_available": auto_prepare,
+        "recommended_workflow": _hc_recommend_workflow(checks),
+        "elapsed_ms": int((time.time() - t0) * 1000),
+    }
+    if mode == "prepare":
+        out["actions_executed"] = actions_executed
+    # Fix A §12.9: stale-detection — explicit warning в health_check response
+    stale = _get_stale_hint()
+    if stale:
+        out["stale_warning"] = stale
+    return json.dumps(out, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -1541,5 +2444,66 @@ async def debug_target_state(target_id: str = "") -> str:
                       ensure_ascii=False, indent=2)
 
 
+def _cli_main() -> int:
+    """Fix #6 §12.8 — CLI runner для debug tools без MCP reload.
+
+    Каждый subcommand = fresh Python process import = no /mcp reconnect нужен
+    при изменении wrapper'а. Useful для итеративной разработки.
+
+    Subcommands map 1-to-1 на @mcp.tool()-decorated functions:
+        health-check, session-summary, session-diff, ping, targets,
+        target-state, get-breakpoints (read-only)
+
+    Mutating tools (connect, set-breakpoint, evaluate, step, disconnect)
+    оставлены только в MCP режиме — они требуют persistent _client state
+    между вызовами который не имеет смысла в CLI per-process модели.
+
+    Usage:
+        python mcp_debug_server.py health-check
+        python mcp_debug_server.py session-summary --format markdown
+        python mcp_debug_server.py session-diff --prev <uuid> [--curr <uuid>]
+    """
+    import argparse
+    # Force UTF-8 stdout для Windows cp1251 default (Cyrillic + math symbols)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+    parser = argparse.ArgumentParser(description="1С Debug Server CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("health-check", help="Run debug_health_check probe (read-only)")
+
+    p_summary = sub.add_parser("session-summary",
+                                help="Print session summary by session_id или current")
+    p_summary.add_argument("--format", default="json",
+                            choices=("json", "markdown"))
+
+    p_diff = sub.add_parser("session-diff",
+                              help="Diff 2 persisted sessions для regression detection")
+    p_diff.add_argument("--prev", required=True, help="prev session UUID")
+    p_diff.add_argument("--curr", default=None, help="curr session UUID (default: current)")
+
+    args = parser.parse_args()
+
+    if args.cmd == "health-check":
+        result = asyncio.run(debug_health_check())
+    elif args.cmd == "session-summary":
+        result = asyncio.run(debug_session_summary(format=args.format))
+    elif args.cmd == "session-diff":
+        result = asyncio.run(
+            debug_session_diff(prev_session_id=args.prev,
+                                curr_session_id=args.curr)
+        )
+    else:
+        parser.print_help()
+        return 2
+    print(result)
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("health-check", "session-summary",
+                                              "session-diff"):
+        sys.exit(_cli_main())
     mcp.run()
