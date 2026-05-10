@@ -2294,18 +2294,37 @@ async def debug_stack_trace(target_id: str = "") -> str:
     """Get call stack of a stopped debug target.
 
     Args:
-        target_id: UUID from debug_targets. If empty, auto-finds stopped target.
+        target_id: UUID from debug_targets. If empty, использует cached
+            last_stopped_target_id (роадмап §13 P1.3, как `debug_variables`/
+            `debug_evaluate`) или fallback на get_targets pull.
+
+    Errors are surfaced as JSON `{"error": "..."}` instead of bubbling up
+    as opaque MCP exceptions (pre-fix 2026-05-10: silent fail with empty
+    body when get_call_stack или json.dumps raised — see live test).
     """
-    client = _get_client()
-    if not target_id:
-        targets = await client.get_targets()
-        target_id = _find_stopped_target(targets) or ""
+    try:
+        client = _get_client()
         if not target_id:
-            return json.dumps({"error": "No stopped targets", "targets": targets},
-                              ensure_ascii=False, indent=2)
-    stack = await client.get_call_stack(target_id)
-    return json.dumps({"target_id": target_id, "stack": stack, "depth": len(stack)},
-                      ensure_ascii=False, indent=2)
+            target_id = client.last_stopped_target_id or ""
+            if not target_id:
+                targets = await client.get_targets()
+                target_id = _find_stopped_target(targets) or ""
+                if not target_id:
+                    return json.dumps(
+                        {"error": "No stopped targets", "targets": targets},
+                        ensure_ascii=False, indent=2,
+                    )
+        stack = await client.get_call_stack(target_id)
+        return json.dumps(
+            {"target_id": target_id, "stack": stack, "depth": len(stack)},
+            ensure_ascii=False, indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_stack_trace failed")
+        return json.dumps(
+            {"error": f"{type(e).__name__}: {e!r}", "target_id": target_id},
+            ensure_ascii=False, indent=2,
+        )
 
 
 @mcp.tool()
