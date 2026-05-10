@@ -17,10 +17,11 @@ Coverage targets (lines 134..654 of mcp_debug_server.py):
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -434,16 +435,26 @@ class TestEvalReattach:
     async def test_eval_expression_ensures_attached(self, client):
         client.attach_debug_targets = AsyncMock(return_value=True)
         await client.eval_expression(
-            expression="ТекущаяДата()", target_uuid=GOOD_UUID,
+            expression="ТекущаяДата()", target_uuid=GOOD_UUID, async_wait_timeout=0,
         )
         client.attach_debug_targets.assert_awaited_once_with([GOOD_UUID])
 
     async def test_eval_local_variables_uses_last_stopped(self, client):
         client._last_stopped_target_id = GOOD_UUID
         client.attach_debug_targets = AsyncMock(return_value=True)
-        await client.eval_local_variables()
+        # 2026-05-10: eval_local_variables now requires non-empty `expressions`.
+        # Empty list is a no-op (returns []) without calling attach.
+        await client.eval_local_variables(expressions=["X"], async_wait_timeout=0)
         # Re-attach probed for fallback target
         client.attach_debug_targets.assert_awaited_once_with([GOOD_UUID])
+
+    async def test_eval_local_variables_empty_expressions_returns_empty(self, client):
+        # No expressions → no-op, no RDBG call.
+        client._last_stopped_target_id = GOOD_UUID
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        result = await client.eval_local_variables(expressions=[])
+        assert result == []
+        client.attach_debug_targets.assert_not_awaited()
 
     async def test_eval_expression_raises_when_no_target(self, client):
         with pytest.raises(ValueError, match="no target_uuid"):
@@ -453,7 +464,7 @@ class TestEvalReattach:
         # P2.3: composite types pres options bumped from 1000 to 4096
         client.attach_debug_targets = AsyncMock(return_value=True)
         client._last_stopped_target_id = GOOD_UUID
-        await client.eval_expression(expression="Контрагент")
+        await client.eval_expression(expression="Контрагент", async_wait_timeout=0)
         # Inspect the XML body that was posted — last positional arg is body
         post_call = client._post.call_args
         body = post_call.args[1] if len(post_call.args) > 1 else post_call.kwargs.get("body", "")
@@ -464,7 +475,7 @@ class TestEvalReattach:
         client.attach_debug_targets = AsyncMock(return_value=True)
         client._last_stopped_target_id = GOOD_UUID
         await client.eval_expression(
-            expression="Контрагент.Ссылка", view_interface="context",
+            expression="Контрагент.Ссылка", view_interface="context", async_wait_timeout=0,
         )
         body = client._post.call_args.args[1]
         assert "<debugCalculations:viewInterface>context</debugCalculations:viewInterface>" in body
@@ -473,16 +484,278 @@ class TestEvalReattach:
         # Default behavior — viewInterface tag absent (backward compat)
         client.attach_debug_targets = AsyncMock(return_value=True)
         client._last_stopped_target_id = GOOD_UUID
-        await client.eval_expression(expression="x")
+        await client.eval_expression(expression="x", async_wait_timeout=0)
         body = client._post.call_args.args[1]
         assert "viewInterface" not in body
 
     async def test_eval_custom_max_text_size(self, client):
         client.attach_debug_targets = AsyncMock(return_value=True)
         client._last_stopped_target_id = GOOD_UUID
-        await client.eval_expression(expression="БольшаяТаблица", max_text_size=16384)
+        await client.eval_expression(expression="БольшаяТаблица", max_text_size=16384,
+                                      async_wait_timeout=0)
         body = client._post.call_args.args[1]
         assert "<debugCalculations:maxTextSize>16384</debugCalculations:maxTextSize>" in body
+
+
+@pytest.mark.asyncio
+class TestEvalAsyncPickup:
+    """eval_expression async event delivery via _pending_evals + exprEvaluated."""
+
+    async def test_pending_future_registered_before_post(self, client):
+        # POST must see the future already in _pending_evals so racing
+        # exprEvaluated event from ping_loop can resolve it.
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        captured_pending = {}
+
+        async def post_capture(cmd, body, **kw):
+            # Simulate ping_loop delivering exprEvaluated event mid-POST
+            captured_pending.update(client._pending_evals)
+            return ET.Element("empty")
+
+        client._post = AsyncMock(side_effect=post_capture)
+        await client.eval_expression(expression="x", target_uuid=GOOD_UUID,
+                                      async_wait_timeout=0)
+        assert len(captured_pending) == 1, "Future must be registered before POST"
+
+    async def test_sync_result_returns_immediately(self, client):
+        # If RDBG returned the value inline (calcWaitingTime sufficed),
+        # eval_expression skips the wait and returns sync_result.
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        non_empty = ET.Element("RDBGEvalExprResponse")
+        result_elem = ET.SubElement(non_empty, "result")
+        ET.SubElement(result_elem, "value").text = "42"
+        client._post = AsyncMock(return_value=non_empty)
+        result = await client.eval_expression(expression="40+2", target_uuid=GOOD_UUID,
+                                               async_wait_timeout=0)
+        assert result, "Sync result should not be empty"
+        # _pending_evals must be cleaned up
+        assert len(client._pending_evals) == 0
+
+    async def test_expr_evaluated_event_resolves_pending_future(self, client):
+        # Simulate the ping_loop receiving exprEvaluated event AFTER
+        # eval_expression POSTed and is awaiting the future.
+        client.attach_debug_targets = AsyncMock(return_value=True)
+        client._post = AsyncMock(return_value=ET.Element("empty"))
+
+        async def eval_then_resolve():
+            # Wait briefly for eval_expression to register the future, then
+            # resolve it via _handle_command (simulating ping_loop event).
+            await asyncio.sleep(0.05)
+            assert len(client._pending_evals) == 1
+            result_id = next(iter(client._pending_evals))
+            event = {
+                "cmdId": "exprEvaluated",
+                "evalExprResBaseData": {
+                    "expressionResultID": result_id,
+                    "value": "result-payload",
+                },
+            }
+            await client._handle_command(event)
+
+        results = await asyncio.gather(
+            client.eval_expression(expression="x", target_uuid=GOOD_UUID,
+                                    async_wait_timeout=2.0),
+            eval_then_resolve(),
+        )
+        eval_result = results[0]
+        assert eval_result, "Expected non-empty result delivered via event"
+        assert eval_result[0]["value"] == "result-payload"
+        assert len(client._pending_evals) == 0
+
+    async def test_unknown_result_id_event_is_ignored(self, client):
+        # exprEvaluated for a result_id that has no pending future just logs
+        # a debug message — must not raise or pollute state.
+        await client._handle_command({
+            "cmdId": "exprEvaluated",
+            "evalExprResBaseData": {"expressionResultID": GOOD_UUID, "value": "ghost"},
+        })
+        assert len(client._pending_evals) == 0  # nothing changed
+
+
+@pytest.mark.asyncio
+class TestUiPlusRetry:
+    """_post auto-recovery when RDBG returns 400 «UI+ часть отладки не зарегистрирована»."""
+
+    async def _restore_real_post(self, client):
+        """Fixture's `client` mocks `_post` — restore the real method so the
+        UI+ retry logic runs end-to-end via `_http.post` (also mocked here)."""
+        from mcp_debug_server import RDBGClient as RealClient
+        client._post = RealClient._post.__get__(client, RealClient)
+
+    async def test_retry_re_handshakes_and_succeeds(self, client):
+        # First call: RDBG returns 400 UI+ revoked. Wrapper auto re-handshakes
+        # (init_settings + clear_break_on_next_statement), retries once, succeeds.
+        import httpx as _httpx
+        await self._restore_real_post(client)
+
+        ui_plus_400 = _httpx.Response(
+            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        ok_resp = _httpx.Response(
+            200, content=b"<root/>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+
+        client._http = MagicMock()
+        # Sequence: setBreakOnNextStatement→400, init_settings→200,
+        # clearBreakOnNextStatement→200, retry setBreakOnNextStatement→200
+        client._http.post = AsyncMock(side_effect=[ui_plus_400, ok_resp, ok_resp, ok_resp])
+
+        await client.set_break_on_next_statement()
+        assert client._http.post.await_count == 4
+
+    async def test_no_retry_for_handshake_commands(self, client):
+        # If init_settings ITSELF returns 400 UI+, we MUST NOT recursively retry
+        # (would infinite-loop). Test by calling init_settings with mocked 400.
+        import httpx as _httpx
+        await self._restore_real_post(client)
+
+        ui_plus_400 = _httpx.Response(
+            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        client._http = MagicMock()
+        client._http.post = AsyncMock(return_value=ui_plus_400)
+
+        with pytest.raises(_httpx.HTTPStatusError, match="initSettings 400"):
+            await client.init_settings()
+        # Exactly 1 call — no retry attempted
+        assert client._http.post.await_count == 1
+
+    async def test_unrelated_400_not_retried(self, client):
+        # Other 400 errors (e.g. «Не указан идентификатор предмета отладки»)
+        # bubble up as HTTPStatusError without retry.
+        import httpx as _httpx
+        await self._restore_real_post(client)
+
+        other_400 = _httpx.Response(
+            400, content=b"<error>Some other error</error>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        client._http = MagicMock()
+        client._http.post = AsyncMock(return_value=other_400)
+
+        with pytest.raises(_httpx.HTTPStatusError):
+            await client.set_break_on_next_statement()
+        assert client._http.post.await_count == 1  # no retry
+
+    async def test_escalation_to_full_reattach_when_light_fails(self, client):
+        # Live test 2026-05-10: light handshake retry can ALSO 400 with UI+
+        # message → wrapper escalates to full detachDebugUI + new attachDebugUI
+        # + 4-step handshake (with fresh session_id). Verify the escalation path.
+        import httpx as _httpx
+        await self._restore_real_post(client)
+
+        ui_plus_400 = _httpx.Response(
+            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        attach_ok = _httpx.Response(
+            200,
+            content=b"<root><result>registered</result></root>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        ok_resp = _httpx.Response(
+            200, content=b"<root/>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+
+        client._http = MagicMock()
+        # Sequence:
+        #   1. setBreakOnNextStatement → 400 UI+
+        #   2. init_settings (light handshake) → 200
+        #   3. clearBreakOnNextStatement → 200
+        #   4. setBreakOnNextStatement retry → 400 UI+ AGAIN (light failed)
+        #   5. detachDebugUI → 200
+        #   6. attachDebugUI (re-attach with fresh session_id) → 200
+        #   7. init_settings (full handshake) → 200
+        #   8. clearBreakOnNextStatement → 200
+        #   9. setAutoAttachSettings → 200
+        #   10. setBreakOnNextStatement final retry → 200 SUCCESS
+        client._http.post = AsyncMock(side_effect=[
+            ui_plus_400, ok_resp, ok_resp,
+            ui_plus_400,
+            ok_resp, attach_ok, ok_resp, ok_resp, ok_resp,
+            ok_resp,
+        ])
+
+        old_session_id = client.session_id
+        await client.set_break_on_next_statement()
+        assert client._http.post.await_count == 10
+        # Session ID must have rotated during escalation (fresh attachDebugUI).
+        assert client.session_id != old_session_id
+
+    async def test_escalation_when_light_handshake_itself_fails(self, client):
+        # Live test 2026-05-10: when UI+ revoked, init_settings ITSELF returns
+        # 400 UI+ (not just the original command). Wrapper must skip directly
+        # to escalation, not re-raise.
+        import httpx as _httpx
+        await self._restore_real_post(client)
+
+        ui_plus_400 = _httpx.Response(
+            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        attach_ok = _httpx.Response(
+            200, content=b"<root><result>registered</result></root>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        ok_resp = _httpx.Response(
+            200, content=b"<root/>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+
+        client._http = MagicMock()
+        # Sequence:
+        #   1. setBreakOnNextStatement → 400 UI+
+        #   2. init_settings (light) → 400 UI+ ← light handshake itself fails!
+        #   3. detachDebugUI → 200
+        #   4. attachDebugUI (escalation) → 200 registered
+        #   5. init_settings (full) → 200
+        #   6. clearBreakOnNextStatement → 200
+        #   7. setAutoAttachSettings → 200
+        #   8. setBreakOnNextStatement final retry → 200 SUCCESS
+        client._http.post = AsyncMock(side_effect=[
+            ui_plus_400, ui_plus_400,
+            ok_resp, attach_ok, ok_resp, ok_resp, ok_resp,
+            ok_resp,
+        ])
+
+        old_session_id = client.session_id
+        await client.set_break_on_next_statement()
+        assert client._http.post.await_count == 8
+        assert client.session_id != old_session_id
+
+    async def test_escalation_url_includes_attachDebugUI(self, client):
+        # Verify the 6th call (after light handshake fail) uses attachDebugUI.
+        import httpx as _httpx
+        await self._restore_real_post(client)
+
+        ui_plus_400 = _httpx.Response(
+            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        attach_ok = _httpx.Response(
+            200, content=b"<root><result>registered</result></root>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+        ok_resp = _httpx.Response(
+            200, content=b"<root/>",
+            request=_httpx.Request("POST", "http://test/"),
+        )
+
+        client._http = MagicMock()
+        client._http.post = AsyncMock(side_effect=[
+            ui_plus_400, ok_resp, ok_resp,
+            ui_plus_400,
+            ok_resp, attach_ok, ok_resp, ok_resp, ok_resp,
+            ok_resp,
+        ])
+        await client.set_break_on_next_statement()
+        # Call #6 (index 5) must hit attachDebugUI — signals escalation reached re-attach.
+        attach_call_url = client._http.post.await_args_list[5].args[0]
+        assert "cmd=attachDebugUI" in attach_call_url
 
 
 # ---------------------------------------------------------------------------
@@ -554,17 +827,34 @@ class TestGetBreakpointsCache:
 @pytest.mark.asyncio
 class TestGetTargetState:
     async def test_session_state_when_no_uuid(self, client):
-        # yukon39 pattern: getDbgTargetState без id → state UI session
-        root = ET.Element("root")
-        ET.SubElement(root, "state").text = "Worked"
-        ET.SubElement(root, "name").text = "Background server"
-        client._post = AsyncMock(return_value=root)
+        # Real-world finding 2026-05-09 (RDBG 8.3.27.1936): getDbgTargetState
+        # без targetID отвергается с HTTP 400. Wrapper теперь возвращает
+        # local session snapshot БЕЗ HTTP roundtrip.
+        client._attached = True
+        client._known_attached_targets.add(GOOD_UUID)
+        client._stopped_targets.add(GOOD_UUID)
+        client._last_stopped_target_id = GOOD_UUID
 
         result = await client.get_target_state(target_uuid=None)
 
-        client._post.assert_awaited_once()
-        assert result["state"] == "Worked"
-        assert result["name"] == "Background server"
+        client._post.assert_not_awaited()  # no RDBG call
+        assert result["_tag"] == "session_state"
+        assert result["infobase_alias"] == "TestDB"
+        assert result["session_id"] == client.session_id
+        assert result["attached"] is True
+        assert result["known_attached_targets"] == [GOOD_UUID]
+        assert result["stopped_targets"] == [GOOD_UUID]
+        assert result["last_stopped_target_id"] == GOOD_UUID
+
+    async def test_session_state_when_disconnected(self, client):
+        # Empty wrapper state — _attached=False, no targets known.
+        result = await client.get_target_state(target_uuid=None)
+        client._post.assert_not_awaited()
+        assert result["_tag"] == "session_state"
+        assert result["attached"] is False
+        assert result["known_attached_targets"] == []
+        assert result["stopped_targets"] == []
+        assert result["last_stopped_target_id"] is None
 
     async def test_per_target_via_get_targets_filter(self, client):
         # When target_uuid given → filter through get_targets()
@@ -583,6 +873,71 @@ class TestGetTargetState:
         result = await client.get_target_state(target_uuid=GOOD_UUID)
         assert result["_tag"] == "not_found"
         assert result["target_uuid"] == GOOD_UUID
+
+
+# ---------------------------------------------------------------------------
+# yukon39 post-attach handshake: initSettings → clearBreakOnNextStatement →
+# setAutoAttachSettings (Debugee.attach() lines 97-109). Reviewer-flagged
+# coverage gap 2026-05-10: pre-fix wrapper called cmd=initSettings with
+# WRONG body (breakOnNextLine + autoAttachSettings → silent no-op), causing
+# eval/step to fail post-BP-fire with HTTP 400 «UI+ - часть отладки не
+# зарегистрирована». Tests lock in the correct yukon39-spec body shapes.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestInitSettingsHandshake:
+    async def test_init_settings_posts_correct_cmd_and_empty_data(self, client):
+        # yukon39 ServerContext.attach() sends new HTTPServerInitialDebug-
+        # SettingsData() without setters → JAXB serializes empty <data/>.
+        await client.init_settings()
+        client._post.assert_awaited_once()
+        cmd, body = client._post.await_args.args
+        assert cmd == "initSettings"
+        # Body must contain empty <data/> element under RDBG ns.
+        assert "<debugRDBGRequestResponse:data>" in body
+        assert "<debugRDBGRequestResponse:data></debugRDBGRequestResponse:data>" in body
+        # Anti-regression: pre-fix broken markers MUST NOT appear.
+        assert "breakOnNextLine" not in body
+        assert "autoAttachSettings" not in body
+
+    async def test_init_settings_uses_session_id(self, client):
+        await client.init_settings()
+        body = client._post.await_args.args[1]
+        assert client.session_id in body
+        assert client.infobase_alias in body
+
+
+@pytest.mark.asyncio
+class TestClearBreakOnNextStatement:
+    async def test_clear_posts_correct_cmd(self, client):
+        # yukon39 HTTPDebugClient.clearBreakOnNextStatement() lines 273-283:
+        # body has only base fields (infoBaseAlias + idOfDebuggerUI), no payload.
+        await client.clear_break_on_next_statement()
+        client._post.assert_awaited_once()
+        cmd, body = client._post.await_args.args
+        assert cmd == "clearBreakOnNextStatement"
+        assert client.session_id in body
+        assert client.infobase_alias in body
+
+
+@pytest.mark.asyncio
+class TestSetAutoAttachSettings:
+    async def test_default_targets_server_and_managed_client(self, client):
+        await client.set_auto_attach_settings()
+        cmd, body = client._post.await_args.args
+        assert cmd == "setAutoAttachSettings"
+        assert "<debugAutoAttach:targetType>Server</debugAutoAttach:targetType>" in body
+        assert "<debugAutoAttach:targetType>ManagedClient</debugAutoAttach:targetType>" in body
+        # Anti-regression: must NOT route through cmd=initSettings (pre-fix bug)
+        # and must NOT include initSettings-only field breakOnNextLine.
+        assert "breakOnNextLine" not in body
+
+    async def test_custom_target_types(self, client):
+        await client.set_auto_attach_settings(target_types=["BackgroundJob"])
+        body = client._post.await_args.args[1]
+        assert "<debugAutoAttach:targetType>BackgroundJob</debugAutoAttach:targetType>" in body
+        assert "Server" not in body
+        assert "ManagedClient" not in body
 
 
 # ---------------------------------------------------------------------------

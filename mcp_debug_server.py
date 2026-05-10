@@ -23,6 +23,10 @@ from typing import Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+# Local modules — UUID → path resolution + BSL local-name extraction
+import bsl_locals
+import uuid_index
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -37,6 +41,7 @@ NS = {
     "calc": "http://v8.1c.ru/8.3/debugger/debugCalculations",
     "auto": "http://v8.1c.ru/8.3/debugger/debugAutoAttach",
     "bp": "http://v8.1c.ru/8.3/debugger/debugBreakpoints",
+    "rte": "http://v8.1c.ru/8.3/debugger/debugRTEFilter",
 }
 
 # Magic propertyID UUIDs per BSL module kind (yukon39/bsl-debug-server ModulePropertyId.java)
@@ -64,6 +69,7 @@ def _build_request(*children_xml: str) -> str:
         f' xmlns:debugCalculations="{NS["calc"]}"'
         f' xmlns:debugAutoAttach="{NS["auto"]}"'
         f' xmlns:debugBreakpoints="{NS["bp"]}"'
+        f' xmlns:debugRTEFilter="{NS["rte"]}"'
         ">"
         + "".join(children_xml)
         + "</debugBaseData:request>"
@@ -88,6 +94,10 @@ def _auto(tag: str, text: str = "") -> str:
 
 def _bp(tag: str, text: str = "") -> str:
     return f"<debugBreakpoints:{tag}>{text}</debugBreakpoints:{tag}>"
+
+
+def _rte(tag: str, text: str = "") -> str:
+    return f"<debugRTEFilter:{tag}>{text}</debugRTEFilter:{tag}>"
 
 
 def _target_id_light(target_uuid: str) -> str:
@@ -166,9 +176,26 @@ class RDBGClient:
         # Keyed by (object_id, property_id), value = full set_breakpoints request payload.
         self._set_breakpoints_cache: list[dict] = []
 
+        # Async eval pickup: evalExpr returns immediately (often with empty result
+        # when calcWaitingTime expires); the actual computed value arrives later
+        # via `exprEvaluated` event in ping_loop. Map expressionResultID → Future.
+        # Resolved by _handle_command's exprEvaluated branch; awaited in eval_expression.
+        self._pending_evals: dict[str, asyncio.Future] = {}
+
     async def _post(self, command: str, body: str,
-                    include_dbgui_url: bool = False) -> ET.Element:
-        """POST to RDBG endpoint. Only ping uses dbgui in URL."""
+                    include_dbgui_url: bool = False,
+                    _ui_plus_retry: bool = True) -> ET.Element:
+        """POST to RDBG endpoint. Only ping uses dbgui in URL.
+
+        UI+ auto-retry (2026-05-10): if RDBG returns 400 with \u00abUI+ \u0447\u0430\u0441\u0442\u044c
+        \u043e\u0442\u043b\u0430\u0434\u043a\u0438 \u043d\u0435 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u0430\u00bb (the \u00abUI+ debug part not registered\u00bb
+        error), re-issue the post-attach handshake (initSettings +
+        clearBreakOnNextStatement) and retry the original call once.
+        Live testing showed UI+ part can be revoked between operations on
+        RDBG 8.3.27.1936 \u2014 root cause unknown, but reapplying handshake
+        restores UI+ for subsequent ops. Set `_ui_plus_retry=False` for
+        the handshake calls themselves to prevent infinite recursion.
+        """
         url = f"{self.debug_url}/e1crdbg/rdbg?cmd={command}"
         if include_dbgui_url:
             url += f"&dbgui={self.session_id}"
@@ -176,6 +203,19 @@ class RDBGClient:
         resp = await self._http.post(url, content=body)
         if resp.status_code >= 400:
             err_body = (resp.text or "")[:2000]
+            # UI+ revocation auto-recovery: detect Russian + English error texts.
+            ui_plus_lost = (
+                _ui_plus_retry
+                and resp.status_code == 400
+                and command not in ("initSettings", "clearBreakOnNextStatement",
+                                    "attachDebugUI", "detachDebugUI")
+                and ("UI+ - \u0447\u0430\u0441\u0442\u044c \u043e\u0442\u043b\u0430\u0434\u043a\u0438 \u043d\u0435 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u0430" in err_body
+                     or "UI+ debug part not registered" in err_body)
+            )
+            if ui_plus_lost:
+                return await self._ui_plus_recover_and_retry(
+                    command, body, include_dbgui_url, resp, err_body,
+                )
             log.error("RDBG %s -> HTTP %s body=%s", command, resp.status_code, err_body)
             raise httpx.HTTPStatusError(
                 f"RDBG {command} {resp.status_code}: {err_body}",
@@ -185,6 +225,67 @@ class RDBGClient:
         if not text:
             return ET.Element("empty")
         return ET.fromstring(text)
+
+    async def _ui_plus_recover_and_retry(self, command, body,
+                                          include_dbgui_url, failed_resp, err_body):
+        """Two-stage UI+ recovery: light handshake → escalate to full re-attach.
+
+        Live test 2026-05-10: when UI+ is revoked, even initSettings itself
+        returns 400 UI+. Original v3 logic re-raised at that point — never
+        reached escalation. v4 fix: if light handshake itself fails (or
+        light retry fails), proceed unconditionally to Stage 2 re-attach.
+        """
+        log.warning("RDBG %s → UI+ revoked; trying light re-handshake", command)
+        light_failed = False
+        try:
+            await self.init_settings()
+            await self.clear_break_on_next_statement()
+        except Exception as e:
+            log.warning("UI+ light re-handshake failed (%s); will escalate", e)
+            light_failed = True
+        if not light_failed:
+            try:
+                return await self._post(command, body,
+                                         include_dbgui_url=include_dbgui_url,
+                                         _ui_plus_retry=False)
+            except httpx.HTTPStatusError as light_err:
+                if not self._is_ui_plus_lost(light_err):
+                    raise
+        log.warning("RDBG %s → escalating to full detach+attach", command)
+        return await self._ui_plus_full_reattach_and_retry(
+            command, body, include_dbgui_url)
+
+    async def _ui_plus_full_reattach_and_retry(self, command, body, include_dbgui_url):
+        """Stage 2 escalation: detach + new attachDebugUI + 4-step handshake."""
+        old_sid = self.session_id
+        try:
+            await self.detach()
+        except Exception:
+            pass
+        self.session_id = str(uuid.uuid4())
+        self._attached = False
+        self._registered = False
+        if self._ping_task and not self._ping_task.done():
+            self._ping_task.cancel()
+            self._ping_task = None
+        await self.attach(cleanup_stale=False)
+        if self._registered:
+            await self.init_settings()
+            await self.clear_break_on_next_statement()
+            await self.set_auto_attach_settings()
+        log.info("UI+ escalation: re-attached %s → %s", old_sid[:8], self.session_id[:8])
+        return await self._post(command, body,
+                                 include_dbgui_url=include_dbgui_url,
+                                 _ui_plus_retry=False)
+
+    @staticmethod
+    def _is_ui_plus_lost(err: "httpx.HTTPStatusError") -> bool:
+        """True iff response is 400 with «UI+ часть отладки не зарегистрирована»."""
+        body = (err.response.text or "")[:500]
+        return err.response.status_code == 400 and (
+            "UI+ - часть отладки не зарегистрирована" in body
+            or "UI+ debug part not registered" in body
+        )
 
     def _base_fields(self) -> str:
         """Common fields: infoBaseAlias + idOfDebuggerUI."""
@@ -227,9 +328,14 @@ class RDBGClient:
         """
         if cleanup_stale:
             await self._cleanup_stale_session()
+        # Empty <options/> mirrors yukon39 ServerContext.attach() line 102:
+        # `new DebuggerOptions()` без сеттеров → JAXB serializes empty element.
+        # Pre-2026-05-10 wrapper sent <options><foregroundAbility>false</...
+        # which doesn't match yukon39 production. Pure speculation that this
+        # affects UI+ persistence — verify in live test.
         body = _build_request(
             self._base_fields(),
-            _rdbg("options", _rdbg("foregroundAbility", "false")),
+            _rdbg("options"),
         )
         root = await self._post("attachDebugUI", body)
         result = "unknown"
@@ -402,10 +508,34 @@ class RDBGClient:
             log.warning("[event] BP corrected to adjusted line for target %s",
                         (target_id or "?")[:8])
 
+        elif cmd_type == "exprEvaluated":
+            # Async eval result delivery: evalExpr POST queues the evaluation
+            # with expressionResultID; the computed value arrives later as this
+            # event. Resolve the matching Future in _pending_evals so the caller
+            # of eval_expression() unblocks. yukon39 mirror: DBGUIExtCmdInfoExpr-
+            # Evaluated event class + ContextServerEventSubscriber dispatch.
+            eval_data = cmd.get("evalExprResBaseData") or cmd.get("data") or cmd
+            result_id = eval_data.get("expressionResultID") if isinstance(eval_data, dict) else None
+            if not result_id:
+                # Fallback — scan nested dicts for expressionResultID
+                for v in cmd.values():
+                    if isinstance(v, dict) and v.get("expressionResultID"):
+                        result_id = v["expressionResultID"]
+                        eval_data = v
+                        break
+            if result_id and result_id in self._pending_evals:
+                fut = self._pending_evals.pop(result_id)
+                if not fut.done():
+                    fut.set_result(eval_data)
+                log.info("[event] ExprEvaluated: result_id=%s resolved", result_id[:8])
+            else:
+                log.debug("[event] ExprEvaluated for unknown result_id=%s (no pending future)",
+                          (result_id or "?")[:8])
+
         elif cmd_type in ("ForegroundHelperSet", "ForegroundHelperRequest",
                            "ForegroundHelperProcess", "measureResultProcessing",
                            "errorViewInfo", "rteOnBPConditionProcessing",
-                           "exprEvaluated", "valueModified", "unknown", ""):
+                           "valueModified", "unknown", ""):
             log.debug("[event] Skipping %s", cmd_type or "<empty>")
 
         else:
@@ -438,17 +568,74 @@ class RDBGClient:
                         return inner
         return None
 
-    async def init_settings(self, target_types: list[str] | None = None) -> bool:
-        """Initialize debug settings with autoAttach configuration."""
+    async def init_settings(self) -> bool:
+        """RDBG initSettings — part of Debug UI post-attach handshake.
+
+        yukon39 reference: ServerContext.attach() line 60 creates
+        `new HTTPServerInitialDebugSettingsData()` WITHOUT setting any
+        fields, then calls `debugee.attach(data)` which routes through
+        Debugee.attach() lines 97-109: attach → initSettings → clear-
+        BreakOnNextStatement → setAutoAttachSettings.
+
+        With JAXB `XmlAccessType.NONE` + Lombok `@Data`, only the
+        default-initialized `inacessibleModuleID = []` field gets
+        serialized. Body is essentially `<data/>` (empty, no children).
+
+        Earlier 2026-05-10 attempt sent <bpWorkspace/> + <rteProcessing>
+        per RDBGSetInitialDebugSettingsRequestTest.xml fixture — that's a
+        TEST fixture, not the production-runtime body. Live RDBG 8.3.27
+        accepted the test-body (HTTP 200) but eval still failed with
+        «UI+ часть отладки не зарегистрирована». Switching to empty data
+        + adding clearBreakOnNextStatement step matches yukon39 production.
+
+        Pre-2026-05-10 (broken): built `breakOnNextLine` + `autoAttach-
+        Settings` body for cmd=initSettings — RDBG silently accepted but
+        neither initialized UI+ nor set autoAttach. Auto-attach moved to
+        dedicated `set_auto_attach_settings`.
+
+        Idempotent at session level — call once per attachDebugUI. After
+        detachDebugUI → attachDebugUI cycle, must re-call.
+        """
+        body = _build_request(
+            self._base_fields(),
+            _rdbg("data"),
+        )
+        await self._post("initSettings", body)
+        return True
+
+    async def clear_break_on_next_statement(self) -> bool:
+        """RDBG clearBreakOnNextStatement — yukon39 attach handshake step 3.
+
+        yukon39 reference: HTTPDebugClient.clearBreakOnNextStatement() lines
+        273-283. Body has no payload beyond `_base_fields()`. Called between
+        initSettings (step 2) and setAutoAttachSettings (step 4) per Debugee.
+        attach() lines 97-109. Without it Debug UI may carry stale break-on-
+        next flag from prior session, causing spurious stops.
+
+        Different from `set_break_on_next_statement` (the inverse op which
+        ARMS break-on-next as a global cmd).
+        """
+        body = _build_request(self._base_fields())
+        await self._post("clearBreakOnNextStatement", body)
+        return True
+
+    async def set_auto_attach_settings(
+        self, target_types: list[str] | None = None
+    ) -> bool:
+        """RDBG setAutoAttachSettings — declare which target kinds auto-attach.
+
+        Separate cmd from initSettings (yukon39 Debugee.attach() calls them in
+        sequence: initSettings → clearBreakOnNextStatement → setAutoAttach-
+        Settings). Default subscribes to Server (rphost) + ManagedClient
+        (1cv8c.exe) — covers thin-client + server-side rphost session.
+        """
         types = target_types or ["Server", "ManagedClient"]
         auto_attach = "".join(_auto("targetType", t) for t in types)
         body = _build_request(
             self._base_fields(),
-            _rdbg("data",
-                   _rdbg("breakOnNextLine", "false")
-                   + _rdbg("autoAttachSettings", auto_attach)),
+            _rdbg("autoAttachSettings", auto_attach),
         )
-        await self._post("initSettings", body)
+        await self._post("setAutoAttachSettings", body)
         return True
 
     async def detach(self) -> bool:
@@ -478,27 +665,51 @@ class RDBGClient:
         await self._post("attachDetachDbgTargets", body)
         return True
 
+    async def set_break_on_next_statement(self) -> bool:
+        """RDBG global op — break on next BSL statement on any eligible target.
+
+        Closes the gap detected 2026-05-10: pre-existing rphosts (alive before
+        debug_connect) are invisible to a fresh debug UI session; getDbgAll-
+        TargetStates returns []; targetStarted events never fire for them, so
+        BPs registered via set_breakpoints never trigger. yukon39 mirror:
+        HTTPDebugClient.setBreakOnNextStatement (Java line 262).
+
+        After this call, the very next BSL statement executed by ANY rphost
+        for this infobase causes a stop event; the ping loop then sees a
+        callStackFormed event and the wrapper auto-attaches that target via
+        the standard handler path. Use cleanup via debug_step("Continue") to
+        resume normal execution once a target is captured.
+        """
+        body = _build_request(self._base_fields())
+        await self._post("setBreakOnNextStatement", body)
+        return True
+
     # -- Observation API ---------------------------------------------------
 
     async def get_target_state(self, target_uuid: Optional[str] = None) -> dict:
-        """Get state of a single debug target (RDBGGetDbgTargetStateRequest).
+        """Get state of a single debug target.
 
-        Roadmap §4.4 P2.4 diagnostic. yukon39 не передаёт `id` в этом запросе —
-        Java-ской `getTargetState()` шлёт без targetID и сервер возвращает
-        состояние UI session (а не конкретного target). Наш wrapper делает
-        то же поведение если target_uuid не задан, иначе ищет в результатах
-        get_targets() (RDBG single-state endpoint имеет недокументированный
-        contract — safe path: фильтр по нашему `get_targets`).
+        Real-world finding 2026-05-09 (RDBG 8.3.27.1936): `getDbgTargetState`
+        отвергает запрос без targetID с HTTP 400 «Не указан идентификатор
+        предмета отладки». Прежняя yukon39-based гипотеза о session-state
+        семантике без targetID не подтверждена на 8.3.27. Поэтому:
+
+        - target_uuid is None → возвращаем wrapper-side session snapshot
+          (infobase_alias, session_id, attached, known/stopped targets) без
+          HTTP roundtrip. Полезно для диагностики UI session без падения.
+        - target_uuid передан → resolve через get_targets() (safe path,
+          per-target single-state endpoint имеет undocumented contract).
         """
         if target_uuid is None:
-            body = _build_request(self._base_fields())
-            root = await self._post("getDbgTargetState", body)
-            result: dict = {"_tag": "session_state"}
-            for child in root:
-                tag = _strip_ns(child.tag)
-                if child.text and child.text.strip():
-                    result[tag] = child.text.strip()
-            return result
+            return {
+                "_tag": "session_state",
+                "infobase_alias": self.infobase_alias,
+                "session_id": self.session_id,
+                "attached": self._attached,
+                "known_attached_targets": sorted(self._known_attached_targets),
+                "stopped_targets": sorted(self._stopped_targets),
+                "last_stopped_target_id": self._last_stopped_target_id,
+            }
         # Per-target: использовать get_targets() и отфильтровать
         targets = await self.get_targets()
         for t in targets:
@@ -621,30 +832,139 @@ class RDBGClient:
     # -- Evaluation API ----------------------------------------------------
 
     async def eval_local_variables(self, target_uuid: Optional[str] = None,
-                                    stack_level: int = 0) -> list[dict]:
-        """Evaluate local variables at a breakpoint (list all variables).
+                                    stack_level: int = 0,
+                                    expressions: Optional[list[str]] = None,
+                                    async_wait_timeout: float = 10.0,
+                                    max_text_size: int = 4096) -> list[dict]:
+        """Evaluate named local variables via batch evalLocalVariables.
 
-        Roadmap §13 P1.2: idempotent re-attach перед запросом для защиты
-        от race window (ping event-loop не успел обработать stop event).
+        yukon39 RDBGEvalLocalVariablesRequest takes a list of `Calculation-
+        SourceDataStorage` — caller provides explicit variable names. RDBG has
+        NO "dump all locals" call; passing empty list returns nothing.
+
+        2026-05-10 fix: requires non-empty `expressions`. For auto-discovery
+        from BSL source see `eval_locals_auto()`.
         """
         target_uuid = self._resolve_target_uuid(target_uuid)
         if not target_uuid:
             raise ValueError("eval_local_variables: no target_uuid and no last_stopped")
+        if not expressions:
+            return []
         await self._ensure_target_attached(target_uuid)
+        # Build one <expr> block per name. Each gets unique expressionResultID
+        # for async pickup via _pending_evals + exprEvaluated event.
+        expr_blocks: list[str] = []
+        result_ids: list[tuple[str, str, asyncio.Future]] = []
+        loop = asyncio.get_event_loop()
+        for name in expressions:
+            result_id = str(uuid.uuid4())
+            fut: asyncio.Future = loop.create_future()
+            self._pending_evals[result_id] = fut
+            result_ids.append((name, result_id, fut))
+            src_calc_info = (
+                _calc("expressionResultID", result_id)
+                + _calc("calcItem",
+                        _calc("itemType", "expression")
+                        + _calc("expression", name))
+            )
+            expr_blocks.append(_rdbg(
+                "expr",
+                _calc("stackLevel", str(stack_level))
+                + _calc("srcCalcInfo", src_calc_info)
+                + _calc("presOptions", _calc("maxTextSize", str(max_text_size))),
+            ))
         body = _build_request(
             self._base_fields(),
             _rdbg("calcWaitingTime", "3"),
             _rdbg("targetID", _target_id_light(target_uuid)),
-            _rdbg("expr", _calc("stackLevel", str(stack_level))),
+            *expr_blocks,
         )
-        root = await self._post("evalLocalVariables", body)
-        return _parse_response(root)
+        try:
+            root = await self._post("evalLocalVariables", body)
+            sync_results = _parse_response(root)
+            sync_by_id: dict[str, dict] = {}
+            for item in sync_results:
+                rid = item.get("expressionResultID")
+                if rid:
+                    sync_by_id[rid] = item
+            out: list[dict] = []
+            for name, result_id, fut in result_ids:
+                if result_id in sync_by_id:
+                    self._pending_evals.pop(result_id, None)
+                    out.append({"name": name, **sync_by_id[result_id]})
+                    continue
+                if async_wait_timeout <= 0:
+                    out.append({"name": name, "evalResultState": "pending"})
+                    continue
+                try:
+                    eval_data = await asyncio.wait_for(fut, timeout=async_wait_timeout)
+                    out.append({"name": name, **(eval_data or {})})
+                except asyncio.TimeoutError:
+                    log.warning("eval_local_variables[%s] timeout after %ss",
+                                name, async_wait_timeout)
+                    out.append({"name": name, "evalResultState": "timeout"})
+            return out
+        finally:
+            for _, result_id, _ in result_ids:
+                self._pending_evals.pop(result_id, None)
+
+    async def eval_locals_auto(self, target_uuid: Optional[str] = None,
+                                stack_level: int = 0,
+                                async_wait_timeout: float = 10.0,
+                                max_text_size: int = 4096) -> list[dict]:
+        """Auto-discover local names from BSL source then evaluate them.
+
+        Pipeline:
+        1. Get current stack frame (last_stopped + stack_level)
+        2. Resolve frame's UUID → BSL file path via uuid_index
+        3. Parse with bsl_locals.extract_locals_at_line()
+        4. Pass extracted names to eval_local_variables
+        """
+        target_uuid = self._resolve_target_uuid(target_uuid)
+        if not target_uuid:
+            return []
+        cached_stack = self._last_stack_by_target.get(target_uuid)
+        if not cached_stack or stack_level >= len(cached_stack):
+            return []
+        frame = cached_stack[stack_level]
+        module_id = frame.get("moduleID") or {}
+        if not isinstance(module_id, dict):
+            return []
+        object_id = module_id.get("objectID")
+        property_id = module_id.get("propertyID")
+        line_no_raw = frame.get("lineNo")
+        if not (object_id and property_id and line_no_raw):
+            return []
+        try:
+            line_no = int(line_no_raw)
+        except (TypeError, ValueError):
+            return []
+        path = uuid_index.resolve_uuid(object_id, property_id)
+        if path is None or not path.exists():
+            log.info("eval_locals_auto: UUID %s + %s -> no source path",
+                     object_id[:8], property_id[:8])
+            return []
+        names = bsl_locals.extract_locals_at_line(path, line_no)
+        if not names:
+            log.info("eval_locals_auto: no locals extracted at %s:%d",
+                     path.name, line_no)
+            return []
+        log.info("eval_locals_auto: extracted %d names at %s:%d",
+                 len(names), path.name, line_no)
+        return await self.eval_local_variables(
+            target_uuid=target_uuid,
+            stack_level=stack_level,
+            expressions=names,
+            async_wait_timeout=async_wait_timeout,
+            max_text_size=max_text_size,
+        )
 
     async def eval_expression(self, expression: str,
                                target_uuid: Optional[str] = None,
                                stack_level: int = 0,
                                view_interface: Optional[str] = None,
-                               max_text_size: int = 4096) -> list[dict]:
+                               max_text_size: int = 4096,
+                               async_wait_timeout: float = 10.0) -> list[dict]:
         """Evaluate a specific BSL expression at a breakpoint.
 
         Roadmap §13 P1.2: idempotent re-attach + fallback на last_stopped.
@@ -668,6 +988,12 @@ class RDBGClient:
             raise ValueError("eval_expression: no target_uuid and no last_stopped")
         await self._ensure_target_attached(target_uuid)
         expr_result_id = str(uuid.uuid4())
+        # Pre-register Future BEFORE POST — async event may arrive before
+        # the POST response if RDBG is fast enough; ping_loop must find a
+        # waiting future so the result isn't dropped.
+        loop = asyncio.get_event_loop()
+        pending_fut: asyncio.Future = loop.create_future()
+        self._pending_evals[expr_result_id] = pending_fut
         src_calc_info = (
             _calc("expressionResultID", expr_result_id)
             + _calc("calcItem",
@@ -688,8 +1014,31 @@ class RDBGClient:
             _rdbg("targetID", _target_id_light(target_uuid)),
             _rdbg("expr", expr_xml),
         )
-        root = await self._post("evalExpr", body)
-        return _parse_response(root)
+        try:
+            root = await self._post("evalExpr", body)
+            sync_result = _parse_response(root)
+            # If RDBG returned the value inline (calcWaitingTime sufficed),
+            # the response is non-empty — return immediately and discard future.
+            if sync_result:
+                self._pending_evals.pop(expr_result_id, None)
+                return sync_result
+            # Otherwise wait for `exprEvaluated` event from ping_loop.
+            # Timeout = calcWaitingTime + ping interval (2s) + slack.
+            # Set async_wait_timeout=0 to skip wait entirely (returns []
+            # if sync_result was empty — useful for unit tests that don't
+            # exercise the ping_loop event path).
+            if async_wait_timeout <= 0:
+                return []
+            try:
+                eval_data = await asyncio.wait_for(pending_fut, timeout=async_wait_timeout)
+                return [eval_data] if eval_data else []
+            except asyncio.TimeoutError:
+                log.warning("eval_expression timeout for result_id=%s — RDBG didn't deliver "
+                            "exprEvaluated event within %ss",
+                            expr_result_id[:8], async_wait_timeout)
+                return []
+        finally:
+            self._pending_evals.pop(expr_result_id, None)
 
     # -- Control API -------------------------------------------------------
 
@@ -847,7 +1196,17 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
         version = await _client.get_api_version()
         existing_id = await _client.get_debug_id()
         attach_result = await _client.attach()
-        await _client.init_settings()
+        # Post-attach handshake (yukon39 Debugee.attach() lines 97-109,
+        # canonical 4-step sequence): initSettings → clearBreakOnNextStatement →
+        # setAutoAttachSettings. Required for eval/step/variables — without the
+        # full sequence RDBG returns HTTP 400 «UI+ - часть отладки не зарегистрирована».
+        if _client._registered:
+            try:
+                await _client.init_settings()
+                await _client.clear_break_on_next_statement()
+                await _client.set_auto_attach_settings()
+            except Exception as e:
+                log.warning("[connect] post-attach handshake failed: %s", e)
 
         targets = await _client.get_targets()
         stopped = _find_stopped_target(targets)
@@ -933,29 +1292,48 @@ async def debug_stack_trace(target_id: str = "") -> str:
 
 
 @mcp.tool()
-async def debug_variables(target_id: str = "", stack_level: int = 0) -> str:
+async def debug_variables(target_id: str = "", stack_level: int = 0,
+                           expressions: Optional[list[str]] = None) -> str:
     """Read local variables at current breakpoint.
 
+    Two modes:
+    - **Auto-discovery (default)**: parse BSL source at current line via
+      uuid_index + bsl_locals to extract param names + Перем + assignments
+      up to the line, then batch-eval them. Requires source in EDT export
+      (default `<infobase>/Конфигурация/src/`). Returns `[{name, evalResult-
+      State, resultValueInfo}, ...]`.
+    - **Explicit names**: pass `expressions=["A", "B", ...]` to evaluate just
+      those names (skips source parsing — works without source access).
+
     Args:
-        target_id: UUID from debug_targets. If empty, использует cached
-            _last_stopped_target_id (roadmap §13 P1.3) или fallback на
-            get_targets pull.
+        target_id: UUID from debug_targets. If empty, uses cached
+            _last_stopped_target_id (roadmap §13 P1.3) or get_targets pull.
         stack_level: 0 = current frame, 1 = caller, etc.
+        expressions: explicit variable names to read. Default None → auto-
+            discover from BSL source.
     """
     client = _get_client()
     if not target_id:
-        # P1.3: prefer ping event-loop cached state vs slower pull
         target_id = client.last_stopped_target_id or ""
         if not target_id:
             targets = await client.get_targets()
             target_id = _find_stopped_target(targets) or ""
         if not target_id:
             return json.dumps({"error": "No stopped targets"})
-    variables = await client.eval_local_variables(
-        target_uuid=target_id, stack_level=stack_level,
-    )
+    if expressions:
+        variables = await client.eval_local_variables(
+            target_uuid=target_id, stack_level=stack_level,
+            expressions=expressions,
+        )
+        mode = "explicit"
+    else:
+        variables = await client.eval_locals_auto(
+            target_uuid=target_id, stack_level=stack_level,
+        )
+        mode = "auto"
     return json.dumps({"target_id": target_id, "variables": variables,
-                       "count": len(variables), "stack_level": stack_level},
+                       "count": len(variables), "stack_level": stack_level,
+                       "mode": mode},
                       ensure_ascii=False, indent=2)
 
 
@@ -1106,15 +1484,54 @@ async def debug_attach_targets(target_ids: list[str], attach: bool = True) -> st
 
 
 @mcp.tool()
+async def debug_break_on_next() -> str:
+    """Force-break next BSL statement on any rphost (covers pre-existing targets).
+
+    Background: getDbgAllTargetStates returns only targets attached to the
+    current debug UI session; rphosts spawned BEFORE debug_connect are
+    invisible because targetStarted events do not replay. As a result BPs
+    set on existing rphosts never fire. setBreakOnNextStatement is RDBG's
+    global op that bypasses this — the next BSL statement on any eligible
+    target stops, fires a callStackFormed event, and the wrapper auto-
+    attaches that target via the normal handler. After capture you can set
+    a precise BP and resume with debug_step("Continue") to land on it on
+    a subsequent execution.
+
+    No args. Returns status + reminder to debug_targets after stop event.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    try:
+        await client.set_break_on_next_statement()
+        return json.dumps({
+            "status": "ok",
+            "action": "break_on_next_statement_armed",
+            "next_step": (
+                "Trigger any BSL execution; then debug_targets to see "
+                "captured target; then set precise BP + debug_step Continue."
+            ),
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
 async def debug_target_state(target_id: str = "") -> str:
     """Get state of a single debug target (or current Debug UI session).
 
-    Roadmap §4.4 P2.4 diagnostic. Если target_id пуст — возвращает state
-    самой Debug UI session (yukon39 getTargetState без targetID); иначе
-    фильтрует результат get_targets() по target_id.
+    Roadmap §4.4 P2.4 diagnostic. Если target_id пуст — возвращает
+    wrapper-side snapshot Debug UI session (infobase_alias, session_id,
+    attached, known/stopped targets) без RDBG roundtrip. Real-world finding
+    2026-05-09 (RDBG 8.3.27.1936): `getDbgTargetState` без targetID
+    возвращает HTTP 400 «Не указан идентификатор предмета отладки», поэтому
+    session-state делается локально, а не запросом к RDBG.
+
+    Если target_id передан — resolve через get_targets() (per-target single-
+    state endpoint имеет undocumented contract — фильтрация безопаснее).
 
     Args:
-        target_id: UUID цели или пусто для UI session state.
+        target_id: UUID цели или пусто для wrapper-side session snapshot.
     """
     client = _get_client()
     if not client._attached:
