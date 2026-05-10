@@ -438,28 +438,23 @@ class RDBGClient:
             log.debug("[cleanup_stale] getDebugID failed (no stale session): %s", e)
 
     async def _ping_loop(self) -> None:
-        """Periodic ping: keep session alive AND dispatch DBGUIExtCmdInfo events.
+        """Periodic ping: keep session alive. Dispatch happens inside ping().
 
-        Roadmap §13 (post-BP-fire handshake): mirrors yukon39 Debugee.run()
-        dispatch loop. ping() returns list of DBGUIExtCmdInfo* commands;
-        each is fed to _handle_command() which auto-attaches new targets,
-        caches stack on stop events, etc.
+        Pre-2026-05-10: this loop maintained its own _handle_command dispatch
+        AFTER calling ping(), while ping() itself did not dispatch. That
+        bifurcated the event-processing path — manual debug_ping (MCP tool)
+        could drain the RDBG queue without populating cache, leading to a
+        cache-miss in subsequent debug_stack_trace calls.
 
-        Sequential await per command (NO asyncio.gather) — preserves event
-        ordering. Race condition `targetStarted` + `callStackFormed` для
-        одного target обрабатывается корректно: attach-then-cache.
+        Post-fix: ping() dispatches inline. This loop just keeps the session
+        alive (heartbeat — без него dbgs.exe GC'нет debug UI ~60с) и
+        делегирует обработку событий в ping().
         """
         try:
             while self._attached and self._registered:
                 await asyncio.sleep(2.0)
                 try:
-                    commands = await self.ping()
-                    for cmd in commands:
-                        try:
-                            await self._handle_command(cmd)
-                        except Exception as e:
-                            log.warning("event handler failed for %s: %s",
-                                        cmd.get("cmdId") or cmd.get("_tag"), e)
+                    await self.ping()  # dispatches internally
                 except Exception as e:
                     log.debug("ping failed: %s", e)
         except asyncio.CancelledError:
@@ -834,13 +829,37 @@ class RDBGClient:
         return targets
 
     async def ping(self) -> list[dict]:
-        """Ping for events. Uses dbgui in URL as per Java implementation."""
+        """Ping for events AND dispatch to _handle_command (cache, auto-attach).
+
+        Single source of truth for event processing. Both background
+        `_ping_loop` and manual `debug_ping` MCP tool go through this — so
+        no matter who drains the RDBG queue, `_last_stack_by_target` /
+        `_last_stopped_target_id` / `_known_attached_targets` get populated.
+
+        Pre-fix 2026-05-10 root cause: ping() returned raw events without
+        dispatch; only _ping_loop processed them. When user invoked manual
+        debug_ping between background ticks, that ping drained the queue
+        AND ROBBED _ping_loop of those events — cache stayed empty. The
+        next debug_stack_trace then took the HTTP-fallback path (cache
+        miss), which could raise httpx errors with empty body and surface
+        as opaque MCP failure.
+
+        Post-fix: ping() dispatches inline. _ping_loop just delegates here.
+        Per-event try/except prevents one bad event from blocking the rest.
+        """
         body = _build_request(
             _rdbg("idOfDebuggerUI", self.session_id),
         )
         root = await self._post("pingDebugUIParams", body,
                                 include_dbgui_url=True)
-        return _parse_response(root)
+        events = _parse_response(root)
+        for ev in events:
+            try:
+                await self._handle_command(ev)
+            except Exception as e:
+                tag = ev.get("cmdID") or ev.get("_tag", "?")
+                log.warning("ping dispatch failed for %s: %s", str(tag)[:40], e)
+        return events
 
     # -- Post-BP-fire helpers (roadmap §13) --------------------------------
 

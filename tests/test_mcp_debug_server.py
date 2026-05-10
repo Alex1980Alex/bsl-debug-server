@@ -2228,3 +2228,81 @@ class TestGetClientHmrRestore:
         c1 = mds._get_client()
         c2 = mds._get_client()
         assert c1 is c2
+
+
+# ---------------------------------------------------------------------------
+# §13.x ping() dispatches to _handle_command (root-cause fix 2026-05-10)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPingDispatch:
+    """Manual ping must populate cache, not just drain queue.
+
+    Pre-fix bug: client.ping() returned raw events without dispatch; only
+    _ping_loop processed them via a separate handler call. Manual debug_ping
+    (MCP tool) drained the RDBG queue and ROBBED _ping_loop of those events,
+    leaving _last_stack_by_target / _last_stopped_target_id empty. Subsequent
+    debug_stack_trace took the HTTP-fallback path (cache miss), which could
+    raise httpx errors with empty body and surface as opaque MCP failure.
+
+    Post-fix: ping() dispatches events inline. Both background loop and
+    manual ping populate cache identically.
+    """
+
+    async def test_populates_last_stopped_via_handle_command(
+        self, client, monkeypatch,
+    ):
+        client._post = AsyncMock(return_value=ET.Element("root"))
+        stack_dict = {"_tag": "frame", "lineNo": "10"}
+        events = [{
+            "cmdId": "callStackFormed",
+            "targetID": GOOD_UUID,
+            "callStack": stack_dict,
+            "stopByBP": "false",
+        }]
+        monkeypatch.setattr(mds, "_parse_response", lambda root: events)
+        result = await client.ping()
+        # Cache populated via dispatched _handle_command
+        assert client._last_stopped_target_id == GOOD_UUID
+        assert client._last_stack_by_target[GOOD_UUID] == [stack_dict]
+        assert GOOD_UUID in client._stopped_targets
+        # Original events still returned (no behaviour change for callers)
+        assert result == events
+
+    async def test_continues_on_handler_exception(self, client, monkeypatch):
+        """Per-event try/except in ping() prevents one bad event from blocking rest."""
+        client._post = AsyncMock(return_value=ET.Element("root"))
+        events = [
+            {"cmdId": "evil1", "targetID": GOOD_UUID},
+            {
+                "cmdId": "callStackFormed",
+                "targetID": ANOTHER_UUID,
+                "callStack": [{"_tag": "frame"}],
+                "stopByBP": "false",
+            },
+        ]
+        monkeypatch.setattr(mds, "_parse_response", lambda root: events)
+        # Make _handle_command raise for the FIRST event only
+        real_handle = client._handle_command
+        call_count = {"n": 0}
+
+        async def flaky(cmd):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated handler failure")
+            await real_handle(cmd)
+
+        client._handle_command = flaky
+        await client.ping()
+        # Both events were attempted; second succeeded → cache populated
+        assert call_count["n"] == 2
+        assert client._last_stopped_target_id == ANOTHER_UUID
+        assert ANOTHER_UUID in client._last_stack_by_target
+
+    async def test_empty_events_no_dispatch(self, client, monkeypatch):
+        client._post = AsyncMock(return_value=ET.Element("root"))
+        monkeypatch.setattr(mds, "_parse_response", lambda root: [])
+        result = await client.ping()
+        assert result == []
+        assert client._last_stopped_target_id is None
+        assert client._last_stack_by_target == {}
