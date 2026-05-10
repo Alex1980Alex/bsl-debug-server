@@ -396,6 +396,12 @@ class RDBGClient:
         # Background ping keeps RDBG session alive — без него dbgs.exe GC-нет UI
         if self._registered and (self._ping_task is None or self._ping_task.done()):
             self._ping_task = asyncio.create_task(self._ping_loop())
+        # §13.x HMR-recovery: snapshot session for next subprocess respawn.
+        # Covers BOTH initial attach() in debug_connect() AND the escalation
+        # path in _ui_plus_full_reattach_and_retry (which regenerates session_id
+        # then calls attach() again — so the new id overwrites the stale file).
+        if self._registered:
+            _persist_active_session(self)
         return {"result": result, "session_id": self.session_id,
                 "fully_registered": self._registered}
 
@@ -729,6 +735,7 @@ class RDBGClient:
             await self._post("detachDebugUI", body)
             self._attached = False
             self._registered = False
+            _clear_active_session()
             return True
         except Exception:
             return False
@@ -1243,9 +1250,48 @@ _client: Optional[RDBGClient] = None
 
 
 def _get_client() -> RDBGClient:
+    """Return the singleton RDBGClient, restoring HMR-saved state on cold start.
+
+    §13.x: when mcp_hmr_proc.py respawns this subprocess on source-file change,
+    in-memory state is gone but RDBG still has our session registered (60s GC
+    grace). _load_active_session() recovers session_id + connection params,
+    so the very first MCP call after restart hits RDBG with the SAME dbgui id
+    and avoids the «UI+ - часть отладки не зарегистрирована» 400 round-trip.
+
+    If the persisted session is stale (RDBG GC'd it, dbgs.exe rebooted), the
+    existing _ui_plus_recover_and_retry path escalates to a full re-attach on
+    the first failing call — and the new session_id is then re-persisted by
+    attach() for future restarts.
+    """
     global _client
     if _client is None:
-        _client = RDBGClient()
+        state = _load_active_session()
+        if state and state.get("session_id"):
+            _client = RDBGClient(
+                debug_url=state.get("debug_url", "http://localhost:1550"),
+                infobase_alias=state.get("infobase_alias", "DefAlias"),
+            )
+            _client.session_id = state["session_id"]
+            _client._attached = True
+            _client._registered = True
+            try:
+                # FastMCP tool handlers run inside an active event loop, so
+                # asyncio.get_running_loop() succeeds here. RuntimeError only
+                # fires если _get_client() is invoked from sync context (CLI
+                # mode, или sync unit-tests). Probe the loop FIRST — иначе
+                # coroutine creation leaks an unawaited task on RuntimeError.
+                loop = asyncio.get_running_loop()
+                if _client._ping_task is None or _client._ping_task.done():
+                    _client._ping_task = loop.create_task(_client._ping_loop())
+            except RuntimeError:
+                pass
+            log.info("[hmr-restore] active session restored: sid=%s alias=%s "
+                     "(persisted %.0fs ago)",
+                     state["session_id"][:8],
+                     state.get("infobase_alias", "?"),
+                     _time.time() - state.get("persisted_at", _time.time()))
+        else:
+            _client = RDBGClient()
     return _client
 
 
@@ -1872,6 +1918,14 @@ async def debug_disconnect() -> str:
 
 _SESSION_STORE_DIR = "data/debug_sessions"
 
+# §13.x HMR-restart recovery: persisted active session state path.
+# When the MCP subprocess is hot-reloaded by mcp_hmr_proc.py, all in-memory
+# state is lost — including session_id и UI+ handshake. RDBG, however, still
+# has our session registered server-side (60s GC grace). Persisting session_id
+# to disk lets the new subprocess reuse it on cold start, so RDBG recognizes
+# the same dbgui and the first call doesn't return 400 «UI+ не зарегистрирована».
+_ACTIVE_SESSION_PATH = "data/debug_sessions/.active.json"
+
 # §12.9 Stale-detection: timestamp когда модуль был импортирован Python'ом.
 # При каждом MCP-вызове сравниваем mtime файла с _MODULE_LOADED_AT —
 # если файл новее, MCP-процесс крутит устаревший код, нужен /mcp reconnect.
@@ -1908,6 +1962,66 @@ def _persist_session_summary(summary: dict) -> Optional[str]:
         return path
     except (OSError, KeyError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# §13.x HMR-restart recovery: active session persistence
+# ---------------------------------------------------------------------------
+# Goal: survive `mcp_hmr_proc.py` subprocess restart (triggered by source-file
+# change) without losing UI+ registration with RDBG. State written atomically
+# (tmp + os.replace) после каждого successful attach() — so even after the
+# UI+ escalation path regenerates session_id, the new id replaces the old one
+# on disk. detach() очищает файл — graceful disconnect ≠ HMR restart.
+
+def _persist_active_session(client: "RDBGClient") -> None:
+    """Write active session state to _ACTIVE_SESSION_PATH (atomic via os.replace).
+
+    Called from RDBGClient.attach() right after _registered=True — including
+    the post-escalation path in _ui_plus_full_reattach_and_retry. Silent on
+    OSError: persistence is best-effort, missing file just falls back to
+    «cold» reconnect (which still works, just costs one extra round-trip).
+    """
+    if not (client._attached and client._registered):
+        return
+    import os
+    state = {
+        "session_id": client.session_id,
+        "debug_url": client.debug_url,
+        "infobase_alias": client.infobase_alias,
+        "persisted_at": _time.time(),
+    }
+    try:
+        os.makedirs(os.path.dirname(_ACTIVE_SESSION_PATH) or ".", exist_ok=True)
+        tmp = _ACTIVE_SESSION_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, _ACTIVE_SESSION_PATH)
+    except OSError:
+        log.debug("[active-session] persist failed", exc_info=True)
+
+
+def _load_active_session() -> Optional[dict]:
+    """Read persisted state. Returns None if absent or unreadable.
+
+    No TTL check: stale state file just causes one 400 → escalation re-attach
+    path covers it (existing UI+ recovery in _post). Cleaner than guessing
+    a TTL value that doesn't match RDBG's actual GC behavior.
+    """
+    try:
+        with open(_ACTIVE_SESSION_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _clear_active_session() -> None:
+    """Remove persisted state (graceful detach / disconnect)."""
+    import os
+    try:
+        os.remove(_ACTIVE_SESSION_PATH)
+    except OSError:
+        pass
 
 
 def _load_session_summary(session_id: str) -> Optional[dict]:

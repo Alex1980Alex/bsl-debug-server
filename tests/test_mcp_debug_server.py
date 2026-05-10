@@ -2049,3 +2049,182 @@ class TestDebugConnectPreflight:
         result = json.loads(raw)
         assert kill_calls == []  # registered=False guard works
         assert "force_recycle" not in result
+
+
+# ---------------------------------------------------------------------------
+# §13.x HMR-restart recovery: active session persistence
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def isolated_active_path(tmp_path, monkeypatch):
+    """Redirect _ACTIVE_SESSION_PATH to a tmp file + reset _client singleton."""
+    target = tmp_path / "active.json"
+    monkeypatch.setattr(mds, "_ACTIVE_SESSION_PATH", str(target))
+    monkeypatch.setattr(mds, "_client", None)
+    return target
+
+
+class TestActiveSessionPersistence:
+    def test_persist_writes_state_for_registered_client(self, isolated_active_path):
+        c = RDBGClient(debug_url="http://h:1550", infobase_alias="ALIAS")
+        c.session_id = "fixed-uuid-for-test"
+        c._attached = True
+        c._registered = True
+        mds._persist_active_session(c)
+        assert isolated_active_path.is_file()
+        state = json.loads(isolated_active_path.read_text(encoding="utf-8"))
+        assert state["session_id"] == "fixed-uuid-for-test"
+        assert state["debug_url"] == "http://h:1550"
+        assert state["infobase_alias"] == "ALIAS"
+        assert isinstance(state["persisted_at"], (int, float))
+
+    def test_persist_noop_when_not_registered(self, isolated_active_path):
+        c = RDBGClient()
+        c._attached = True
+        c._registered = False  # ibInDebug case
+        mds._persist_active_session(c)
+        assert not isolated_active_path.exists()
+
+    def test_persist_noop_when_not_attached(self, isolated_active_path):
+        c = RDBGClient()
+        c._attached = False
+        c._registered = False
+        mds._persist_active_session(c)
+        assert not isolated_active_path.exists()
+
+    def test_persist_atomic_via_replace(self, isolated_active_path):
+        # Pre-existing file must be overwritten atomically (no tmp leftover)
+        isolated_active_path.write_text('{"session_id": "old"}', encoding="utf-8")
+        c = RDBGClient(infobase_alias="NEW")
+        c.session_id = "new-id"
+        c._attached = True
+        c._registered = True
+        mds._persist_active_session(c)
+        state = json.loads(isolated_active_path.read_text(encoding="utf-8"))
+        assert state["session_id"] == "new-id"
+        # No leftover .tmp
+        assert not (isolated_active_path.parent / "active.json.tmp").exists()
+
+    def test_load_returns_none_when_missing(self, isolated_active_path):
+        assert mds._load_active_session() is None
+
+    def test_load_returns_none_on_corrupt_json(self, isolated_active_path):
+        isolated_active_path.write_text("{not valid json", encoding="utf-8")
+        assert mds._load_active_session() is None
+
+    def test_load_returns_none_on_non_dict_root(self, isolated_active_path):
+        isolated_active_path.write_text("[1, 2, 3]", encoding="utf-8")
+        assert mds._load_active_session() is None
+
+    def test_load_roundtrip(self, isolated_active_path):
+        c = RDBGClient(debug_url="http://x:1551", infobase_alias="RT")
+        c.session_id = "roundtrip-id"
+        c._attached = True
+        c._registered = True
+        mds._persist_active_session(c)
+        loaded = mds._load_active_session()
+        assert loaded is not None
+        assert loaded["session_id"] == "roundtrip-id"
+        assert loaded["debug_url"] == "http://x:1551"
+        assert loaded["infobase_alias"] == "RT"
+
+    def test_clear_removes_file(self, isolated_active_path):
+        isolated_active_path.write_text('{"session_id": "x"}', encoding="utf-8")
+        mds._clear_active_session()
+        assert not isolated_active_path.exists()
+
+    def test_clear_noop_when_missing(self, isolated_active_path):
+        # Must not raise even if file already absent
+        mds._clear_active_session()  # no exception
+        assert not isolated_active_path.exists()
+
+
+@pytest.mark.asyncio
+class TestAttachDetachLifecyclePersistence:
+    """attach() persists on success, detach() clears."""
+
+    async def _client_with_attach_xml(self, result_text: str = "registered"):
+        """Build client with _post returning attach result XML."""
+        c = RDBGClient(debug_url="http://h:1550", infobase_alias="X")
+        attach_xml = ET.fromstring(
+            f'<root xmlns:r="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">'
+            f'<r:result>{result_text}</r:result>'
+            f'</root>'
+        )
+        c._post = AsyncMock(return_value=attach_xml)
+        c._cleanup_stale_session = AsyncMock()
+        # Prevent ping_loop spawn (real loop would touch network)
+        c._ping_loop = AsyncMock()
+        return c
+
+    async def test_attach_persists_on_registered(self, isolated_active_path):
+        c = await self._client_with_attach_xml("registered")
+        await c.attach(cleanup_stale=False)
+        assert isolated_active_path.is_file()
+        state = json.loads(isolated_active_path.read_text(encoding="utf-8"))
+        assert state["session_id"] == c.session_id
+        assert state["infobase_alias"] == "X"
+
+    async def test_attach_no_persist_on_ibindebug(self, isolated_active_path):
+        c = await self._client_with_attach_xml("ibInDebug")
+        await c.attach(cleanup_stale=False)
+        assert c._attached is True
+        assert c._registered is False
+        # Not registered → no persistence
+        assert not isolated_active_path.exists()
+
+    async def test_detach_clears_state(self, isolated_active_path):
+        c = await self._client_with_attach_xml("registered")
+        await c.attach(cleanup_stale=False)
+        assert isolated_active_path.is_file()
+        # detach() reuses _post; just need a graceful response
+        c._post = AsyncMock(return_value=ET.Element("ok"))
+        ok = await c.detach()
+        assert ok is True
+        assert not isolated_active_path.exists()
+
+    async def test_detach_failure_keeps_state(self, isolated_active_path):
+        c = await self._client_with_attach_xml("registered")
+        await c.attach(cleanup_stale=False)
+        assert isolated_active_path.is_file()
+        # detach() failing → state file should still be there for next restart
+        c._post = AsyncMock(side_effect=RuntimeError("network down"))
+        ok = await c.detach()
+        assert ok is False
+        assert isolated_active_path.is_file()
+
+
+class TestGetClientHmrRestore:
+    def test_cold_start_no_state_creates_default_client(self, isolated_active_path):
+        c = mds._get_client()
+        assert c is not None
+        assert c._attached is False
+        assert c._registered is False
+
+    def test_cold_start_with_state_restores_session(self, isolated_active_path):
+        isolated_active_path.write_text(json.dumps({
+            "session_id": "restored-uuid",
+            "debug_url": "http://restored:1550",
+            "infobase_alias": "RESTORED",
+            "persisted_at": 0,
+        }), encoding="utf-8")
+        c = mds._get_client()
+        assert c.session_id == "restored-uuid"
+        assert c.debug_url == "http://restored:1550"
+        assert c.infobase_alias == "RESTORED"
+        assert c._attached is True
+        assert c._registered is True
+
+    def test_cold_start_with_partial_state_falls_back(self, isolated_active_path):
+        # state file exists но без session_id → treated as no state
+        isolated_active_path.write_text(json.dumps({
+            "debug_url": "http://x:1550",
+        }), encoding="utf-8")
+        c = mds._get_client()
+        assert c._attached is False
+        assert c._registered is False
+
+    def test_subsequent_calls_return_same_client(self, isolated_active_path):
+        c1 = mds._get_client()
+        c2 = mds._get_client()
+        assert c1 is c2
