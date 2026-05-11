@@ -23,12 +23,24 @@ async def maybe_auto_continue_system_stop(client, target_id, stop_by_bp) -> bool
 
     P0.E: if target is in `_attached_pending` (freshly attached), this halt
     is the BP-propagation window — wait briefly, reapply BPs, then Continue.
+
+    P0.G: if `_break_on_next_silent_arm` is True, this halt is the warm-pool
+    arming window — attach target to session, drain BPs, Continue invisibly.
     """
     if stop_by_bp:
         client_drained_targets = getattr(client, "_attached_pending", None)
         if client_drained_targets is not None:
             client_drained_targets.discard(target_id)
         return False
+    if getattr(client, "_break_on_next_silent_arm", False):
+        client._break_on_next_silent_arm = False  # one-shot
+        try:
+            await client.attach_debug_targets([target_id], attach=True)
+            client._known_attached_targets.add(target_id)
+        except Exception as e:
+            log.warning("[P0.G] silent-arm attach failed: %s", e)
+        await _drain_bp_propagation(client, target_id)
+        return True
     if getattr(client, "_break_on_next_armed", False):
         return False
     pending = getattr(client, "_attached_pending", None)

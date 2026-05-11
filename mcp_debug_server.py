@@ -231,6 +231,10 @@ class RDBGClient:
         # P0.D roadmap 260511: armed by set_break_on_next_statement; cleared after first stop.
         # Used by system_stops.maybe_auto_continue_system_stop to keep user-requested stops visible.
         self._break_on_next_armed: bool = False
+        # P0.G roadmap 260511: silent-arm variant — break_on_next halts next rphost,
+        # wrapper grabs target_id from event, attaches it, drains BPs, Continues
+        # silently (no user-visible stop). Closes HTTPService warm-pool BP-fire gap.
+        self._break_on_next_silent_arm: bool = False
         # P0.E roadmap 260511: targets freshly spawned + auto-attached. First cascade
         # halt for these acts as BP-propagation window (drain BPs, wait, Continue).
         self._attached_pending: set[str] = set()
@@ -899,8 +903,13 @@ class RDBGClient:
         await self._post("attachDetachDbgTargets", body)
         return True
 
-    async def set_break_on_next_statement(self) -> bool:
+    async def set_break_on_next_statement(self, silent: bool = False) -> bool:
         """RDBG global op — break on next BSL statement on any eligible target.
+
+        Args:
+            silent: P0.G — if True, resulting halt is drained silently (target
+                attached + BPs reapplied + Continue), no user-visible stop. Used
+                by `debug_arm_next_rphost` for autonomous warm-pool BP fire.
 
         Closes the gap detected 2026-05-10: pre-existing rphosts (alive before
         debug_connect) are invisible to a fresh debug UI session; getDbgAll-
@@ -916,7 +925,10 @@ class RDBGClient:
         """
         body = _build_request(self._base_fields())
         await self._post("setBreakOnNextStatement", body)
-        self._break_on_next_armed = True  # P0.D: keep next stop visible
+        if silent:
+            self._break_on_next_silent_arm = True  # P0.G: drain halt invisibly
+        else:
+            self._break_on_next_armed = True  # P0.D: keep next stop visible
         return True
 
     # -- Observation API ---------------------------------------------------
@@ -3218,6 +3230,32 @@ async def debug_arm_warm_rphosts(target_types: Optional[list[str]] = None) -> st
         "filter_types": target_types,
         "armed_targets": armed,
         "bp_workspace_reapplied": reapplied_ok,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_arm_next_rphost() -> str:
+    """P0.G roadmap 260511: silently arm next rphost (incl. warm pool) for BP fire.
+
+    HTTPService warm-pool rphost is invisible to a new debug session — RDBG only
+    auto-attaches NEWLY spawned targets via DBGUIExtCmdInfoStarted. P0.F's
+    `debug_arm_warm_rphosts` only sees targets exposed by getDbgAllTargetStates
+    (excludes warm pool). This tool uses RDBG global `setBreakOnNextStatement`
+    to force-halt the next BSL statement on ANY rphost (including warm pool),
+    then the wrapper drains the halt silently — attaches the target + reapplies
+    BPs + Continue — making it BP-receptive for the rest of its lifetime.
+
+    Usage:
+        debug_connect → set BPs → debug_arm_next_rphost → execute_code → BP fires
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    await client.set_break_on_next_statement(silent=True)
+    return json.dumps({
+        "status": "silent_arm_armed",
+        "next_stop_will_be_drained": True,
+        "hint": "Trigger BSL (e.g. execute_code). Wrapper will attach the rphost silently; subsequent BPs/logpoints fire normally.",
     }, ensure_ascii=False, indent=2)
 
 
