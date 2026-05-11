@@ -3164,6 +3164,61 @@ async def debug_attach_targets(target_ids: list[str], attach: bool = True) -> st
 
 
 @mcp.tool()
+async def debug_arm_warm_rphosts(target_types: Optional[list[str]] = None) -> str:
+    """P0.F roadmap 260511: arm warm-pool rphosts for autonomous BP fire.
+
+    1С ragent holds a warm pool of rphost workers. HTTPService triggers (e.g.
+    1c-mcp-crud execute_code) reuse these warm rphosts instead of spawning
+    fresh ones — so BPs registered post-spawn never reach them (RDBG attach
+    is one-shot at spawn).
+
+    This tool lists all current targets, filters to specified types, attaches
+    each to current Debug UI session, marks them as `_attached_pending` (so
+    P0.E drain applies on next halt), then re-applies BP workspace.
+
+    Args:
+        target_types: filter list (default ["HTTPService", "JOB", "Server"]).
+            Pass empty list `[]` or None to arm ALL targets unconditionally.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    if target_types is None:
+        target_types = ["HTTPService", "JOB", "Server"]
+    try:
+        all_targets = await client.get_targets()
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"get_targets failed: {e}"})
+    armed = []
+    for t in all_targets:
+        ttype = t.get("targetType", "")
+        if target_types and ttype not in target_types:
+            continue
+        tid = t.get("id", "")
+        if not tid:
+            continue
+        try:
+            await client.attach_debug_targets([tid], attach=True)
+            client._known_attached_targets.add(tid)
+            client._attached_pending.add(tid)
+            armed.append({"id": tid, "type": ttype})
+        except Exception as e:
+            log.warning("[P0.F] arm failed for target=%s: %s", tid[:8], e)
+    if armed and client._set_breakpoints_cache:
+        try:
+            await client._reapply_bp_workspace()
+        except Exception as e:
+            log.warning("[P0.F] BP re-apply after arm failed: %s", e)
+    return json.dumps({
+        "status": "armed",
+        "count": len(armed),
+        "filter_types": target_types,
+        "armed_targets": armed,
+        "bp_workspace_reapplied": bool(armed and client._set_breakpoints_cache),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def debug_break_on_next() -> str:
     """Force-break next BSL statement on any rphost (covers pre-existing targets).
 
