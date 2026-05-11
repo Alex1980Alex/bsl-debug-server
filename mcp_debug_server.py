@@ -33,6 +33,7 @@ import logpoints  # P0.B roadmap 260511
 import system_stops  # P0.D roadmap 260511
 import artifacts  # P1.B roadmap 260511
 import coverage as bsl_coverage  # P1.A roadmap 260511
+import exception_bps  # P3.B roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -243,6 +244,9 @@ class RDBGClient:
         # P1.A roadmap 260511: coverage tracker — (oid, pid, line) -> {hits, file_path}.
         # Silent BP-counter; coverage.record_hit_and_continue auto-Continues invisibly.
         self._coverage_tracked: dict[tuple, dict] = {}
+        # P3.B roadmap 260511: exception BP filters. Empty list = halt all exceptions
+        # (backward compat). Non-empty = halt only if any filter matches.
+        self._exception_bp_filters: list[dict] = []
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -726,6 +730,14 @@ class RDBGClient:
                 self._last_exception_by_target[target_id] = exc
             log.warning("[event] RTE: target=%s exception_present=%s frames=%d",
                         target_id[:8], bool(exc), len(stack))
+            # P3.B roadmap 260511: exception BP filter — if defined and none match,
+            # auto-Continue silently (don't pollute stop_events with filtered out exc).
+            if self._exception_bp_filters:
+                suppressed = await exception_bps.maybe_suppress(
+                    self, target_id, exc, stack,
+                )
+                if suppressed:
+                    return
 
         elif cmd_type == "targetQuit":
             if target_id:
@@ -3343,6 +3355,61 @@ async def debug_coverage_export(output_path: str = "") -> str:
         output_path = str(out_dir / f"{sess}.xml")
     result = bsl_coverage.export_generic_coverage_xml(client, output_path)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_set_exception_bp(message_pattern: str = "", module_pattern: str = "") -> str:
+    """P3.B roadmap 260511: add filter for exception BPs.
+
+    Wrapper's `_handle_command(rteProcessing)` halts on unhandled exceptions.
+    Without filters — halts on ALL exceptions (default). With filters — halts
+    only if at least one filter matches the exception.
+
+    Each filter has 2 axes (both case-insensitive substring match, empty = "match any"):
+    - `message_pattern`: matched against `messageText` of the exception
+    - `module_pattern`: matched against top stack frame's `presentation` field
+
+    Args:
+        message_pattern: e.g. "ошибка проведения" or "deadlock"
+        module_pattern: e.g. "гкс_ДокументРегистрации" or "ОбщегоНазначения"
+
+    Multiple `debug_set_exception_bp` calls accumulate filters (OR semantics —
+    halt if ANY filter matches). Use `debug_clear_exception_bps` to reset.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    f = {"message_pattern": message_pattern, "module_pattern": module_pattern}
+    client._exception_bp_filters.append(f)
+    return json.dumps({
+        "status": "filter_added",
+        "filter": f,
+        "total_filters": len(client._exception_bp_filters),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_clear_exception_bps() -> str:
+    """P3.B roadmap 260511: clear all exception BP filters → default (halt on ALL exceptions)."""
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    cleared = len(client._exception_bp_filters)
+    client._exception_bp_filters.clear()
+    return json.dumps({"status": "cleared", "filters_removed": cleared}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_list_exception_bps() -> str:
+    """P3.B roadmap 260511: list current exception BP filters."""
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    return json.dumps({
+        "filters": list(client._exception_bp_filters),
+        "count": len(client._exception_bp_filters),
+        "default_behavior": "halt-all" if not client._exception_bp_filters else "filter-only",
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
