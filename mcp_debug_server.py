@@ -717,6 +717,7 @@ class RDBGClient:
                 self._stop_reason_by_target.pop(target_id, None)
                 self._last_exception_by_target.pop(target_id, None)
                 self._known_attached_targets.discard(target_id)
+                self._attached_pending.discard(target_id)  # P0.F: prevent leak
                 log.info("[event] Quit: target=%s", target_id[:8])
 
         elif cmd_type == "correctedBP":
@@ -3177,8 +3178,8 @@ async def debug_arm_warm_rphosts(target_types: Optional[list[str]] = None) -> st
     P0.E drain applies on next halt), then re-applies BP workspace.
 
     Args:
-        target_types: filter list (default ["HTTPService", "JOB", "Server"]).
-            Pass empty list `[]` or None to arm ALL targets unconditionally.
+        target_types: filter list. None (default) → ["HTTPService","JOB","Server"].
+            Pass empty list `[]` to arm ALL targets unconditionally (no filter).
     """
     client = _get_client()
     if not client._attached:
@@ -3204,9 +3205,11 @@ async def debug_arm_warm_rphosts(target_types: Optional[list[str]] = None) -> st
             armed.append({"id": tid, "type": ttype})
         except Exception as e:
             log.warning("[P0.F] arm failed for target=%s: %s", tid[:8], e)
+    reapplied_ok = False
     if armed and client._set_breakpoints_cache:
         try:
             await client._reapply_bp_workspace()
+            reapplied_ok = True
         except Exception as e:
             log.warning("[P0.F] BP re-apply after arm failed: %s", e)
     return json.dumps({
@@ -3214,7 +3217,7 @@ async def debug_arm_warm_rphosts(target_types: Optional[list[str]] = None) -> st
         "count": len(armed),
         "filter_types": target_types,
         "armed_targets": armed,
-        "bp_workspace_reapplied": bool(armed and client._set_breakpoints_cache),
+        "bp_workspace_reapplied": reapplied_ok,
     }, ensure_ascii=False, indent=2)
 
 
