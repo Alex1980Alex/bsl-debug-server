@@ -2286,6 +2286,96 @@ class TestRecycleStrategy:
 # Roadmap 260511 §3.1: _validate_infobase_alias helper unit tests
 # ---------------------------------------------------------------------------
 
+@pytest.mark.asyncio
+class TestPostSpawnAutoAttach:
+    """Roadmap 260511 §P0.4 — periodic auto-attach polling в _ping_loop.
+
+    Closes residual RC2: HTTP-service spawned rphost виден в get_targets,
+    но НЕ emit'ил targetStarted к нашей session → без polling никогда
+    не attach'ится → BPs не fire.
+    """
+
+    def _make_client(self):
+        c = RDBGClient(infobase_alias="ИБTest")
+        c._attached = True
+        c._registered = True
+        return c
+
+    async def test_post_spawn_attaches_new_targets(self, monkeypatch):
+        c = self._make_client()
+        c._known_attached_targets.add("already-attached-id")
+        # get_targets returns 2: один уже attached, один новый
+        async def _get_targets(self):
+            return [{"id": "already-attached-id"},
+                    {"id": "new-spawn-id"}]
+        # attach_debug_targets captures call
+        attach_calls = []
+        async def _attach(self, uuids, attach=True):
+            attach_calls.append((list(uuids), attach))
+            return True
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 1
+        assert attach_calls == [(["new-spawn-id"], True)]
+        assert "new-spawn-id" in c._known_attached_targets
+
+    async def test_post_spawn_noop_when_all_attached(self, monkeypatch):
+        c = self._make_client()
+        c._known_attached_targets.update({"t1", "t2"})
+        async def _get_targets(self):
+            return [{"id": "t1"}, {"id": "t2"}]
+        attach_calls = []
+        async def _attach(self, uuids, attach=True):
+            attach_calls.append(uuids)
+            return True
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 0
+        assert attach_calls == []
+
+    async def test_post_spawn_handles_get_targets_failure(self, monkeypatch):
+        c = self._make_client()
+        async def _get_targets(self):
+            raise RuntimeError("connection refused")
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 0  # graceful — return 0, не raise
+
+    async def test_post_spawn_handles_attach_failure(self, monkeypatch):
+        c = self._make_client()
+        async def _get_targets(self):
+            return [{"id": "new-id"}]
+        async def _attach(self, uuids, attach=True):
+            raise RuntimeError("RDBG 500")
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 0
+        # known_attached_targets НЕ обновлён (attach failed)
+        assert "new-id" not in c._known_attached_targets
+
+    async def test_post_spawn_skips_targets_without_id(self, monkeypatch):
+        c = self._make_client()
+        async def _get_targets(self):
+            return [{"id": ""}, {"name": "no-id-field"}, {"id": "real-id"}]
+        attach_calls = []
+        async def _attach(self, uuids, attach=True):
+            attach_calls.append(list(uuids))
+            return True
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 1
+        assert attach_calls == [["real-id"]]
+
+
 class TestValidateInfobaseAlias:
     def test_skipped_when_rac_not_found(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)

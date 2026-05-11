@@ -437,6 +437,8 @@ class RDBGClient:
         except Exception as e:
             log.debug("[cleanup_stale] getDebugID failed (no stale session): %s", e)
 
+    POST_SPAWN_POLL_INTERVAL = 3  # iterations × 2s sleep = ~6s между polls
+
     async def _ping_loop(self) -> None:
         """Periodic ping: keep session alive. Dispatch happens inside ping().
 
@@ -449,16 +451,69 @@ class RDBGClient:
         Post-fix: ping() dispatches inline. This loop just keeps the session
         alive (heartbeat — без него dbgs.exe GC'нет debug UI ~60с) и
         делегирует обработку событий в ping().
+
+        Roadmap 260511 §P0.4 (2026-05-11): каждые POST_SPAWN_POLL_INTERVAL
+        итераций (default 3 = ~6с) дополнительно вызывает get_targets() и
+        diff'ит против _known_attached_targets. Закрывает residual RC2 gap:
+        HTTP-service spawned rphost'ы (через 1c-mcp-crud execute_code) видны
+        в getDbgAllTargetStates, но НЕ emit'ят DBGUIExtCmdInfoStarted к
+        нашей session → без polling attach_debug_targets никогда не
+        вызовется → BPs не fire. Polling auto-attach'ит такие targets.
         """
         try:
+            poll_counter = 0
             while self._attached and self._registered:
                 await asyncio.sleep(2.0)
                 try:
                     await self.ping()  # dispatches internally
                 except Exception as e:
                     log.debug("ping failed: %s", e)
+                poll_counter += 1
+                if poll_counter >= self.POST_SPAWN_POLL_INTERVAL:
+                    poll_counter = 0
+                    try:
+                        await self._post_spawn_auto_attach()
+                    except Exception as e:
+                        log.debug("post-spawn poll failed: %s", e)
         except asyncio.CancelledError:
             pass
+
+    async def _post_spawn_auto_attach(self) -> int:
+        """Detect targets not yet attached + attach them. Roadmap 260511 §P0.4.
+
+        Background polling, вызывается из _ping_loop каждые ~6с. Получает
+        список всех target'ов от RDBG (`getDbgAllTargetStates`), сравнивает
+        с `_known_attached_targets`, attach'ит любые новые.
+
+        Closes residual RC2 gap: HTTP-service spawned rphost emit'ит
+        targetStarted событие на свою dbgs session, но события могут не
+        дойти до нашего UI до явного attach. Periodic poll guarantees
+        eventual attachment.
+
+        Returns: количество newly attached targets (для логирования / тестов).
+        """
+        try:
+            targets = await self.get_targets()
+        except Exception as e:
+            log.debug("post-spawn poll get_targets failed: %s", e)
+            return 0
+        new_ids: list[str] = []
+        for t in targets:
+            tid = t.get("id")
+            if tid and tid not in self._known_attached_targets:
+                new_ids.append(tid)
+        if not new_ids:
+            return 0
+        try:
+            await self.attach_debug_targets(new_ids, attach=True)
+            for tid in new_ids:
+                self._known_attached_targets.add(tid)
+            log.info("[post-spawn] auto-attached %d new target(s): %s",
+                     len(new_ids), [tid[:8] for tid in new_ids])
+            return len(new_ids)
+        except Exception as e:
+            log.warning("post-spawn attach failed: %s", e)
+            return 0
 
     # Real-world finding 2026-05-09 §13.18: RDBG может emit `cmdIDNum=N` без
     # literal `cmdId="literal"`. Map ordinal → cmdId per yukon39 DBGUIExtCmds
