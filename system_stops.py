@@ -39,6 +39,10 @@ async def maybe_auto_continue_system_stop(client, target_id, stop_by_bp) -> bool
             client._known_attached_targets.add(target_id)
         except Exception as e:
             log.warning("[P0.G] silent-arm attach failed: %s", e)
+        pending = getattr(client, "_attached_pending", None)
+        if pending is not None:
+            pending.discard(target_id)  # housekeeping: avoid double-drain
+        log.info("[P0.G] silent-armed warm rphost target=%s", target_id[:8])
         await _drain_bp_propagation(client, target_id)
         return True
     if getattr(client, "_break_on_next_armed", False):
