@@ -19,6 +19,7 @@ test_quick*.sh
 # VS Code extension builds
 *.vsix
 
-# Runtime debug artifacts (HMR session persistence + P0.B logpoint JSONL)
+# Runtime debug artifacts (HMR session persistence + P0.B logpoint JSONL + P1.B ZIP bundles)
 data/debug_sessions/
 data/debug_logs/
+data/debug_artifacts/

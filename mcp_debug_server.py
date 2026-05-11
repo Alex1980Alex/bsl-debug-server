@@ -31,6 +31,7 @@ import uuid_index
 import bp_conditions  # P0.A roadmap 260511
 import logpoints  # P0.B roadmap 260511
 import system_stops  # P0.D roadmap 260511
+import artifacts  # P1.B roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -2633,7 +2634,11 @@ async def debug_session_summary(format: str = "json") -> str:
     Tracking is in-process counters (append-only); no DB persistence.
 
     Args:
-        format: "json" (structured) | "markdown" (human-readable PR transcript)
+        format: "json" (structured) | "markdown" (human-readable PR transcript) |
+                "artifacts" (P1.B roadmap 260511: ZIP bundle с summary.json +
+                summary.md + breakpoints_cache.json + stop_events.json +
+                logpoint_log.jsonl (если есть) + stack_snapshots/<tid>.json).
+                Returns `{path, size_bytes, files[]}`. ZIP в `data/debug_artifacts/<session>.zip`
 
     Если нет активной session (debug_connect не вызывался) — возвращает
     {"status": "no_session"}.
@@ -2676,23 +2681,31 @@ async def debug_session_summary(format: str = "json") -> str:
     if stale:
         summary["_stale_hint"] = stale
     if format == "markdown":
-        bp = summary["breakpoints"]
-        ev = summary["evaluations"]
-        rec = summary["recycle"]
-        md_lines = [
-            f"## Debug Session {summary['session_id'][:8]} ({summary['started_at']})",
-            f"- Infobase: **{summary['infobase_alias']}**",
-            f"- BPs: **{bp['set_count']} set, {bp['fire_count']} fired** "
-            f"({(bp['fire_rate'] or 0) * 100:.0f}% fire rate)",
-            f"- Locations: {bp['by_location'] or '—'}",
-            f"- Evals: **{ev['count']}** (failures: {ev['failures']})",
-            f"- UI+ retries: **{summary['ui_plus_retries']}**",
-            f"- Recycle: invoked={rec['force_invoked']}, method={rec['method_used'] or '—'}",
-            f"- Stop events: **{len(summary['stop_events'])}**",
-            f"- Targets seen: {len(summary['rphosts_seen'])}",
-        ]
-        return "\n".join(md_lines)
+        return _render_summary_md(summary)
+    if format == "artifacts":
+        result = artifacts.build_session_zip(_client, summary, _render_summary_md)
+        return json.dumps(result, ensure_ascii=False, indent=2)
     return json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+def _render_summary_md(summary: dict) -> str:
+    """P1.B: extracted markdown render for reuse via artifacts ZIP bundle."""
+    bp = summary["breakpoints"]
+    ev = summary["evaluations"]
+    rec = summary["recycle"]
+    md_lines = [
+        f"## Debug Session {summary['session_id'][:8]} ({summary['started_at']})",
+        f"- Infobase: **{summary['infobase_alias']}**",
+        f"- BPs: **{bp['set_count']} set, {bp['fire_count']} fired** "
+        f"({(bp['fire_rate'] or 0) * 100:.0f}% fire rate)",
+        f"- Locations: {bp['by_location'] or '—'}",
+        f"- Evals: **{ev['count']}** (failures: {ev['failures']})",
+        f"- UI+ retries: **{summary['ui_plus_retries']}**",
+        f"- Recycle: invoked={rec['force_invoked']}, method={rec['method_used'] or '—'}",
+        f"- Stop events: **{len(summary['stop_events'])}**",
+        f"- Targets seen: {len(summary['rphosts_seen'])}",
+    ]
+    return "\n".join(md_lines)
 
 
 @mcp.tool()
