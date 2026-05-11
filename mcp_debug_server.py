@@ -2972,6 +2972,7 @@ async def debug_launch_thin_client(infobase_alias: str = "",
     target_registered = False
     first_target_id = None
     elapsed_ms = 0
+    not_connected_warning = None
     if _client and _client._attached:
         import time as _t
         start = _t.monotonic()
@@ -2988,11 +2989,15 @@ async def debug_launch_thin_client(infobase_alias: str = "",
                 break
             await asyncio.sleep(0.5)
         elapsed_ms = int((_t.monotonic() - start) * 1000)
+    else:
+        not_connected_warning = (
+            "Not connected to debug agent — target_registered detection "
+            "skipped. Call debug_connect first для polling.")
     # Hide password в command_line на возврате
     command_line_safe = " ".join(
         ("/P***" if arg == password and password else f'"{arg}"' if " " in arg else arg)
         for arg in args)
-    return json.dumps({
+    response = {
         "status": "ok" if target_registered else "launched",
         "pid": proc.pid,
         "command_line": command_line_safe,
@@ -3002,7 +3007,16 @@ async def debug_launch_thin_client(infobase_alias: str = "",
         "note": ("Target not yet registered — perform any action в GUI "
                  "to trigger BSL execution, then debug_wait_for_target"
                  if not target_registered else None),
-    }, ensure_ascii=False, indent=2)
+    }
+    if not_connected_warning:
+        response["warning"] = not_connected_warning
+    if password:
+        response["security_note"] = (
+            "/P password передаётся через CLI argv — виден в OS process list "
+            "(Get-Process | Select CommandLine). НЕ использовать в shared/"
+            "production контекстах. Предпочтительно: сохранённые credentials "
+            "в Windows-storage клиента или Windows-auth.")
+    return json.dumps(response, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -3026,7 +3040,8 @@ async def debug_wait_for_target(timeout_sec: int = 10,
     timeout_sec = max(1, min(60, timeout_sec))
     client = _get_client()
     if not client._attached:
-        return json.dumps({"error": "Not connected. Call debug_connect first."})
+        return json.dumps({"error": "Not connected. Call debug_connect first."},
+                          ensure_ascii=False, indent=2)
     start = _t.monotonic()
     while _t.monotonic() - start < timeout_sec:
         try:
