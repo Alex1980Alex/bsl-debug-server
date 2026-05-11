@@ -37,6 +37,31 @@ MODULE_PROPERTY_FILES: dict[str, tuple[str, Optional[str]]] = {
     "078a6af8-d22c-4248-9c33-7e90075a3d2c": ("CommandModule.bsl", "Commands"),
 }
 
+# P0.C roadmap 260511: kind (mdo root tag) → Russian FQN prefix
+_KIND_FQN = {
+    "document": "Документ", "catalog": "Справочник",
+    "informationregister": "РегистрСведений",
+    "accumulationregister": "РегистрНакопления",
+    "accountingregister": "РегистрБухгалтерии",
+    "calculationregister": "РегистрРасчёта",
+    "chartofcharacteristictypes": "ПланВидовХарактеристик",
+    "chartofaccounts": "ПланСчетов",
+    "chartofcalculationtypes": "ПланВидовРасчёта",
+    "businessprocess": "БизнесПроцесс", "task": "Задача",
+    "exchangeplan": "ПланОбмена", "enum": "Перечисление",
+    "report": "Отчёт", "dataprocessor": "Обработка",
+    "commonmodule": "ОбщийМодуль", "subsystem": "Подсистема",
+}
+# propertyID → Russian module-kind suffix
+_PROP_FQN = {
+    "d1b64a2c-8078-4982-8190-8f81aefda192": "МодульМенеджера",
+    "a637f77f-3840-441d-a1c3-699c8c5cb7e0": "МодульОбъекта",
+    "9f36fd70-4bf4-47f6-b235-935f73aab43f": "МодульНабораЗаписей",
+    "32e087ab-1491-49b6-aba7-43571b41ac2b": "МодульФормы",
+    "078a6af8-d22c-4248-9c33-7e90075a3d2c": "МодульКоманды",
+    "d5963243-262e-4398-b4d7-fb16d06484f6": "",  # CommonModule whole-module
+}
+
 # Default location relative to repo root — override via env var or arg.
 DEFAULT_CONFIG_SRC = Path(
     r"C:\1С-Framework\ИБTransportManagementDevelop\Конфигурация\src"
@@ -194,6 +219,30 @@ class UUIDIndex:
         idx = self._ensure_index()
         return idx.get(object_id.lower())
 
+    def get_source_info(self, object_id: str, property_id: str) -> Optional[dict]:
+        """P0.C: return {fqn, file_path, exists} for (oid, pid). None if unknown."""
+        rec = self.lookup(object_id)
+        if not rec:
+            return None
+        path = self.resolve(object_id, property_id)
+        kind_ru = _KIND_FQN.get((rec.get("kind") or "").lower(), rec.get("kind", ""))
+        if rec.get("child_kind") == "forms":
+            fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Форма.{rec['name']}"
+        elif rec.get("child_kind") == "commands":
+            fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Команда.{rec['name']}"
+        else:
+            suffix = _PROP_FQN.get((property_id or "").lower(), "")
+            fqn = f"{kind_ru}.{rec['name']}" + (f".{suffix}" if suffix else "")
+        try:
+            rel_path = str(path.relative_to(self.config_src)) if path else None
+        except (ValueError, AttributeError):
+            rel_path = str(path) if path else None
+        return {
+            "fqn": fqn,
+            "file_path": rel_path,
+            "exists": bool(path and path.exists()),
+        }
+
 
 # Singleton convenience for in-process callers
 _default: Optional[UUIDIndex] = None
@@ -211,3 +260,8 @@ def get_default_index() -> UUIDIndex:
 def resolve_uuid(object_id: str, property_id: str) -> Optional[Path]:
     """Module-level convenience — uses default singleton index."""
     return get_default_index().resolve(object_id, property_id)
+
+
+def get_source_info(object_id: str, property_id: str) -> Optional[dict]:
+    """P0.C roadmap 260511: convenience wrapper around UUIDIndex.get_source_info."""
+    return get_default_index().get_source_info(object_id, property_id)

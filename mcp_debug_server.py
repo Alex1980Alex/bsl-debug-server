@@ -2860,8 +2860,20 @@ async def debug_stack_trace(target_id: str = "") -> str:
                         ensure_ascii=False, indent=2,
                     )
         stack = await client.get_call_stack(target_id)
+        # P0.C roadmap 260511: enrich each frame with resolved_source (FQN + file path)
+        enriched = []
+        for frame in stack:
+            if isinstance(frame, dict):
+                mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
+                info = uuid_index.get_source_info(
+                    mod.get("objectID", ""), mod.get("propertyID", ""),
+                )
+                if info:
+                    frame = dict(frame)
+                    frame["resolved_source"] = info
+            enriched.append(frame)
         return json.dumps(
-            {"target_id": target_id, "stack": stack, "depth": len(stack)},
+            {"target_id": target_id, "stack": enriched, "depth": len(enriched)},
             ensure_ascii=False, indent=2,
         )
     except Exception as e:
