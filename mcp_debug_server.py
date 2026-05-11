@@ -34,6 +34,7 @@ import system_stops  # P0.D roadmap 260511
 import artifacts  # P1.B roadmap 260511
 import coverage as bsl_coverage  # P1.A roadmap 260511
 import exception_bps  # P3.B roadmap 260511
+import snapshot  # P2.A roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -247,6 +248,9 @@ class RDBGClient:
         # P3.B roadmap 260511: exception BP filters. Empty list = halt all exceptions
         # (backward compat). Non-empty = halt only if any filter matches.
         self._exception_bp_filters: list[dict] = []
+        # P2.A roadmap 260511: snapshot replay — when True, every stop event
+        # (callStackFormed + rteProcessing) appends entry to debug_replays JSONL.
+        self._recording_enabled: bool = False
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -712,6 +716,10 @@ class RDBGClient:
                 if obj_id_top and line_no != "?":
                     key = f"{obj_id_top}:{line_no}"
                     self._bp_by_location[key] = self._bp_by_location.get(key, 0) + 1
+            # P2.A roadmap 260511: replay snapshot recording (after metrics gate so
+            # only user-visible stops are recorded)
+            if not stop_suppressed:
+                snapshot.record(self, target_id, self._stop_reason_by_target.get(target_id, "bp"), stack)
 
         elif cmd_type == "rteProcessing":
             # 🟠 IMPORTANT: unhandled exception — also a stop event
@@ -738,6 +746,8 @@ class RDBGClient:
                 )
                 if suppressed:
                     return
+            # P2.A roadmap 260511: replay snapshot for user-visible exception
+            snapshot.record(self, target_id, "exception", stack, exc if isinstance(exc, dict) else None)
 
         elif cmd_type == "targetQuit":
             if target_id:
@@ -3355,6 +3365,67 @@ async def debug_coverage_export(output_path: str = "") -> str:
         output_path = str(out_dir / f"{sess}.xml")
     result = bsl_coverage.export_generic_coverage_xml(client, output_path)
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_session_record(enable: bool = True) -> str:
+    """P2.A roadmap 260511: toggle session snapshot recording.
+
+    When enabled, every user-visible stop event (BP fire / exception not filtered)
+    appends snapshot entry to `data/debug_replays/<session>.jsonl`. Entry shape:
+    `{ts, iso, session_id, target_id, reason, stack, exception?}`.
+
+    NOT true time-travel — snapshots are read-only post-mortem inspection. Use
+    `debug_replay_seek(index)` / `debug_replay_list()` для retrieval.
+
+    Args:
+        enable: True (default) — start recording. False — stop recording.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    client._recording_enabled = bool(enable)
+    return json.dumps({
+        "status": "recording_enabled" if enable else "recording_disabled",
+        "recording_enabled": client._recording_enabled,
+        "session_id": getattr(client, "session_id", None),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_replay_list() -> str:
+    """P2.A roadmap 260511: list snapshots recorded in current session.
+
+    Returns array of `{index, iso, target_id, reason, line, has_exception}`.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    sess = getattr(client, "session_id", None)
+    snapshots = snapshot.list_snapshots(sess) if sess else []
+    return json.dumps({
+        "session_id": sess,
+        "count": len(snapshots),
+        "snapshots": snapshots,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_replay_seek(index: int) -> str:
+    """P2.A roadmap 260511: retrieve full snapshot at given index.
+
+    Returns full entry: `{ts, iso, session_id, target_id, reason, stack, exception?}`
+    or `{error: "out of range"}`.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    sess = getattr(client, "session_id", None)
+    entry = snapshot.seek_snapshot(sess, index) if sess else None
+    if entry is None:
+        return json.dumps({"error": "out of range", "index": index, "session_id": sess},
+                          ensure_ascii=False, indent=2)
+    return json.dumps(entry, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
