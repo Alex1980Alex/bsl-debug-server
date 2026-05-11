@@ -19,6 +19,7 @@ import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -28,6 +29,7 @@ from mcp.server.fastmcp import FastMCP
 import bsl_locals
 import uuid_index
 import bp_conditions  # P0.A roadmap 260511
+import logpoints  # P0.B roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -221,6 +223,10 @@ class RDBGClient:
         # RDBG не имеет native hit-count → wrapper-level enforcement в _handle_command.
         self._hit_conditions: dict[tuple, str] = {}  # (oid,pid,line) -> ">5" | "%3" | "=10"
         self._hit_counters: dict[tuple, int] = {}    # (oid,pid,line) -> count
+        # P0.B roadmap 260511: logpoint templates per (object_id, property_id, line).
+        # На callStackFormed: render → write JSONL → auto-Continue (no user-visible halt).
+        self._logpoints: dict[tuple, str] = {}  # (oid,pid,line) -> "Контр={Контр.ИНН}"
+        self._log_dir: Path = Path(__file__).parent / "data" / "debug_logs"
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -629,8 +635,14 @@ class RDBGClient:
             self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
             log.info("[event] CallStackFormed: target=%s frames=%d reason=%s",
                      target_id[:8], len(stack), self._stop_reason_by_target[target_id])
+            # P0.B roadmap 260511: logpoint check (render+log+auto-Continue, never user-visible)
+            logpoint_fired = False
+            if stop_by_bp and stack and self._logpoints:
+                logpoint_fired = await logpoints.fire_logpoint(
+                    self, target_id, stack, self._log_dir,
+                )
             # P0.A roadmap 260511: hit_condition enforcement
-            if stop_by_bp and stack and self._hit_conditions:
+            if not logpoint_fired and stop_by_bp and stack and self._hit_conditions:
                 await bp_conditions.auto_continue_if_unsatisfied(self, target_id, stack)
             # §12.3 Level 3 — track stop event для session_summary
             from datetime import datetime as _dt
@@ -1350,6 +1362,12 @@ class RDBGClient:
             self._hit_conditions[key] = hit_condition
             self._hit_counters.setdefault(key, 0)
 
+    def _record_logpoint(self, object_id, property_id, lines, template):
+        """P0.B: register logpoint template per (oid, pid, line)."""
+        for ln in lines:
+            key = (object_id, property_id, int(ln))
+            self._logpoints[key] = template
+
     async def set_breakpoints(
         self,
         module_type: str,
@@ -1362,6 +1380,7 @@ class RDBGClient:
         version: str = "",
         condition: str = "",
         hit_condition: str = "",
+        logpoint_template: str = "",
     ) -> list[dict]:
         """Set breakpoints on specific lines in a BSL module.
 
@@ -1390,6 +1409,8 @@ class RDBGClient:
         }
         if hit_condition:
             self._record_hit_condition(object_id, property_id, lines, hit_condition)
+        if logpoint_template:
+            self._record_logpoint(object_id, property_id, lines, logpoint_template)
         groups = _aggregate_breakpoints(self._set_breakpoints_cache, new_entry)
         module_bp_infos: list = []
         for (mt, oid, pid, eid, url_, ext_, ver_), bp_lines in groups.items():
@@ -2975,6 +2996,56 @@ async def debug_set_breakpoint(
         "line": line,
         "module_type": module_type,
         "response": result,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_set_logpoint(
+    object_id: str,
+    line: int,
+    message_template: str,
+    module_type: str = "CommonModule",
+    property_id: str = "",
+) -> str:
+    """Set a logpoint (tracepoint): log + auto-Continue without user-visible halt.
+
+    Roadmap 260511 P0.B. VS Code DAP Logpoint analog: sets a wrapper-side BP,
+    on hit renders message_template (with {expr} placeholders evaluated against
+    current stack frame), appends JSONL entry to data/debug_logs/<session>.jsonl,
+    then auto-Continue.
+
+    Args:
+        object_id: UUID of metadata object.
+        line: Line number.
+        message_template: e.g. "ИНН={Контрагент.ИНН} flag={Флаг}".
+        module_type: CommonModule|ManagerModule|ObjectModule|RecordSetModule|FormModule|CommandModule.
+        property_id: Optional explicit propertyID UUID.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    xml_module_type = module_type
+    if not property_id or property_id == ZERO_UUID:
+        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
+        if kind_uuid:
+            property_id = kind_uuid
+            xml_module_type = "ConfigModule"
+    await client.set_breakpoints(
+        module_type=xml_module_type,
+        object_id=object_id,
+        property_id=property_id,
+        lines=[line],
+        logpoint_template=message_template,
+    )
+    return json.dumps({
+        "status": "logpoint_set",
+        "object_id": object_id,
+        "property_id": property_id,
+        "line": line,
+        "module_type": module_type,
+        "message_template": message_template,
+        "log_path": str(client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.jsonl"),
+        "placeholders": logpoints.extract_placeholders(message_template),
     }, ensure_ascii=False, indent=2)
 
 
