@@ -231,6 +231,9 @@ class RDBGClient:
         # P0.D roadmap 260511: armed by set_break_on_next_statement; cleared after first stop.
         # Used by system_stops.maybe_auto_continue_system_stop to keep user-requested stops visible.
         self._break_on_next_armed: bool = False
+        # P0.E roadmap 260511: targets freshly spawned + auto-attached. First cascade
+        # halt for these acts as BP-propagation window (drain BPs, wait, Continue).
+        self._attached_pending: set[str] = set()
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -618,6 +621,9 @@ class RDBGClient:
                         except Exception as e:
                             log.warning("BP re-apply failed for %s: %s",
                                         target_id[:8], e)
+                    # P0.E: mark target as pending BP-propagation drain.
+                    # First cascade halt for this target → drain BPs + brief wait + Continue.
+                    self._attached_pending.add(target_id)
                 except Exception as e:
                     log.warning("auto-attach failed for %s: %s", target_id[:8], e)
 
