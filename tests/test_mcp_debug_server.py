@@ -928,19 +928,20 @@ class TestClearBreakOnNextStatement:
 
 @pytest.mark.asyncio
 class TestSetAutoAttachSettings:
-    async def test_default_targets_server_and_managed_client(self, client):
-        # Fix #1 ROLLBACK 2026-05-10 (autonomous L2 test detected regression):
-        # RDBG XSD enum для targetType ограничен [Server, ManagedClient]; values
-        # HTTPService/WebService/BackgroundJob → HTTP 400. Default возвращён к
-        # 2 safe types. Multi-rphost IIS scenario → force-recycle (Fix #2).
+    async def test_default_targets_expanded_after_p0_5(self, client):
+        # Roadmap 260511 §P0.5 (2026-05-11): расширенный filter после yukon39
+        # XSD review. debugAutoAttach.xsd подтверждает DebugTargetType enum
+        # включает HTTPService/WEBService/JOB/JobFileMode/COMConnector/OData.
+        # Previous ROLLBACK ошибочно считал их invalid → BPs не fire на JOB
+        # rphost (1c-mcp-crud execute_code spawn'ит как JOB).
         await client.set_auto_attach_settings()
         cmd, body = client._post.await_args.args
         assert cmd == "setAutoAttachSettings"
-        assert "<debugAutoAttach:targetType>Server</debugAutoAttach:targetType>" in body
-        assert "<debugAutoAttach:targetType>ManagedClient</debugAutoAttach:targetType>" in body
-        # Anti-regression: НЕ должно быть invalid XSD enum values
-        for invalid in ("HTTPService", "WebService", "BackgroundJob"):
-            assert invalid not in body
+        # Must include all 8 default types from P0.5 expansion
+        for t in ("Server", "ManagedClient", "HTTPService", "WEBService",
+                  "JOB", "JobFileMode", "COMConnector", "OData"):
+            assert f"<debugAutoAttach:targetType>{t}</debugAutoAttach:targetType>" in body, \
+                f"Missing targetType: {t}"
         # Anti-regression: must NOT route через cmd=initSettings (pre-fix bug)
         assert "breakOnNextLine" not in body
 

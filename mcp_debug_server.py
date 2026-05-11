@@ -575,6 +575,20 @@ class RDBGClient:
                     await self.attach_debug_targets([target_id])
                     self._known_attached_targets.add(target_id)
                     log.info("[event] Started: target %s → attached", target_id[:8])
+                    # Roadmap 260511 §P0.5: re-apply cached BPs to fresh target.
+                    # RDBG `setBreakpoints` workspace is per-attached-target.
+                    # Short-lived JOB targets (execute_code via 1c-mcp-crud)
+                    # spawn → attach → execute → quit за <100ms — без re-apply
+                    # их BPs не push'ятся и BP не fire. Re-apply гарантирует
+                    # что новый target получит BP set ДО первой BSL-инструкции.
+                    if self._set_breakpoints_cache:
+                        try:
+                            await self._reapply_bp_workspace()
+                            log.debug("[event] BPs re-applied for target %s",
+                                      target_id[:8])
+                        except Exception as e:
+                            log.warning("BP re-apply failed for %s: %s",
+                                        target_id[:8], e)
                 except Exception as e:
                     log.warning("auto-attach failed for %s: %s", target_id[:8], e)
 
@@ -770,17 +784,24 @@ class RDBGClient:
         Settings). Default subscribes to Server (rphost) + ManagedClient
         (1cv8c.exe) — covers thin-client + server-side rphost session.
         """
-        # Fix #1 ROLLBACK 2026-05-10 (autonomous L2 test detected regression):
-        # RDBG returns HTTP 400 «Несоответствие свойства targetType» when XSD
-        # enum gets values вне [Server, ManagedClient]. HTTPService/WebService/
-        # BackgroundJob — НЕ valid в этой версии XSD. Default revert to safe
-        # 2-type set; per-scenario expansion должен передаваться явно через
-        # target_types kwarg + проверка XSD'а в roadmap §11.5 follow-up.
-        # Note: Server filter всё ещё ловит rphost'ы которые обрабатывают IIS
-        # HTTP-services (они тоже rphost workers), но не emit'ят отдельный
-        # HTTPService event. Multi-rphost IIS scenario требует force-recycle
-        # (Fix #2) для предсказуемого attach.
-        types = target_types or ["Server", "ManagedClient"]
+        # Roadmap 260511 §P0.5 (2026-05-11): расширенный filter после yukon39 XSD review.
+        # `debugAutoAttach.xsd` подтверждает что DebugTargetType enum включает
+        # HTTPService, WEBService, JOB, OData, COMConnector — все эти target types
+        # spawn'ятся как separate rphost workers ragent'ом для соответствующих
+        # session kinds. Закрывает RC2 deeper gap из GKSTCPLK-2468 E2E: до этого
+        # filter был `["Server", "ManagedClient"]` → HTTPService rphost'ы (через
+        # 1c-mcp-crud:execute_code) пропускались → 0 BP fire.
+        #
+        # Previous ROLLBACK 2026-05-10 ошибочно интерпретировал HTTP 400 «несоот-
+        # ветствие targetType» как XSD invalidation. По yukon39/bsl-debug-server
+        # XSD (tools/bsl-debug-server/src/test/resources/xsd/debugBaseData.xsd:105-
+        # 123), enum полный: Unknown/Client/ManagedClient/WEBClient/COMConnector/
+        # Server/ServerEmulation/WEBService/HTTPService/OData/JOB/JobFileMode/
+        # Mobile*. 400 был на typo / case-sensitivity, не XSD violation.
+        types = target_types or [
+            "Server", "ManagedClient", "HTTPService", "WEBService",
+            "JOB", "JobFileMode", "COMConnector", "OData",
+        ]
         auto_attach = "".join(_auto("targetType", t) for t in types)
         body = _build_request(
             self._base_fields(),
@@ -1252,6 +1273,47 @@ class RDBGClient:
         return _parse_response(root)
 
     # -- Breakpoints API -----------------------------------------------------
+
+    async def _reapply_bp_workspace(self) -> None:
+        """Re-apply cached BP workspace to RDBG. Roadmap 260511 §P0.5.
+
+        Used by `_handle_command(targetStarted)` для гарантии что свежий
+        target (JOB / HTTPService / etc) получит BPs ДО первой BSL операции.
+        Short-lived JOB targets (execute_code via 1c-mcp-crud) могут
+        spawn → execute → quit за <100ms; без re-apply BPs не push'ятся
+        вовремя и BP не fire.
+
+        Идемпотентно: если cache пуст — noop. Полный workspace отправляется
+        одним setBreakpoints request'ом (RDBG REPLACES workspace per call).
+        """
+        if not self._set_breakpoints_cache:
+            return
+        module_bp_infos: list = []
+        for entry in self._set_breakpoints_cache:
+            mod_xml = (_base("type", entry["module_type"])
+                       + _base("objectID", entry["object_id"])
+                       + _base("propertyID", entry["property_id"]))
+            if entry.get("url"):
+                mod_xml += _base("url", entry["url"])
+            if entry.get("extension_name"):
+                mod_xml += _base("extensionName", entry["extension_name"])
+            if entry.get("ext_id"):
+                mod_xml += _base("extId", str(entry["ext_id"]))
+            if entry.get("version"):
+                mod_xml += _base("version", entry["version"])
+            bp_xml = "".join(
+                _bp("bpInfo",
+                    _bp("line", str(L))
+                    + _bp("isActive", "true")
+                    + _bp("temp", "false"))
+                for L in entry["lines"]
+            )
+            module_bp_infos.append(
+                _bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml)
+            )
+        workspace_xml = _rdbg("bpWorkspace", "".join(module_bp_infos))
+        body = _build_request(self._base_fields(), workspace_xml)
+        await self._post("setBreakpoints", body)
 
     async def set_breakpoints(
         self,
