@@ -2250,6 +2250,37 @@ class TestRecycleStrategy:
         assert result["reason"] == "invalid_recycle_strategy"
         assert "all_rphosts_of_ib" in result["allowed"]
 
+    async def test_all_rphosts_of_cluster_combines_snapshot_and_rac(
+            self, monkeypatch):
+        """HIGH RISK strategy — kills snapshot + cluster-wide rac process list,
+        dedup'ит pids между источниками. Smoke coverage для критичной ветки
+        (review feedback от code-verify quality-review)."""
+        await self._setup(monkeypatch)
+        # Snapshot returns pids [100, 200]
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 100, "name": "rphost.exe"},
+                                     {"pid": 200, "name": "rphost.exe"}])
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c-uuid")
+        # rac returns pids [200 (dup), 300, 400] — 200 уже в snapshot
+        monkeypatch.setattr(mds, "_rac_list_processes_by_pid",
+                            lambda exe, cl: {200: "p2-uuid",
+                                             300: "p3-uuid",
+                                             400: "p4-uuid"})
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(list(pids)) or
+                            {"killed": list(pids), "failed": []})
+        raw = await mds.debug_connect(
+            infobase_alias="X",
+            recycle_strategy="all_rphosts_of_cluster")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        # 100, 200 from snapshot + 300, 400 from rac (200 dedup'ed)
+        assert kill_calls == [[100, 200, 300, 400]]
+        assert result["force_recycle"]["strategy"] == "all_rphosts_of_cluster"
+
 
 # ---------------------------------------------------------------------------
 # Roadmap 260511 §3.1: _validate_infobase_alias helper unit tests

@@ -1569,6 +1569,11 @@ def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str,
     """List rphost OS pids serving the given infobase UUID.
 
     Used by recycle_strategy=all_rphosts_of_ib (roadmap 260511 §3.2 P0).
+
+    Encoding: cp866 для consistency с _rac_list_infobases — защита от
+    UnicodeDecodeError при exotic Windows locales (даже если этот парсер
+    смотрит только числовые pids, defensive symmetry дешевле чем silent
+    SubprocessError → пустой list).
     """
     try:
         result = subprocess.run(
@@ -1576,6 +1581,7 @@ def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str,
              f"--infobase={infobase_uuid}",
              *_rac_auth_args()],
             capture_output=True, text=True, timeout=5,
+            encoding="cp866", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError):
