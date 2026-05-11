@@ -17,9 +17,9 @@ async def maybe_auto_continue_system_stop(client, target_id, stop_by_bp) -> bool
     if getattr(client, "_break_on_next_armed", False):
         return False
     try:
-        await client.step(target_id, "Continue", simple=True)
-        client._stopped_targets.discard(target_id)
+        await client.step("Continue", target_id)
         log.info("[P0.D] auto-Continue system stop on target=%s", target_id[:8])
+        return True
     except Exception as e:
-        log.warning("[P0.D] auto-Continue system stop failed: %s", e)
-    return True
+        log.warning("[P0.D] auto-Continue system stop failed: %s — keeping visible", e)
+        return False

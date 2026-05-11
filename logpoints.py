@@ -77,8 +77,8 @@ async def fire_logpoint(client, target_id: str, stack: list, log_dir: Path) -> b
     except Exception as e:
         log.warning("logpoint JSONL write failed (%s): %s", log_dir, e)
     try:
-        await client.step(target_id, "Continue", simple=True)
-        client._stopped_targets.discard(target_id)
+        await client.step("Continue", target_id)
     except Exception as e:
         log.warning("logpoint auto-Continue failed for target=%s: %s", target_id[:8], e)
+        return False
     return True

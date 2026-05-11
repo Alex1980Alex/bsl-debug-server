@@ -2695,7 +2695,7 @@ class TestPingDispatch:
             "cmdId": "callStackFormed",
             "targetID": GOOD_UUID,
             "callStack": stack_dict,
-            "stopByBP": "false",
+            "stopByBP": "true",
         }]
         monkeypatch.setattr(mds, "_parse_response", lambda root: events)
         result = await client.ping()
@@ -2715,7 +2715,7 @@ class TestPingDispatch:
                 "cmdId": "callStackFormed",
                 "targetID": ANOTHER_UUID,
                 "callStack": [{"_tag": "frame"}],
-                "stopByBP": "false",
+                "stopByBP": "true",
             },
         ]
         monkeypatch.setattr(mds, "_parse_response", lambda root: events)

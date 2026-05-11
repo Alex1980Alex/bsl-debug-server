@@ -40,8 +40,8 @@ async def _do_check(client, target_id, mod, line):
     if eval_hit_condition(client._hit_conditions[key], client._hit_counters[key]):
         return False
     try:
-        await client.step(target_id, "Continue", simple=True)
-        client._stopped_targets.discard(target_id)
+        await client.step("Continue", target_id)
     except Exception as e:
         log.warning("auto-Continue failed for target=%s: %s", target_id[:8], e)
+        return False
     return True
