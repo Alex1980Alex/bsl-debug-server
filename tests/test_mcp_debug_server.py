@@ -953,6 +953,42 @@ class TestSetAutoAttachSettings:
         assert "ManagedClient" not in body
 
 
+@pytest.mark.asyncio
+class TestReapplyBPWorkspace:
+    """Roadmap 260511 §P0.5: re-apply BPs on targetStarted to cover
+    short-lived JOB targets (1c-mcp-crud:execute_code)."""
+
+    async def test_noop_when_cache_empty(self, client):
+        # No BPs cached → no setBreakpoints call
+        post_count_before = client._post.await_count
+        await client._reapply_bp_workspace()
+        assert client._post.await_count == post_count_before
+
+    async def test_replays_cached_bps_as_single_setbreakpoints(self, client):
+        # Seed cache with 2 BP entries (different modules)
+        client._set_breakpoints_cache = [
+            {"module_type": "ManagerModule",
+             "object_id": "obj-1", "property_id": "prop-1",
+             "lines": [80], "ext_id": 0, "url": "",
+             "extension_name": "", "version": ""},
+            {"module_type": "CommonModule",
+             "object_id": "obj-2", "property_id": "prop-2",
+             "lines": [10, 20], "ext_id": 0, "url": "",
+             "extension_name": "", "version": ""},
+        ]
+        await client._reapply_bp_workspace()
+        cmd, body = client._post.await_args.args
+        assert cmd == "setBreakpoints"
+        # Both module groups + all lines в одном request body
+        assert "<debugBaseData:objectID>obj-1</debugBaseData:objectID>" in body
+        assert "<debugBaseData:objectID>obj-2</debugBaseData:objectID>" in body
+        assert "<debugBreakpoints:line>80</debugBreakpoints:line>" in body
+        assert "<debugBreakpoints:line>10</debugBreakpoints:line>" in body
+        assert "<debugBreakpoints:line>20</debugBreakpoints:line>" in body
+        # Single bpWorkspace wrapper (replace semantics)
+        assert body.count("<debugRDBGRequestResponse:bpWorkspace>") == 1
+
+
 # ---------------------------------------------------------------------------
 # §6.3 Stale Debug UI session cleanup
 # ---------------------------------------------------------------------------

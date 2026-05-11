@@ -1284,7 +1284,13 @@ class RDBGClient:
         вовремя и BP не fire.
 
         Идемпотентно: если cache пуст — noop. Полный workspace отправляется
-        одним setBreakpoints request'ом (RDBG REPLACES workspace per call).
+        одним setBreakpoints request'ом. **RDBG `setBreakpoints` REPLACES
+        workspace per call** (Fix #5 / live finding 2026-05-10) — повторный
+        push того же state идempotent на RDBG-side.
+
+        Race note: multiple targets started simultaneously → N parallel
+        calls. Поскольку RDBG REPLACES, последний wins; intermediate
+        излишни, но НЕ вредны (correctness preserved, ~N HTTP cost).
         """
         if not self._set_breakpoints_cache:
             return
