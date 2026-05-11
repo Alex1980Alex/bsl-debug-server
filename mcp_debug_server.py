@@ -1493,6 +1493,108 @@ def _rac_list_processes_by_pid(rac_exe: str, cluster: str) -> dict:
     return pid_to_uuid
 
 
+def _rac_list_infobases(rac_exe: str, cluster: str) -> list[dict]:
+    """Run `rac infobase summary list --cluster=<UUID>`, parse {uuid, name} pairs.
+
+    Returns: list[{"uuid": "...", "name": "..."}] — empty list если cluster
+    unreachable / rac fails. Used by _validate_infobase_alias и
+    _rac_list_rphosts_of_infobase (recycle_strategy=all_rphosts_of_ib).
+    """
+    try:
+        result = subprocess.run(
+            [rac_exe, "infobase", f"--cluster={cluster}", "summary", "list",
+             *_rac_auth_args()],
+            capture_output=True, text=True, timeout=5,
+            encoding="cp866", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    infobases: list[dict] = []
+    current_uuid: Optional[str] = None
+    current_name: Optional[str] = None
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("infobase"):
+            if current_uuid and current_name:
+                infobases.append({"uuid": current_uuid, "name": current_name})
+            current_uuid = None
+            current_name = None
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                u = parts[1].strip()
+                if len(u) >= 32 and "-" in u:
+                    current_uuid = u
+        elif line.startswith("name"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                current_name = parts[1].strip()
+    if current_uuid and current_name:
+        infobases.append({"uuid": current_uuid, "name": current_name})
+    return infobases
+
+
+def _validate_infobase_alias(alias: str) -> dict:
+    """Cross-check infobase_alias против реального cluster IB list.
+
+    Returns dict с одним из трёх состояний:
+    - {"status": "valid", "uuid": "<UUID>", "name": alias} — alias найден
+    - {"status": "invalid", "available": [<names>]} — alias НЕ найден
+    - {"status": "skipped", "reason": "<rac_exe_not_found|cluster_unreachable
+       |empty_infobase_list>"} — validation невозможна (graceful degradation,
+       НЕ блокирует connect)
+
+    Roadmap 260511 §3.1 (P0). Closes RC1 из GKSTCPLK-2468 incident.
+    """
+    rac_exe = _find_rac_exe()
+    if not rac_exe:
+        return {"status": "skipped", "reason": "rac_exe_not_found"}
+    cluster = _rac_get_cluster_uuid(rac_exe)
+    if not cluster:
+        return {"status": "skipped", "reason": "cluster_unreachable"}
+    infobases = _rac_list_infobases(rac_exe, cluster)
+    if not infobases:
+        return {"status": "skipped", "reason": "empty_infobase_list"}
+    for ib in infobases:
+        if ib["name"] == alias:
+            return {"status": "valid", "uuid": ib["uuid"], "name": alias}
+    return {"status": "invalid",
+            "available": [ib["name"] for ib in infobases]}
+
+
+def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str,
+                                  infobase_uuid: str) -> list[int]:
+    """List rphost OS pids serving the given infobase UUID.
+
+    Used by recycle_strategy=all_rphosts_of_ib (roadmap 260511 §3.2 P0).
+    """
+    try:
+        result = subprocess.run(
+            [rac_exe, "process", "list", f"--cluster={cluster}",
+             f"--infobase={infobase_uuid}",
+             *_rac_auth_args()],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    pids: list[int] = []
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("pid"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                try:
+                    pids.append(int(parts[1].strip()))
+                except ValueError:
+                    pass
+    return pids
+
+
 def _recycle_via_rac(rac_exe: str, cluster: str, pids: list,
                      pid_to_uuid: dict) -> dict:
     """Turn off rphost workers через `rac process turn-off` (graceful drain)."""
@@ -1793,7 +1895,8 @@ mcp = FastMCP("1c-debug")
 @mcp.tool()
 async def debug_connect(debug_url: str = "http://localhost:1550",
                         infobase_alias: str = "TestDB",
-                        force_recycle_rphost: bool = False) -> str:
+                        force_recycle_rphost: bool = False,
+                        recycle_strategy: str = "auto") -> str:
     """Connect to 1C debug agent and attach as debug client.
 
     IMPORTANT: Only ONE debug UI can be active per infobase.
@@ -1802,21 +1905,56 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
 
     Args:
         debug_url: URL of 1C debug agent (default: http://localhost:1550)
-        infobase_alias: Infobase name in 1C cluster
-        force_recycle_rphost: Solution A from roadmap §11.2. When True,
-            after successful attach + setAutoAttachSettings, taskkill /F
-            on every rphost.exe alive ДО connect. Ragent then spawns
-            fresh worker(s) which read the filter at registration time
-            → emit DBGUIExtCmdInfoStarted → wrapper auto-attaches → BPs
-            fire on subsequent BSL execution (closes §10 «pre-existing
-            rphost invisible» gap). Default False = preflight-warning
-            mode (response includes pre_existing_rphost_warning with
-            PIDs + next-step suggestions). RISK when True: разрыв
-            активных пользовательских сессий в killed rphost'ах.
+        infobase_alias: Infobase name in 1C cluster. Validated against
+            `rac infobase summary list` perед attach — если не найден,
+            возвращает status=error с available list (roadmap 260511 §3.1
+            P0, closes RC1 из GKSTCPLK-2468). Validation graceful skip'ится
+            если rac.exe/cluster unreachable.
+        force_recycle_rphost: DEPRECATED — используй recycle_strategy.
+            Backward-compat: True → recycle_strategy="pre_existing".
+        recycle_strategy: roadmap 260511 §3.2 P0. Один из:
+            "auto" (default) — = "pre_existing" если force_recycle_rphost=True,
+                иначе "none"
+            "none" — preflight-warning mode (текущее default поведение)
+            "pre_existing" — kill только pre-existing pids (existing
+                force_recycle_rphost=True behaviour)
+            "all_rphosts_of_ib" — kill ВСЕ rphost workers обслуживающие
+                эту IB через `rac process list --infobase` (closes RC2 —
+                HTTP-service spawned rphost вне pre-existing snapshot).
+                Требует valid infobase_alias.
+            "all_rphosts_of_cluster" — kill ВСЕ rphost cluster'а (HIGH RISK:
+                разрыв всех user sessions). Только для personal dev-баз.
     """
     global _client
     if _client and _client._attached:
         await _client.close()
+
+    # Roadmap 260511 §3.1 (P0) — validate infobase_alias ПЕРЕД attach.
+    # Closes RC1 (silent registered=true для несуществующего alias).
+    alias_validation = _validate_infobase_alias(infobase_alias)
+    if alias_validation["status"] == "invalid":
+        return json.dumps({
+            "status": "error",
+            "reason": "infobase_alias_not_found",
+            "provided": infobase_alias,
+            "available": alias_validation["available"],
+            "hint": ("Use one of available infobases. Provide the cluster IB "
+                     "name from `rac infobase list`, not IIS publication name "
+                     "or arbitrary alias. See roadmap 260511 §3.1."),
+        }, ensure_ascii=False, indent=2)
+
+    # Resolve recycle_strategy (backward-compat для force_recycle_rphost).
+    if recycle_strategy == "auto":
+        recycle_strategy = "pre_existing" if force_recycle_rphost else "none"
+    if recycle_strategy not in ("none", "pre_existing",
+                                "all_rphosts_of_ib", "all_rphosts_of_cluster"):
+        return json.dumps({
+            "status": "error",
+            "reason": "invalid_recycle_strategy",
+            "provided": recycle_strategy,
+            "allowed": ["auto", "none", "pre_existing",
+                        "all_rphosts_of_ib", "all_rphosts_of_cluster"],
+        }, ensure_ascii=False, indent=2)
 
     # Preflight (Solution B): snapshot rphost.exe ДО attach. Roadmap §11.
     pre_existing_rphosts = detect_pre_existing_rphosts()
@@ -1840,15 +1978,50 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
 
         # Solution A: force-recycle ПОСЛЕ setAutoAttachSettings — фильтр уже
         # pushed в dbgs, fresh rphost'ы прочитают его на регистрации.
+        # Roadmap 260511 §3.2 (P0): extended recycle_strategy (closes RC2).
         recycle_info: Optional[dict] = None
-        if force_recycle_rphost and pre_existing_rphosts and _client._registered:
-            pids_to_kill = [r["pid"] for r in pre_existing_rphosts]
+        pids_to_kill: list[int] = []
+        if recycle_strategy != "none" and _client._registered:
+            # Resolve pid list based on strategy
+            if recycle_strategy == "pre_existing":
+                pids_to_kill = [r["pid"] for r in pre_existing_rphosts]
+            elif recycle_strategy == "all_rphosts_of_ib":
+                # Requires resolved infobase UUID from validation step
+                if alias_validation["status"] != "valid":
+                    return json.dumps({
+                        "status": "error",
+                        "reason": "recycle_strategy_requires_valid_alias",
+                        "recycle_strategy": recycle_strategy,
+                        "alias_validation": alias_validation,
+                        "hint": ("all_rphosts_of_ib needs cluster reachable + "
+                                 "alias validated. Use recycle_strategy="
+                                 "pre_existing for snapshot-based recycle."),
+                    }, ensure_ascii=False, indent=2)
+                rac_exe = _find_rac_exe()
+                cluster = _rac_get_cluster_uuid(rac_exe) if rac_exe else None
+                if rac_exe and cluster:
+                    pids_to_kill = _rac_list_rphosts_of_infobase(
+                        rac_exe, cluster, alias_validation["uuid"])
+            elif recycle_strategy == "all_rphosts_of_cluster":
+                # HIGH RISK — kill every rphost in cluster
+                pids_to_kill = [r["pid"] for r in detect_pre_existing_rphosts()]
+                # Also include rphosts that may not be detected via process
+                # snapshot (cluster-wide perspective via rac)
+                rac_exe = _find_rac_exe()
+                cluster = _rac_get_cluster_uuid(rac_exe) if rac_exe else None
+                if rac_exe and cluster:
+                    pid_to_uuid = _rac_list_processes_by_pid(rac_exe, cluster)
+                    for pid in pid_to_uuid.keys():
+                        if pid not in pids_to_kill:
+                            pids_to_kill.append(pid)
+        if pids_to_kill:
             # Fix #4 §12.8: env BSL_DEBUG_DRY_RUN_RECYCLE=true → preview only
             import os
             dry_run = (os.environ.get("BSL_DEBUG_DRY_RUN_RECYCLE", "")
                        .lower() == "true")
-            log.warning("[connect] force-recycling pre-existing rphost(s): %s%s",
-                        pids_to_kill, " (DRY-RUN)" if dry_run else "")
+            log.warning("[connect] recycle_strategy=%s killing rphost(s): %s%s",
+                        recycle_strategy, pids_to_kill,
+                        " (DRY-RUN)" if dry_run else "")
             # §12.3 Level 3 — track recycle invocation
             _client._force_recycle_invoked = True
             kill_result = force_recycle_rphost_processes(pids_to_kill, dry_run=dry_run)
@@ -1858,6 +2031,7 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
             await asyncio.sleep(3.0)
             recycle_info = {
                 "_tag": "force_recycle_result",
+                "strategy": recycle_strategy,
                 "requested_pids": pids_to_kill,
                 "killed": kill_result["killed"],
                 "failed": kill_result["failed"],
@@ -1884,10 +2058,13 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
             "stopped_target": stopped,
         }
 
+        # Surface alias validation status в result (roadmap 260511 §3.1).
+        result["alias_validation"] = alias_validation
+
         # Solution B: preflight warning when есть pre-existing rphost'ы и
         # пользователь НЕ запросил force-recycle — surface gap явно вместо
         # silent BP-no-fire (root cause § 10).
-        if pre_existing_rphosts and not force_recycle_rphost:
+        if pre_existing_rphosts and recycle_strategy == "none":
             result["pre_existing_rphost_warning"] = {
                 "_tag": "preflight_warning",
                 "message": (
@@ -1901,10 +2078,14 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
                 "pre_existing_pids": [r["pid"] for r in pre_existing_rphosts],
                 "next_steps": [
                     "Solution C: триггер через UI запущенный ПОСЛЕ debug_connect "
-                    "(тонкий клиент с /Debug /DebuggerURL — validated)",
-                    "Solution A: retry с force_recycle_rphost=True (kills pre-"
-                    "existing, ragent spawn'ит fresh worker с активным filter; "
-                    "РИСК: разрыв активных пользовательских сессий)",
+                    "(тонкий клиент с /Debug -http /DebuggerURL=http://localhost:1550)",
+                    "Solution A (snapshot): retry с recycle_strategy=pre_existing "
+                    "(kills pre-existing snapshot pids; ragent spawn'ит fresh "
+                    "worker с активным filter; РИСК: разрыв user sessions в "
+                    "killed rphost'ах)",
+                    "Solution A+ (extended, roadmap 260511 §3.2): retry с "
+                    "recycle_strategy=all_rphosts_of_ib (covers HTTP-service "
+                    "spawned rphost вне pre-existing snapshot — closes RC2)",
                     "Manual: Console кластера → «Выключить» процесс (graceful "
                     "drain активных сессий другому worker'у) → retry connect",
                 ],

@@ -1957,6 +1957,12 @@ class TestDebugConnectPreflight:
         monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach_targets)
         monkeypatch.setattr(RDBGClient, "close", _close)
 
+        # Roadmap 260511 §3.1: mock alias validation → skipped (rac unreachable
+        # in unit-test env) so tests using arbitrary aliases like "X" proceed.
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda alias: {"status": "skipped",
+                                           "reason": "rac_exe_not_found"})
+
         # Reset the module-level singleton so every test starts cold
         mds._client = None
 
@@ -2049,6 +2055,243 @@ class TestDebugConnectPreflight:
         result = json.loads(raw)
         assert kill_calls == []  # registered=False guard works
         assert "force_recycle" not in result
+
+
+# ---------------------------------------------------------------------------
+# Roadmap 260511 §3.1 + §3.2: infobase alias validation + recycle_strategy
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestInfobaseAliasValidation:
+    """§3.1 — debug_connect validates alias against rac infobase list."""
+
+    async def _setup(self, monkeypatch, registered=True):
+        """Same as TestDebugConnectPreflight._setup_client_mocks but без
+        дефолтного alias-validation mock — каждый тест ставит свой."""
+        from mcp_debug_server import RDBGClient
+
+        async def _api_version(self): return "8.3.27"
+        async def _debug_id(self): return mds.ZERO_UUID
+        async def _attach(self, cleanup_stale=True):
+            self._attached = True
+            self._registered = registered
+            return {"result": "registered" if registered else "ibInDebug",
+                    "session_id": self.session_id,
+                    "fully_registered": registered}
+        async def _init_settings(self): return None
+        async def _clear_bons(self): return None
+        async def _set_aas(self, **kw): return None
+        async def _targets(self): return []
+        async def _attach_targets(self, ids, attach=True): return True
+        async def _close(self): pass
+
+        monkeypatch.setattr(RDBGClient, "get_api_version", _api_version)
+        monkeypatch.setattr(RDBGClient, "get_debug_id", _debug_id)
+        monkeypatch.setattr(RDBGClient, "attach", _attach)
+        monkeypatch.setattr(RDBGClient, "init_settings", _init_settings)
+        monkeypatch.setattr(RDBGClient, "clear_break_on_next_statement", _clear_bons)
+        monkeypatch.setattr(RDBGClient, "set_auto_attach_settings", _set_aas)
+        monkeypatch.setattr(RDBGClient, "get_targets", _targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach_targets)
+        monkeypatch.setattr(RDBGClient, "close", _close)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
+        async def _no_sleep(_): return None
+        monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
+        mds._client = None
+
+    async def test_alias_valid_proceeds_to_connect(self, monkeypatch):
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: {"status": "valid", "uuid": "uuid-1",
+                                       "name": a})
+        raw = await mds.debug_connect(infobase_alias="ИБTransport")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        assert result["alias_validation"]["status"] == "valid"
+
+    async def test_alias_invalid_blocks_with_available_list(self, monkeypatch):
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: {"status": "invalid",
+                                       "available": ["ИБReal", "DevBase"]})
+        raw = await mds.debug_connect(infobase_alias="WrongAlias")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert result["reason"] == "infobase_alias_not_found"
+        assert result["provided"] == "WrongAlias"
+        assert result["available"] == ["ИБReal", "DevBase"]
+        assert "hint" in result
+
+    async def test_alias_skipped_proceeds_to_connect(self, monkeypatch):
+        # rac.exe not found / cluster unreachable → skipped, не блокирует
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: {"status": "skipped",
+                                       "reason": "rac_exe_not_found"})
+        raw = await mds.debug_connect(infobase_alias="X")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        assert result["alias_validation"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+class TestRecycleStrategy:
+    """§3.2 — recycle_strategy extends force_recycle_rphost coverage."""
+
+    async def _setup(self, monkeypatch, alias_validation=None, registered=True):
+        from mcp_debug_server import RDBGClient
+        async def _api_version(self): return "8.3.27"
+        async def _debug_id(self): return mds.ZERO_UUID
+        async def _attach(self, cleanup_stale=True):
+            self._attached = True
+            self._registered = registered
+            return {"result": "registered" if registered else "ibInDebug",
+                    "session_id": self.session_id,
+                    "fully_registered": registered}
+        async def _init_settings(self): return None
+        async def _clear_bons(self): return None
+        async def _set_aas(self, **kw): return None
+        async def _targets(self): return []
+        async def _attach_targets(self, ids, attach=True): return True
+        async def _close(self): pass
+        for name, fn in (("get_api_version", _api_version),
+                         ("get_debug_id", _debug_id),
+                         ("attach", _attach),
+                         ("init_settings", _init_settings),
+                         ("clear_break_on_next_statement", _clear_bons),
+                         ("set_auto_attach_settings", _set_aas),
+                         ("get_targets", _targets),
+                         ("attach_debug_targets", _attach_targets),
+                         ("close", _close)):
+            monkeypatch.setattr(RDBGClient, name, fn)
+        async def _no_sleep(_): return None
+        monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
+        validation = alias_validation or {"status": "skipped",
+                                          "reason": "rac_exe_not_found"}
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: validation)
+        mds._client = None
+
+    async def test_default_auto_no_force_means_none(self, monkeypatch):
+        # auto + force_recycle_rphost=False → recycle_strategy resolved to "none"
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 100, "name": "rphost.exe"}])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(pids) or
+                            {"killed": [], "failed": []})
+        raw = await mds.debug_connect(infobase_alias="X")
+        result = json.loads(raw)
+        assert kill_calls == []  # "none" → no kill
+        # Warning emitted because pre_existing but strategy=none
+        assert "pre_existing_rphost_warning" in result
+
+    async def test_backward_compat_force_recycle_true(self, monkeypatch):
+        # auto + force_recycle_rphost=True → resolves to "pre_existing"
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 100, "name": "rphost.exe"},
+                                     {"pid": 200, "name": "rphost.exe"}])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(pids) or
+                            {"killed": list(pids), "failed": []})
+        raw = await mds.debug_connect(infobase_alias="X",
+                                       force_recycle_rphost=True)
+        result = json.loads(raw)
+        assert kill_calls == [[100, 200]]
+        assert result["force_recycle"]["strategy"] == "pre_existing"
+
+    async def test_all_rphosts_of_ib_requires_valid_alias(self, monkeypatch):
+        # strategy=all_rphosts_of_ib + alias=skipped → returns error
+        await self._setup(monkeypatch,
+                          alias_validation={"status": "skipped",
+                                            "reason": "rac_exe_not_found"})
+        raw = await mds.debug_connect(infobase_alias="X",
+                                       recycle_strategy="all_rphosts_of_ib")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert result["reason"] == "recycle_strategy_requires_valid_alias"
+
+    async def test_all_rphosts_of_ib_resolves_via_rac(self, monkeypatch):
+        # strategy=all_rphosts_of_ib + valid alias → kills via _rac_list_rphosts_of_infobase
+        await self._setup(monkeypatch,
+                          alias_validation={"status": "valid",
+                                            "uuid": "ib-uuid-1",
+                                            "name": "ИБReal"})
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid",
+                            lambda exe: "cluster-uuid")
+        monkeypatch.setattr(mds, "_rac_list_rphosts_of_infobase",
+                            lambda exe, cluster, ib_uuid: [555, 666])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(list(pids)) or
+                            {"killed": list(pids), "failed": []})
+        raw = await mds.debug_connect(infobase_alias="ИБReal",
+                                       recycle_strategy="all_rphosts_of_ib")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        assert kill_calls == [[555, 666]]
+        assert result["force_recycle"]["strategy"] == "all_rphosts_of_ib"
+        assert result["force_recycle"]["requested_pids"] == [555, 666]
+
+    async def test_invalid_strategy_value_blocks(self, monkeypatch):
+        await self._setup(monkeypatch)
+        raw = await mds.debug_connect(infobase_alias="X",
+                                       recycle_strategy="bogus")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert result["reason"] == "invalid_recycle_strategy"
+        assert "all_rphosts_of_ib" in result["allowed"]
+
+
+# ---------------------------------------------------------------------------
+# Roadmap 260511 §3.1: _validate_infobase_alias helper unit tests
+# ---------------------------------------------------------------------------
+
+class TestValidateInfobaseAlias:
+    def test_skipped_when_rac_not_found(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        result = mds._validate_infobase_alias("anything")
+        assert result == {"status": "skipped", "reason": "rac_exe_not_found"}
+
+    def test_skipped_when_cluster_unreachable(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: None)
+        result = mds._validate_infobase_alias("X")
+        assert result == {"status": "skipped", "reason": "cluster_unreachable"}
+
+    def test_skipped_when_empty_infobase_list(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases", lambda exe, cl: [])
+        result = mds._validate_infobase_alias("X")
+        assert result == {"status": "skipped", "reason": "empty_infobase_list"}
+
+    def test_valid_when_alias_matches(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
+                                             {"uuid": "u2", "name": "Other"}])
+        result = mds._validate_infobase_alias("ИБOne")
+        assert result == {"status": "valid", "uuid": "u1", "name": "ИБOne"}
+
+    def test_invalid_when_alias_not_in_list(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
+                                             {"uuid": "u2", "name": "Other"}])
+        result = mds._validate_infobase_alias("Wrong")
+        assert result == {"status": "invalid",
+                          "available": ["ИБOne", "Other"]}
 
 
 # ---------------------------------------------------------------------------
