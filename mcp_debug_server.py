@@ -1376,6 +1376,11 @@ _RAC_BIN_CANDIDATES = (
     r"C:\Program Files (x86)\1cv8\common\rac.exe",
 )
 
+_1CV8C_BIN_CANDIDATES = (
+    r"C:\Program Files (x86)\1cv8\8.3.27.1936\bin\1cv8c.exe",
+    r"C:\Program Files\1cv8\8.3.27.1936\bin\1cv8c.exe",
+)
+
 
 def _find_rac_exe() -> Optional[str]:
     """Locate rac.exe (1С Remote Administrative Client) on disk."""
@@ -1383,6 +1388,24 @@ def _find_rac_exe() -> Optional[str]:
     for path in _RAC_BIN_CANDIDATES:
         if os.path.isfile(path):
             return path
+    return None
+
+
+def _find_1cv8c_exe() -> Optional[str]:
+    """Locate 1cv8c.exe (1С thin client) on disk. Roadmap 260511 §3.5 (P1).
+
+    Tries hardcoded paths first; falls back to WMI-style globbing if needed.
+    """
+    import os
+    import glob
+    for path in _1CV8C_BIN_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    # Fallback: glob through `C:\Program Files*\1cv8\*\bin\1cv8c.exe`
+    for prefix in (r"C:\Program Files (x86)\1cv8",
+                   r"C:\Program Files\1cv8"):
+        for found in glob.glob(os.path.join(prefix, "*", "bin", "1cv8c.exe")):
+            return found
     return None
 
 
@@ -1536,6 +1559,29 @@ def _rac_list_infobases(rac_exe: str, cluster: str) -> list[dict]:
     return infobases
 
 
+def _resolve_alias_from_env(alias: str) -> str:
+    """Resolve short alias from DEBUG_INFOBASE_ALIASES env mapping.
+
+    Roadmap 260511 §3.7 (P2). Env format: "Short:Long;Short2:Long2".
+
+    Example: DEBUG_INFOBASE_ALIASES="TestDB:ИБTransportManagementDevelop;Dev:260507_DEV_ATERLETSKIY_53196"
+
+    Returns: resolved long-form alias, or original if no mapping.
+    """
+    import os
+    raw = os.environ.get("DEBUG_INFOBASE_ALIASES", "")
+    if not raw:
+        return alias
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        short, long_name = entry.split(":", 1)
+        if short.strip() == alias:
+            return long_name.strip()
+    return alias
+
+
 def _validate_infobase_alias(alias: str) -> dict:
     """Cross-check infobase_alias против реального cluster IB list.
 
@@ -1546,21 +1592,31 @@ def _validate_infobase_alias(alias: str) -> dict:
        |empty_infobase_list>"} — validation невозможна (graceful degradation,
        НЕ блокирует connect)
 
-    Roadmap 260511 §3.1 (P0). Closes RC1 из GKSTCPLK-2468 incident.
+    Roadmap 260511 §3.1 (P0) + §3.7 (P2, env alias mapping).
+    Closes RC1 из GKSTCPLK-2468 incident.
     """
+    # §3.7: resolve через env mapping ДО валидации (short → long)
+    resolved_alias = _resolve_alias_from_env(alias)
     rac_exe = _find_rac_exe()
     if not rac_exe:
-        return {"status": "skipped", "reason": "rac_exe_not_found"}
+        return {"status": "skipped", "reason": "rac_exe_not_found",
+                "resolved_alias": resolved_alias}
     cluster = _rac_get_cluster_uuid(rac_exe)
     if not cluster:
-        return {"status": "skipped", "reason": "cluster_unreachable"}
+        return {"status": "skipped", "reason": "cluster_unreachable",
+                "resolved_alias": resolved_alias}
     infobases = _rac_list_infobases(rac_exe, cluster)
     if not infobases:
-        return {"status": "skipped", "reason": "empty_infobase_list"}
+        return {"status": "skipped", "reason": "empty_infobase_list",
+                "resolved_alias": resolved_alias}
     for ib in infobases:
-        if ib["name"] == alias:
-            return {"status": "valid", "uuid": ib["uuid"], "name": alias}
+        if ib["name"] == resolved_alias:
+            return {"status": "valid", "uuid": ib["uuid"],
+                    "name": resolved_alias,
+                    "alias_resolved_from_env": (alias != resolved_alias)}
     return {"status": "invalid",
+            "provided": alias,
+            "resolved_alias": resolved_alias,
             "available": [ib["name"] for ib in infobases]}
 
 
@@ -1889,7 +1945,31 @@ def _hc_collect_checks(client) -> dict:
         "env_vars": _hc_probe_env_vars(),
         "sddl_au_grant": _hc_probe_sddl_au_grant(),
         "active_session": _hc_probe_active_session(client),
+        "infobase_list": _hc_probe_infobase_list(),
     }
+
+
+def _hc_probe_infobase_list() -> dict:
+    """Roadmap 260511 §3.3 partial — surface available infobases в health_check.
+
+    Не полный bp_fire_smoke (тот требует triggering BSL — invasive в probe
+    mode), но lists available infobases чтобы пользователь сразу видел
+    valid aliases вместо silent invalid-alias path.
+    """
+    rac_exe = _find_rac_exe()
+    if not rac_exe:
+        return {"status": "skip",
+                "detail": "rac.exe not found — cannot list infobases"}
+    cluster = _rac_get_cluster_uuid(rac_exe)
+    if not cluster:
+        return {"status": "skip", "detail": "cluster unreachable"}
+    infobases = _rac_list_infobases(rac_exe, cluster)
+    if not infobases:
+        return {"status": "warn",
+                "detail": "cluster has zero infobases registered"}
+    return {"status": "pass",
+            "detail": f"{len(infobases)} infobase(s) discovered",
+            "_extras": {"infobases": [ib["name"] for ib in infobases]}}
 
 
 # ---------------------------------------------------------------------------
@@ -2488,11 +2568,80 @@ async def debug_targets() -> str:
 
 @mcp.tool()
 async def debug_ping() -> str:
-    """Ping debug server for pending events (breakpoint hit, target started/quit)."""
+    """Ping debug server for pending events (breakpoint hit, target started/quit).
+
+    Roadmap 260511 §3.6 (P2): после 3+ consecutive empty pings — append
+    no_fire_diagnostics с auto-detected root-cause hints (RC1/RC2 from
+    GKSTCPLK-2468 incident).
+    """
     client = _get_client()
     events = await client.ping()
-    return json.dumps({"events": events, "count": len(events)},
-                      ensure_ascii=False, indent=2)
+    # Track consecutive empty pings on client (P2 no-fire diagnostics)
+    if not hasattr(client, "_consecutive_empty_pings"):
+        client._consecutive_empty_pings = 0
+    if events:
+        client._consecutive_empty_pings = 0
+    else:
+        client._consecutive_empty_pings += 1
+    result = {"events": events, "count": len(events)}
+    if client._consecutive_empty_pings >= 3:
+        result["no_fire_diagnostics"] = _build_no_fire_diagnostics(client)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _build_no_fire_diagnostics(client) -> dict:
+    """Auto-detect likely no-fire causes (roadmap 260511 §3.6 P2).
+
+    Surfaces:
+    - alias validity (if rac reachable)
+    - targets_attached count
+    - active rphosts in cluster
+    - actionable suggestions
+    """
+    diag: dict = {
+        "consecutive_empty_pings": client._consecutive_empty_pings,
+        "infobase_alias": getattr(client, "infobase_alias", None),
+        "session_id": getattr(client, "session_id", None),
+    }
+    # Targets check
+    try:
+        attached_ids = list(getattr(client, "_attached_targets", set()))
+        diag["targets_attached"] = len(attached_ids)
+    except Exception:
+        diag["targets_attached"] = "unknown"
+    # Alias validation
+    alias = getattr(client, "infobase_alias", None) or ""
+    if alias:
+        validation = _validate_infobase_alias(alias)
+        diag["infobase_validation"] = validation
+    # Active rphosts
+    try:
+        rphosts = detect_pre_existing_rphosts()
+        diag["active_rphost_pids"] = [r["pid"] for r in rphosts]
+    except Exception:
+        diag["active_rphost_pids"] = []
+    # Build suggestions
+    suggestions: list[str] = []
+    if diag.get("infobase_validation", {}).get("status") == "invalid":
+        suggestions.append(
+            f"RC1: infobase_alias '{alias}' NOT in cluster. "
+            f"Available: {diag['infobase_validation'].get('available', [])}. "
+            "Reconnect with valid alias.")
+    if diag.get("targets_attached") == 0 and diag.get("active_rphost_pids"):
+        suggestions.append(
+            "RC2: rphost'ы запущены но НЕ attached к debug session. "
+            "Try: reconnect с recycle_strategy='all_rphosts_of_ib' или "
+            "debug_launch_thin_client после connect (Solution C).")
+    if not diag.get("active_rphost_pids"):
+        suggestions.append(
+            "No rphosts running — trigger BSL via execute_code or "
+            "debug_launch_thin_client to spawn one.")
+    if not suggestions:
+        suggestions.append(
+            "BPs may be on inactive code paths. Try debug_break_on_next "
+            "to catch ANY BSL operation, or set BP closer to trigger entry.")
+    diag["suggestions"] = suggestions
+    return diag
 
 
 @mcp.tool()
@@ -2756,6 +2905,156 @@ async def debug_break_on_next() -> str:
         }, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def debug_launch_thin_client(infobase_alias: str = "",
+                                    user: str = "",
+                                    password: str = "",
+                                    server: str = "localhost:1541",
+                                    debugger_url: str = "http://localhost:1550",
+                                    wait_target_timeout_sec: int = 15) -> str:
+    """Launch 1cv8c.exe (thin client) с правильными /Debug -http /DebuggerURL флагами.
+
+    Roadmap 260511 §3.5 (P1). Auto-flagged thin client launch closes RC3
+    (protocol mismatch tcp:// vs http://) and provides Solution C как
+    first-class workflow вместо manual workaround.
+
+    Args:
+        infobase_alias: cluster IB name (mandatory если пуст — error)
+        user: optional /N username
+        password: optional /P password (be careful with secrets in logs)
+        server: cluster server (default localhost:1541)
+        debugger_url: debug agent URL (default http://localhost:1550)
+        wait_target_timeout_sec: timeout для ожидания регистрации target'а
+
+    Returns: {status, pid, command_line, target_registered, first_target_id,
+              elapsed_ms}
+    """
+    import os
+    import subprocess as sp
+    if not infobase_alias:
+        return json.dumps({"status": "error",
+                           "reason": "infobase_alias_required"},
+                          ensure_ascii=False, indent=2)
+    exe = _find_1cv8c_exe()
+    if not exe:
+        return json.dumps({
+            "status": "error", "reason": "1cv8c_exe_not_found",
+            "searched": list(_1CV8C_BIN_CANDIDATES),
+            "hint": "Provide explicit path via env or install 1С platform",
+        }, ensure_ascii=False, indent=2)
+    # Validate infobase_alias unless cluster unreachable
+    validation = _validate_infobase_alias(infobase_alias)
+    if validation["status"] == "invalid":
+        return json.dumps({
+            "status": "error", "reason": "infobase_alias_not_found",
+            "provided": infobase_alias,
+            "available": validation["available"],
+        }, ensure_ascii=False, indent=2)
+    args = [exe, f'/S{server}\\{infobase_alias}',
+            "/Debug", "-http", f'/DebuggerURL={debugger_url}']
+    if user:
+        args.extend(["/N", user])
+    if password:
+        args.extend(["/P", password])
+    try:
+        # Detached background launch (Windows) — DETACHED_PROCESS=0x00000008
+        creationflags = getattr(sp, "DETACHED_PROCESS", 0) | \
+                        getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = sp.Popen(args, creationflags=creationflags,
+                        stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                        close_fds=True)
+    except (OSError, sp.SubprocessError) as e:
+        return json.dumps({"status": "error", "reason": "launch_failed",
+                           "error": str(e)}, ensure_ascii=False, indent=2)
+    # Wait for target registration via existing client (if connected)
+    target_registered = False
+    first_target_id = None
+    elapsed_ms = 0
+    if _client and _client._attached:
+        import time as _t
+        start = _t.monotonic()
+        timeout = max(1, min(60, wait_target_timeout_sec))
+        while _t.monotonic() - start < timeout:
+            try:
+                targets = await _client.get_targets()
+            except Exception:
+                targets = []
+            if targets:
+                target_registered = True
+                first_target_id = next(
+                    (t.get("id") for t in targets if t.get("id")), None)
+                break
+            await asyncio.sleep(0.5)
+        elapsed_ms = int((_t.monotonic() - start) * 1000)
+    # Hide password в command_line на возврате
+    command_line_safe = " ".join(
+        ("/P***" if arg == password and password else f'"{arg}"' if " " in arg else arg)
+        for arg in args)
+    return json.dumps({
+        "status": "ok" if target_registered else "launched",
+        "pid": proc.pid,
+        "command_line": command_line_safe,
+        "target_registered": target_registered,
+        "first_target_id": first_target_id,
+        "elapsed_ms": elapsed_ms,
+        "note": ("Target not yet registered — perform any action в GUI "
+                 "to trigger BSL execution, then debug_wait_for_target"
+                 if not target_registered else None),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_wait_for_target(timeout_sec: int = 10,
+                                 poll_interval_sec: float = 0.5) -> str:
+    """Block until ≥1 target appears in debug_targets, or timeout.
+
+    Roadmap 260511 §3.4 (P1). Synchronous primitive для guaranteed-attached
+    workflow: после debug_connect / launch_thin_client часто требуется
+    дождаться регистрации target'а (rphost spawn + DBGUIExtCmdInfoStarted
+    handler) перед set_breakpoint.
+
+    Args:
+        timeout_sec: max wait time. Clamped to [1, 60].
+        poll_interval_sec: pause между debug_targets polls.
+
+    Returns: {status: "ok"|"timeout", targets_count, first_target_id,
+              elapsed_ms, [suggestion if timeout]}
+    """
+    import time as _t
+    timeout_sec = max(1, min(60, timeout_sec))
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    start = _t.monotonic()
+    while _t.monotonic() - start < timeout_sec:
+        try:
+            targets = await client.get_targets()
+        except Exception:
+            targets = []
+        if targets:
+            first_id = next((t.get("id") for t in targets if t.get("id")), None)
+            return json.dumps({
+                "status": "ok",
+                "targets_count": len(targets),
+                "first_target_id": first_id,
+                "elapsed_ms": int((_t.monotonic() - start) * 1000),
+            }, ensure_ascii=False, indent=2)
+        await asyncio.sleep(poll_interval_sec)
+    return json.dumps({
+        "status": "timeout",
+        "targets_count": 0,
+        "first_target_id": None,
+        "elapsed_ms": int((_t.monotonic() - start) * 1000),
+        "suggestion": (
+            "No targets registered within timeout. Try: (1) launch thin "
+            "client with /Debug -http /DebuggerURL=http://localhost:1550, "
+            "(2) trigger BSL via execute_code, (3) check infobase_alias "
+            "valid via debug_health_check, (4) try recycle_strategy="
+            "all_rphosts_of_ib if pre-existing rphost gap."
+        ),
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

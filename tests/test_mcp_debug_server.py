@@ -2289,21 +2289,27 @@ class TestRecycleStrategy:
 class TestValidateInfobaseAlias:
     def test_skipped_when_rac_not_found(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
         result = mds._validate_infobase_alias("anything")
-        assert result == {"status": "skipped", "reason": "rac_exe_not_found"}
+        assert result["status"] == "skipped"
+        assert result["reason"] == "rac_exe_not_found"
 
     def test_skipped_when_cluster_unreachable(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: None)
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
         result = mds._validate_infobase_alias("X")
-        assert result == {"status": "skipped", "reason": "cluster_unreachable"}
+        assert result["status"] == "skipped"
+        assert result["reason"] == "cluster_unreachable"
 
     def test_skipped_when_empty_infobase_list(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
         monkeypatch.setattr(mds, "_rac_list_infobases", lambda exe, cl: [])
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
         result = mds._validate_infobase_alias("X")
-        assert result == {"status": "skipped", "reason": "empty_infobase_list"}
+        assert result["status"] == "skipped"
+        assert result["reason"] == "empty_infobase_list"
 
     def test_valid_when_alias_matches(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
@@ -2311,8 +2317,11 @@ class TestValidateInfobaseAlias:
         monkeypatch.setattr(mds, "_rac_list_infobases",
                             lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
                                              {"uuid": "u2", "name": "Other"}])
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
         result = mds._validate_infobase_alias("ИБOne")
-        assert result == {"status": "valid", "uuid": "u1", "name": "ИБOne"}
+        assert result["status"] == "valid"
+        assert result["uuid"] == "u1"
+        assert result["name"] == "ИБOne"
 
     def test_invalid_when_alias_not_in_list(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
@@ -2320,9 +2329,36 @@ class TestValidateInfobaseAlias:
         monkeypatch.setattr(mds, "_rac_list_infobases",
                             lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
                                              {"uuid": "u2", "name": "Other"}])
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
         result = mds._validate_infobase_alias("Wrong")
-        assert result == {"status": "invalid",
-                          "available": ["ИБOne", "Other"]}
+        assert result["status"] == "invalid"
+        assert result["available"] == ["ИБOne", "Other"]
+
+    def test_env_alias_mapping_resolves(self, monkeypatch):
+        """§3.7 P2: DEBUG_INFOBASE_ALIASES env translates short → long."""
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1",
+                                              "name": "ИБLongCyrillicName"}])
+        monkeypatch.setenv("DEBUG_INFOBASE_ALIASES",
+                           "Short:ИБLongCyrillicName;Other:OtherLong")
+        result = mds._validate_infobase_alias("Short")
+        assert result["status"] == "valid"
+        assert result["name"] == "ИБLongCyrillicName"
+        assert result["alias_resolved_from_env"] is True
+
+    def test_env_alias_mapping_no_match_passes_through(self, monkeypatch):
+        """Если alias не в env mapping — используется как есть."""
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1",
+                                              "name": "ИБDirect"}])
+        monkeypatch.setenv("DEBUG_INFOBASE_ALIASES", "Other:OtherLong")
+        result = mds._validate_infobase_alias("ИБDirect")
+        assert result["status"] == "valid"
+        assert result.get("alias_resolved_from_env") is False
 
 
 # ---------------------------------------------------------------------------
