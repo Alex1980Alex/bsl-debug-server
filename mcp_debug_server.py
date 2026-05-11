@@ -485,10 +485,25 @@ class RDBGClient:
         список всех target'ов от RDBG (`getDbgAllTargetStates`), сравнивает
         с `_known_attached_targets`, attach'ит любые новые.
 
-        Closes residual RC2 gap: HTTP-service spawned rphost emit'ит
-        targetStarted событие на свою dbgs session, но события могут не
-        дойти до нашего UI до явного attach. Periodic poll guarantees
-        eventual attachment.
+        Закрывает design-level pattern для RC2: HTTP-service spawned rphost
+        emit'ит targetStarted событие, но event может потеряться (HMR-restart
+        race, EOF на ping queue, etc.). Periodic poll provides eventual
+        attachment guarantee если RDBG отдаёт rphost через getDbgAllTargetStates.
+
+        ⚠ **P0.5 caveat (E2E finding 2026-05-11):** в RDBG 8.3.27
+        `getDbgAllTargetStates` возвращает ТОЛЬКО targets, которые
+        зарегистрировались к нашей Debug UI session через
+        `DBGUIExtCmdInfoStarted` event. HTTP-service spawned rphost'ы
+        (через `1c-mcp-crud:execute_code`) fundamentally НЕ регистрируются
+        к UI session — они видны на OS-level (`detect_pre_existing_rphosts`)
+        но НЕ в `getDbgAllTargetStates` response. Polling sees empty list →
+        polling не помогает в этом сценарии. Требует P0.5 follow-up: research
+        cluster-process-UUID → debug-UUID mapping API (yukon39 reference +
+        RDBG protocol exploration). См. roadmap 260511 §P0.5.
+
+        Race note: `_handle_command(targetStarted)` параллельно может добавить
+        target в `_known_attached_targets`. На race возможен двойной attach;
+        RDBG idempotent (повторный attach OK), но `log.info` сдублируется.
 
         Returns: количество newly attached targets (для логирования / тестов).
         """
