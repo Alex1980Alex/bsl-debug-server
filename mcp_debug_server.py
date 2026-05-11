@@ -30,6 +30,7 @@ import bsl_locals
 import uuid_index
 import bp_conditions  # P0.A roadmap 260511
 import logpoints  # P0.B roadmap 260511
+import system_stops  # P0.D roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -227,6 +228,9 @@ class RDBGClient:
         # На callStackFormed: render → write JSONL → auto-Continue (no user-visible halt).
         self._logpoints: dict[tuple, str] = {}  # (oid,pid,line) -> "Контр={Контр.ИНН}"
         self._log_dir: Path = Path(__file__).parent / "data" / "debug_logs"
+        # P0.D roadmap 260511: armed by set_break_on_next_statement; cleared after first stop.
+        # Used by system_stops.maybe_auto_continue_system_stop to keep user-requested stops visible.
+        self._break_on_next_armed: bool = False
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -635,6 +639,15 @@ class RDBGClient:
             self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
             log.info("[event] CallStackFormed: target=%s frames=%d reason=%s",
                      target_id[:8], len(stack), self._stop_reason_by_target[target_id])
+            # P0.D roadmap 260511: filter system-initiated stops (spawn-halt, stop_on_next)
+            system_stop_suppressed = await system_stops.maybe_auto_continue_system_stop(
+                self, target_id, stop_by_bp,
+            )
+            if system_stop_suppressed:
+                return
+            # Clear break_on_next flag: user got the stop they armed
+            if self._break_on_next_armed:
+                self._break_on_next_armed = False
             # P0.B roadmap 260511: logpoint check (render+log+auto-Continue, never user-visible)
             logpoint_fired = False
             if stop_by_bp and stack and self._logpoints:
@@ -896,6 +909,7 @@ class RDBGClient:
         """
         body = _build_request(self._base_fields())
         await self._post("setBreakOnNextStatement", body)
+        self._break_on_next_armed = True  # P0.D: keep next stop visible
         return True
 
     # -- Observation API ---------------------------------------------------
