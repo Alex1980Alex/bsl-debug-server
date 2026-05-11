@@ -224,11 +224,19 @@ class UUIDIndex:
         rec = self.lookup(object_id)
         if not rec:
             return None
+        # Guard forms/commands branches: property_id must match the corresponding
+        # module UUID (FormModule for forms, CommandModule for commands) — otherwise
+        # caller passed a mismatched pair and FQN would be misleading.
+        pid_l = (property_id or "").lower()
         path = self.resolve(object_id, property_id)
         kind_ru = _KIND_FQN.get((rec.get("kind") or "").lower(), rec.get("kind", ""))
         if rec.get("child_kind") == "forms":
+            if pid_l != "32e087ab-1491-49b6-aba7-43571b41ac2b":
+                return None
             fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Форма.{rec['name']}"
         elif rec.get("child_kind") == "commands":
+            if pid_l != "078a6af8-d22c-4248-9c33-7e90075a3d2c":
+                return None
             fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Команда.{rec['name']}"
         else:
             suffix = _PROP_FQN.get((property_id or "").lower(), "")

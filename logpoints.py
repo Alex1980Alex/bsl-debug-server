@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
+
+log = logging.getLogger("1c-debug-mcp.logpoints")
 
 
 _PLACEHOLDER_RE = re.compile(r"(?<!\{)\{([^{}]+)\}(?!\})")
@@ -71,11 +74,11 @@ async def fire_logpoint(client, target_id: str, stack: list, log_dir: Path) -> b
     session_id = getattr(client, "session_id", None) or "unknown"
     try:
         _write_jsonl(log_dir, session_id, entry)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("logpoint JSONL write failed (%s): %s", log_dir, e)
     try:
         await client.step(target_id, "Continue", simple=True)
         client._stopped_targets.discard(target_id)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("logpoint auto-Continue failed for target=%s: %s", target_id[:8], e)
     return True

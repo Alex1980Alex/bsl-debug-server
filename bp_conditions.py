@@ -1,4 +1,7 @@
 """P0.A roadmap 260511: hit-condition evaluation + auto-Continue helper."""
+import logging
+
+log = logging.getLogger("1c-debug-mcp.bp-conditions")
 
 
 def eval_hit_condition(cond: str, n: int) -> bool:
@@ -39,6 +42,6 @@ async def _do_check(client, target_id, mod, line):
     try:
         await client.step(target_id, "Continue", simple=True)
         client._stopped_targets.discard(target_id)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("auto-Continue failed for target=%s: %s", target_id[:8], e)
     return True

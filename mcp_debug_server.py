@@ -642,8 +642,14 @@ class RDBGClient:
                     self, target_id, stack, self._log_dir,
                 )
             # P0.A roadmap 260511: hit_condition enforcement
+            hit_condition_suppressed = False
             if not logpoint_fired and stop_by_bp and stack and self._hit_conditions:
-                await bp_conditions.auto_continue_if_unsatisfied(self, target_id, stack)
+                hit_condition_suppressed = await bp_conditions.auto_continue_if_unsatisfied(
+                    self, target_id, stack,
+                )
+            # Suppressed stops (logpoint/hit_condition not satisfied) — auto-Continue'd,
+            # user never saw them → don't pollute _stop_events/_bp_fire_count metrics.
+            stop_suppressed = logpoint_fired or hit_condition_suppressed
             # §12.3 Level 3 — track stop event для session_summary
             from datetime import datetime as _dt
             top = stack[0] if stack else {}
@@ -653,14 +659,15 @@ class RDBGClient:
                 mod_id = top.get("moduleID")
                 if isinstance(mod_id, dict):
                     obj_id_top = mod_id.get("objectID", "")
-            self._stop_events.append({
-                "ts": _dt.now().isoformat(),
-                "target_id": target_id,
-                "lineNo": line_no,
-                "reason": self._stop_reason_by_target[target_id],
-            })
-            self._rphosts_seen.add(target_id)
-            if stop_by_bp:
+            if not stop_suppressed:
+                self._stop_events.append({
+                    "ts": _dt.now().isoformat(),
+                    "target_id": target_id,
+                    "lineNo": line_no,
+                    "reason": self._stop_reason_by_target[target_id],
+                })
+                self._rphosts_seen.add(target_id)
+            if stop_by_bp and not stop_suppressed:
                 self._bp_fire_count += 1
                 if obj_id_top and line_no != "?":
                     key = f"{obj_id_top}:{line_no}"
@@ -3025,6 +3032,10 @@ async def debug_set_logpoint(
     on hit renders message_template (with {expr} placeholders evaluated against
     current stack frame), appends JSONL entry to data/debug_logs/<session>.jsonl,
     then auto-Continue.
+
+    SECURITY: {expr} placeholders в message_template исполняются как BSL-выражения
+    в running rphost через client.evaluate (privileged operation, has full access
+    to BSL execution context). Не передавайте untrusted templates.
 
     Args:
         object_id: UUID of metadata object.
