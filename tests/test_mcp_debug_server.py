@@ -1558,7 +1558,7 @@ class TestAggregateBreakpoints:
         groups = mds._aggregate_breakpoints([], new)
         assert len(groups) == 1
         key = ("ConfigModule", "obj1", "prop1", 0, "", "", "")
-        assert groups[key] == [10, 20]
+        assert groups[key] == {10: "", 20: ""}
 
     def test_two_lines_same_module_dedupe(self):
         cache = [self._entry("objA", "propA", [10])]
@@ -1566,13 +1566,13 @@ class TestAggregateBreakpoints:
         groups = mds._aggregate_breakpoints(cache, new)
         # Same module → consolidated into single key with 2 lines
         assert len(groups) == 1
-        assert list(groups.values())[0] == [10, 20]
+        assert list(groups.values())[0] == {10: "", 20: ""}
 
     def test_duplicate_lines_dedupe_to_one(self):
         cache = [self._entry("objA", "propA", [42])]
         new = self._entry("objA", "propA", [42])
         groups = mds._aggregate_breakpoints(cache, new)
-        assert list(groups.values())[0] == [42]
+        assert list(groups.values())[0] == {42: ""}
 
     def test_different_modules_keep_separate(self):
         cache = [self._entry("objA", "propA", [10])]
@@ -1590,7 +1590,7 @@ class TestAggregateBreakpoints:
         cache = [self._entry("objA", "propA", [50, 10])]
         new = self._entry("objA", "propA", [30])
         groups = mds._aggregate_breakpoints(cache, new)
-        assert list(groups.values())[0] == [10, 30, 50]
+        assert list(groups.values())[0] == {10: "", 30: "", 50: ""}
 
 
 @pytest.mark.asyncio

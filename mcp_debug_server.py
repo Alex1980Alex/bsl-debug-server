@@ -27,6 +27,7 @@ from mcp.server.fastmcp import FastMCP
 # Local modules — UUID → path resolution + BSL local-name extraction
 import bsl_locals
 import uuid_index
+import bp_conditions  # P0.A roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,6 +144,19 @@ def _parse_response(root: ET.Element) -> list[dict]:
     return results
 
 
+def _escape_xml(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def _build_bp_info_xml(line: int, condition: str = "") -> str:
+    children = _bp("line", str(line)) + _bp("isActive", "true")
+    if condition:
+        children += _bp("condition", _escape_xml(condition))
+    children += _bp("temp", "false")
+    return _bp("bpInfo", children)
+
+
 def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
     """Merge cached BP entries + new entry into per-module groups.
 
@@ -154,7 +168,7 @@ def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
 
     Returns: dict keyed by 7-tuple
         (module_type, object_id, property_id, ext_id, url, extension_name, version)
-    value = sorted list[int] of dedupe'd line numbers.
+    value = dict[line:int, condition:str] (P0.A roadmap 260511).
     """
     grouped: dict = {}
     for entry in list(cache) + [new_entry]:
@@ -165,13 +179,14 @@ def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
             entry.get("extension_name", "") or "",
             entry.get("version", "") or "",
         )
-        line_set: set = grouped.setdefault(key, set())
+        line_map: dict = grouped.setdefault(key, {})
+        cond = entry.get("condition", "") or ""
         for line in entry.get("lines", []):
             try:
-                line_set.add(int(line))
+                line_map[int(line)] = cond
             except (TypeError, ValueError):
                 continue
-    return {k: sorted(v) for k, v in grouped.items()}
+    return {k: dict(sorted(v.items())) for k, v in grouped.items()}
 
 
 class RDBGClient:
@@ -202,6 +217,10 @@ class RDBGClient:
         self._stop_reason_by_target: dict[str, str] = {}  # "breakpoint" | "step" | "exception"
         self._last_exception_by_target: dict[str, dict] = {}
         self._known_attached_targets: set[str] = set()  # idempotency for auto-attach
+        # P0.A roadmap 260511: hit-condition counters per (object_id, property_id, line).
+        # RDBG не имеет native hit-count → wrapper-level enforcement в _handle_command.
+        self._hit_conditions: dict[tuple, str] = {}  # (oid,pid,line) -> ">5" | "%3" | "=10"
+        self._hit_counters: dict[tuple, int] = {}    # (oid,pid,line) -> count
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -610,6 +629,9 @@ class RDBGClient:
             self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
             log.info("[event] CallStackFormed: target=%s frames=%d reason=%s",
                      target_id[:8], len(stack), self._stop_reason_by_target[target_id])
+            # P0.A roadmap 260511: hit_condition enforcement
+            if stop_by_bp and stack and self._hit_conditions:
+                await bp_conditions.auto_continue_if_unsatisfied(self, target_id, stack)
             # §12.3 Level 3 — track stop event для session_summary
             from datetime import datetime as _dt
             top = stack[0] if stack else {}
@@ -1321,6 +1343,13 @@ class RDBGClient:
         body = _build_request(self._base_fields(), workspace_xml)
         await self._post("setBreakpoints", body)
 
+    def _record_hit_condition(self, object_id, property_id, lines, hit_condition):
+        """P0.A: register hit-condition per (oid, pid, line)."""
+        for ln in lines:
+            key = (object_id, property_id, int(ln))
+            self._hit_conditions[key] = hit_condition
+            self._hit_counters.setdefault(key, 0)
+
     async def set_breakpoints(
         self,
         module_type: str,
@@ -1331,6 +1360,8 @@ class RDBGClient:
         url: str = "",
         extension_name: str = "",
         version: str = "",
+        condition: str = "",
+        hit_condition: str = "",
     ) -> list[dict]:
         """Set breakpoints on specific lines in a BSL module.
 
@@ -1355,7 +1386,10 @@ class RDBGClient:
             "property_id": property_id, "lines": list(lines),
             "ext_id": ext_id, "url": url,
             "extension_name": extension_name, "version": version,
+            "condition": condition or "",
         }
+        if hit_condition:
+            self._record_hit_condition(object_id, property_id, lines, hit_condition)
         groups = _aggregate_breakpoints(self._set_breakpoints_cache, new_entry)
         module_bp_infos: list = []
         for (mt, oid, pid, eid, url_, ext_, ver_), bp_lines in groups.items():
@@ -1369,11 +1403,7 @@ class RDBGClient:
             if ver_:
                 mod_xml += _base("version", ver_)
             bp_xml = "".join(
-                _bp("bpInfo",
-                    _bp("line", str(L))
-                    + _bp("isActive", "true")
-                    + _bp("temp", "false"))
-                for L in bp_lines
+                _build_bp_info_xml(L, cond) for L, cond in bp_lines.items()
             )
             module_bp_infos.append(
                 _bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml)
@@ -1388,7 +1418,8 @@ class RDBGClient:
                 "module_type": k[0], "object_id": k[1], "property_id": k[2],
                 "ext_id": k[3], "url": k[4],
                 "extension_name": k[5], "version": k[6],
-                "lines": list(v),
+                "lines": list(v.keys()),
+                "condition": next(iter(v.values()), "") if v else "",
             }
             for k, v in groups.items()
         ]
@@ -2898,19 +2929,23 @@ async def debug_set_breakpoint(
     line: int,
     module_type: str = "CommonModule",
     property_id: str = "",
+    condition: str = "",
+    hit_condition: str = "",
 ) -> str:
     """Set a breakpoint in a BSL module.
 
+    Roadmap 260511 §P0.A (2026-05-11): condition + hit_condition support.
+    - `condition`: BSL expression, BP fire'ит только если True (RDBG native).
+    - `hit_condition`: VS Code DAP syntax `>N`/`>=N`/`<N`/`<=N`/`=N`/`%N`
+      (wrapper enforce'ит counter в _handle_command, auto-Continue if не satisfied).
+
     Args:
-        object_id: UUID of metadata object (CommonModule UUID, Document UUID, ...)
-            from edt-mcp get_metadata_details.
-        property_id: Optional explicit propertyID UUID. Leave empty to auto-resolve
-            from module_type via MODULE_PROPERTY_IDS magic UUIDs.
+        object_id: UUID of metadata object.
+        property_id: Optional explicit propertyID UUID. Auto-resolves from module_type.
         line: Line number.
-        module_type: BSL module kind: CommonModule | ManagerModule | ObjectModule |
-            RecordSetModule | FormModule | CommandModule. When this matches a known
-            kind, propertyID auto-resolves and XML type is set to "ConfigModule"
-            (platform disambiguates by propertyID, not type literal).
+        module_type: CommonModule|ManagerModule|ObjectModule|RecordSetModule|FormModule|CommandModule.
+        condition: BSL conditional expression (e.g. `Контрагент.ИНН = "1234567890"`).
+        hit_condition: hit-count predicate `>N`/`%N`/`=N`.
     """
     client = _get_client()
     if not client._attached:
@@ -2930,6 +2965,8 @@ async def debug_set_breakpoint(
         object_id=object_id,
         property_id=property_id,
         lines=[line],
+        condition=condition,
+        hit_condition=hit_condition,
     )
     return json.dumps({
         "status": "breakpoint_set",
