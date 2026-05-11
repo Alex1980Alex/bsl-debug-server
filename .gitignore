@@ -23,3 +23,4 @@ test_quick*.sh
 data/debug_sessions/
 data/debug_logs/
 data/debug_artifacts/
+data/debug_coverage/

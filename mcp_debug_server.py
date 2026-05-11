@@ -32,6 +32,7 @@ import bp_conditions  # P0.A roadmap 260511
 import logpoints  # P0.B roadmap 260511
 import system_stops  # P0.D roadmap 260511
 import artifacts  # P1.B roadmap 260511
+import coverage as bsl_coverage  # P1.A roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -239,6 +240,9 @@ class RDBGClient:
         # P0.E roadmap 260511: targets freshly spawned + auto-attached. First cascade
         # halt for these acts as BP-propagation window (drain BPs, wait, Continue).
         self._attached_pending: set[str] = set()
+        # P1.A roadmap 260511: coverage tracker — (oid, pid, line) -> {hits, file_path}.
+        # Silent BP-counter; coverage.record_hit_and_continue auto-Continues invisibly.
+        self._coverage_tracked: dict[tuple, dict] = {}
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -659,6 +663,14 @@ class RDBGClient:
             # Clear break_on_next flag: user got the stop they armed
             if self._break_on_next_armed:
                 self._break_on_next_armed = False
+            # P1.A roadmap 260511: coverage hit (silent counter, auto-Continue)
+            coverage_hit = False
+            if stop_by_bp and stack and self._coverage_tracked:
+                coverage_hit = await bsl_coverage.record_hit_and_continue(
+                    self, target_id, stack,
+                )
+            if coverage_hit:
+                return
             # P0.B roadmap 260511: logpoint check (render+log+auto-Continue, never user-visible)
             logpoint_fired = False
             if stop_by_bp and stack and self._logpoints:
@@ -3270,6 +3282,67 @@ async def debug_arm_next_rphost() -> str:
         "next_stop_will_be_drained": True,
         "hint": "Trigger BSL (e.g. execute_code). Wrapper will attach the rphost silently; subsequent BPs/logpoints fire normally.",
     }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_coverage_register(lines: list[dict]) -> str:
+    """P1.A roadmap 260511: register BSL lines for code coverage tracking.
+
+    Each entry registered as a silent coverage BP — on fire, wrapper increments
+    hit counter + auto-Continues (no user-visible halt, no JSONL noise).
+
+    Args:
+        lines: list of `{object_id, line, module_type?, property_id?, file_path?}`
+            - module_type auto-resolves propertyID via MODULE_PROPERTY_IDS
+            - file_path used in genericCoverage.xml output (optional)
+
+    Returns: `{status, registered_count, sample}` JSON envelope.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    registered = []
+    for spec in lines:
+        oid = spec.get("object_id", "")
+        if not oid:
+            continue
+        line = spec.get("line", 0)
+        module_type = spec.get("module_type", "CommonModule")
+        pid = spec.get("property_id", "") or MODULE_PROPERTY_IDS.get(module_type, "")
+        xml_mt = "ConfigModule" if pid and not spec.get("property_id") else module_type
+        fp = spec.get("file_path", "")
+        bsl_coverage.register_line(client, oid, pid, line, fp)
+        # Register as BP via existing aggregation (no condition, no template)
+        await client.set_breakpoints(
+            module_type=xml_mt, object_id=oid, property_id=pid, lines=[int(line)],
+        )
+        registered.append({"object_id": oid, "line": int(line), "property_id": pid})
+    return json.dumps({
+        "status": "registered",
+        "registered_count": len(registered),
+        "sample": registered[:5],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_coverage_export(output_path: str = "") -> str:
+    """P1.A roadmap 260511: export coverage as SonarQube genericCoverage.xml.
+
+    Args:
+        output_path: where to write XML (default: `data/debug_coverage/<session>.xml`)
+
+    Returns: `{path, files_count, lines_total, lines_covered, coverage_pct}` JSON.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    if not output_path:
+        out_dir = Path(__file__).parent / "data" / "debug_coverage"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sess = getattr(client, "session_id", None) or "unknown"
+        output_path = str(out_dir / f"{sess}.xml")
+    result = bsl_coverage.export_generic_coverage_xml(client, output_path)
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
