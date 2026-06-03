@@ -652,12 +652,16 @@ class RDBGClient:
                     await self.attach_debug_targets([target_id])
                     self._known_attached_targets.add(target_id)
                     log.info("[event] Started: target %s → attached", target_id[:8])
-                    # Roadmap 260511 §P0.5: re-apply cached BPs to fresh target.
-                    # RDBG `setBreakpoints` workspace is per-attached-target.
-                    # Short-lived JOB targets (execute_code via 1c-mcp-crud)
-                    # spawn → attach → execute → quit за <100ms — без re-apply
-                    # их BPs не push'ятся и BP не fire. Re-apply гарантирует
-                    # что новый target получит BP set ДО первой BSL-инструкции.
+                    # ⚠ CORRECTION (deep research 2026-06-03, roadmap 260603 §10):
+                    # RDBG `setBreakpoints` — SESSION-GLOBAL, НЕ per-target (запрос
+                    # несёт только bpWorkspace + idOfDebuggerUI, без target-id);
+                    # сервер dbgs САМ пропагирует workspace каждому авто-attach'енному
+                    # таргету. yukon39 ставит BP один раз на сессию и НЕ ре-применяет
+                    # per-target. Поэтому правильная модель — регистрировать
+                    # bpWorkspace session-global ДО спавна JOB (что и делает
+                    # debug_set_breakpoint). Этот re-apply оставлен лишь как BACKSTOP
+                    # (HMR-recovery / потеря workspace), НЕ как primary-механизм — на
+                    # эфемерном JOB реактивный per-target re-apply проигрывает гонку.
                     if self._set_breakpoints_cache:
                         try:
                             await self._reapply_bp_workspace()
