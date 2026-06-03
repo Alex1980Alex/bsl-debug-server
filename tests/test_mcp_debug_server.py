@@ -2743,3 +2743,63 @@ class TestPingDispatch:
         assert result == []
         assert client._last_stopped_target_id is None
         assert client._last_stack_by_target == {}
+
+
+class TestEvalErrorEnvelope:
+    """Graceful error envelope для debug_evaluate / debug_variables (follow-up 2026-06-03).
+
+    RDBG отклоняет eval/variables на НЕ-остановленном таргете (HTTP 400 с XML).
+    Раньше это пробрасывалось как opaque MCP-exception; теперь — graceful JSON
+    {"error":...} (как у debug_stack_trace). `_rdbg_error_text` извлекает чистый
+    <descr> вместо дампа всего XML.
+    """
+
+    RDBG_XML = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<exception xmlns="http://v8.1c.ru/8.2/virtual-resource-system" reason="400">'
+        '<descr xmlns="http://v8.1c.ru/8.1/data/core">Выполнение вычислений возможно '
+        'только в остановленном предмете отладки</descr></exception>'
+    )
+
+    def test_rdbg_error_text_extracts_descr(self):
+        msg = mds._rdbg_error_text(RuntimeError("RDBG evalExpr 400: " + self.RDBG_XML))
+        assert msg == ("Выполнение вычислений возможно только "
+                       "в остановленном предмете отладки")
+
+    def test_rdbg_error_text_collapses_whitespace(self):
+        xml = "<descr>line1\n   line2\t  line3</descr>"
+        assert mds._rdbg_error_text(RuntimeError(xml)) == "line1 line2 line3"
+
+    def test_rdbg_error_text_truncates_plain(self):
+        out = mds._rdbg_error_text(RuntimeError("z" * 1000), limit=50)
+        assert out.endswith("…")
+        assert len(out) <= 51
+
+    @pytest.mark.asyncio
+    async def test_evaluate_graceful_envelope(self, monkeypatch):
+        class FakeClient:
+            last_stopped_target_id = "tgt-1"
+
+            async def eval_expression(self, **kw):
+                raise RuntimeError("RDBG evalExpr 400: " + TestEvalErrorEnvelope.RDBG_XML)
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_evaluate("1 + 1"))
+        assert "остановленном" in data["error"]
+        assert data["error_type"] == "RuntimeError"
+        assert data["expression"] == "1 + 1"
+        assert data["target_id"] == "tgt-1"
+
+    @pytest.mark.asyncio
+    async def test_variables_graceful_envelope(self, monkeypatch):
+        class FakeClient:
+            last_stopped_target_id = "tgt-1"
+
+            async def eval_local_variables(self, **kw):
+                raise RuntimeError("RDBG evalLocalVariables 400: " + TestEvalErrorEnvelope.RDBG_XML)
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_variables(expressions=["A"]))
+        assert "остановленном" in data["error"]
+        assert data["error_type"] == "RuntimeError"
+        assert data["target_id"] == "tgt-1"

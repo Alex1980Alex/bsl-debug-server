@@ -1633,6 +1633,22 @@ def _find_stopped_target(targets: list[dict]) -> Optional[str]:
     return None
 
 
+def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
+    """Clean, concise message from an exception, stripping RDBG's verbose XML.
+
+    RDBG 4xx errors embed the human-readable reason inside a <descr> element
+    wrapped in a large XML/stylesheet preamble (e.g. «Выполнение вычислений
+    возможно только в остановленном предмете отладки»). For graceful error
+    envelopes (debug_evaluate / debug_variables) we extract just that descr so
+    the result is actionable rather than dumping the whole XML document.
+    """
+    text = str(exc)
+    m = re.search(r"<descr[^>]*>(.*?)</descr>", text, re.DOTALL)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 # ---------------------------------------------------------------------------
 # Roadmap §11 (Solutions A/B): pre-existing rphost detection + force-recycle
 # ---------------------------------------------------------------------------
@@ -3035,29 +3051,40 @@ async def debug_variables(target_id: str = "", stack_level: int = 0,
         expressions: explicit variable names to read. Default None → auto-
             discover from BSL source.
     """
-    client = _get_client()
-    if not target_id:
-        target_id = client.last_stopped_target_id or ""
+    try:
+        client = _get_client()
         if not target_id:
-            targets = await client.get_targets()
-            target_id = _find_stopped_target(targets) or ""
-        if not target_id:
-            return json.dumps({"error": "No stopped targets"})
-    if expressions:
-        variables = await client.eval_local_variables(
-            target_uuid=target_id, stack_level=stack_level,
-            expressions=expressions,
+            target_id = client.last_stopped_target_id or ""
+            if not target_id:
+                targets = await client.get_targets()
+                target_id = _find_stopped_target(targets) or ""
+            if not target_id:
+                return json.dumps({"error": "No stopped targets"})
+        if expressions:
+            variables = await client.eval_local_variables(
+                target_uuid=target_id, stack_level=stack_level,
+                expressions=expressions,
+            )
+            mode = "explicit"
+        else:
+            variables = await client.eval_locals_auto(
+                target_uuid=target_id, stack_level=stack_level,
+            )
+            mode = "auto"
+        return json.dumps({"target_id": target_id, "variables": variables,
+                           "count": len(variables), "stack_level": stack_level,
+                           "mode": mode},
+                          ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Graceful envelope (consistent с debug_stack_trace) вместо opaque MCP
+        # exception. Типичный кейс: RDBG 400 «вычисления только в остановленном
+        # предмете отладки» когда target не на halt'е.
+        log.exception("debug_variables failed")
+        return json.dumps(
+            {"error": _rdbg_error_text(e), "error_type": type(e).__name__,
+             "target_id": target_id, "stack_level": stack_level},
+            ensure_ascii=False, indent=2,
         )
-        mode = "explicit"
-    else:
-        variables = await client.eval_locals_auto(
-            target_uuid=target_id, stack_level=stack_level,
-        )
-        mode = "auto"
-    return json.dumps({"target_id": target_id, "variables": variables,
-                       "count": len(variables), "stack_level": stack_level,
-                       "mode": mode},
-                      ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -3071,19 +3098,30 @@ async def debug_evaluate(expression: str, target_id: str = "",
             cached state (P1.3) или fallback на get_targets pull.
         stack_level: 0 = current frame.
     """
-    client = _get_client()
-    if not target_id:
-        target_id = client.last_stopped_target_id or ""
+    try:
+        client = _get_client()
         if not target_id:
-            targets = await client.get_targets()
-            target_id = _find_stopped_target(targets) or ""
-        if not target_id:
-            return json.dumps({"error": "No stopped targets"})
-    result = await client.eval_expression(
-        expression=expression, target_uuid=target_id, stack_level=stack_level,
-    )
-    return json.dumps({"expression": expression, "result": result},
-                      ensure_ascii=False, indent=2)
+            target_id = client.last_stopped_target_id or ""
+            if not target_id:
+                targets = await client.get_targets()
+                target_id = _find_stopped_target(targets) or ""
+            if not target_id:
+                return json.dumps({"error": "No stopped targets"})
+        result = await client.eval_expression(
+            expression=expression, target_uuid=target_id, stack_level=stack_level,
+        )
+        return json.dumps({"expression": expression, "result": result},
+                          ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Graceful envelope (consistent с debug_stack_trace) вместо opaque MCP
+        # exception — типичный кейс RDBG 400 «вычисления только в остановленном
+        # предмете отладки» при target не на halt'е.
+        log.exception("debug_evaluate failed")
+        return json.dumps(
+            {"error": _rdbg_error_text(e), "error_type": type(e).__name__,
+             "expression": expression, "target_id": target_id},
+            ensure_ascii=False, indent=2,
+        )
 
 
 @mcp.tool()
