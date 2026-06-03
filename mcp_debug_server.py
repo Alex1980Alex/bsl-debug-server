@@ -1649,6 +1649,22 @@ def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+def _error_json(message: str, error_type: str = "error", **extra) -> str:
+    """Единый error-envelope для inspection-tools (stack_trace/variables/evaluate).
+
+    Все ошибочные выходы этих tool'ов имеют одинаковую форму: `error` (текст),
+    `error_type` (машинно-читаемый разряд: "not_connected" / "no_stopped_target"
+    / имя класса исключения) + контекстные поля через `extra` (target_id,
+    expression, ...). Это позволяет вызывающему различать причины программно.
+    """
+    # Reserved-ключи приоритетны: extra не может перетереть error/error_type
+    # (защита от TypeError «multiple values» при будущем неосторожном вызове).
+    extra.pop("error", None)
+    extra.pop("error_type", None)
+    return json.dumps({"error": message, "error_type": error_type, **extra},
+                      ensure_ascii=False, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Roadmap §11 (Solutions A/B): pre-existing rphost detection + force-recycle
 # ---------------------------------------------------------------------------
@@ -2995,16 +3011,17 @@ async def debug_stack_trace(target_id: str = "") -> str:
     """
     try:
         client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.",
+                               "not_connected")
         if not target_id:
             target_id = client.last_stopped_target_id or ""
             if not target_id:
                 targets = await client.get_targets()
                 target_id = _find_stopped_target(targets) or ""
                 if not target_id:
-                    return json.dumps(
-                        {"error": "No stopped targets", "targets": targets},
-                        ensure_ascii=False, indent=2,
-                    )
+                    return _error_json("No stopped targets", "no_stopped_target",
+                                       targets=targets)
         stack = await client.get_call_stack(target_id)
         # P0.C roadmap 260511: enrich each frame with resolved_source (FQN + file path)
         enriched = []
@@ -3024,10 +3041,7 @@ async def debug_stack_trace(target_id: str = "") -> str:
         )
     except Exception as e:
         log.exception("debug_stack_trace failed")
-        return json.dumps(
-            {"error": f"{type(e).__name__}: {e!r}", "target_id": target_id},
-            ensure_ascii=False, indent=2,
-        )
+        return _error_json(_rdbg_error_text(e), type(e).__name__, target_id=target_id)
 
 
 @mcp.tool()
@@ -3053,13 +3067,17 @@ async def debug_variables(target_id: str = "", stack_level: int = 0,
     """
     try:
         client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.",
+                               "not_connected")
         if not target_id:
             target_id = client.last_stopped_target_id or ""
             if not target_id:
                 targets = await client.get_targets()
                 target_id = _find_stopped_target(targets) or ""
             if not target_id:
-                return json.dumps({"error": "No stopped targets"})
+                return _error_json("No stopped targets", "no_stopped_target",
+                                   target_id=target_id)
         if expressions:
             variables = await client.eval_local_variables(
                 target_uuid=target_id, stack_level=stack_level,
@@ -3076,15 +3094,12 @@ async def debug_variables(target_id: str = "", stack_level: int = 0,
                            "mode": mode},
                           ensure_ascii=False, indent=2)
     except Exception as e:
-        # Graceful envelope (consistent с debug_stack_trace) вместо opaque MCP
-        # exception. Типичный кейс: RDBG 400 «вычисления только в остановленном
-        # предмете отладки» когда target не на halt'е.
+        # Graceful envelope (единый формат с debug_stack_trace/_error_json) вместо
+        # opaque MCP-exception. Типичный кейс: RDBG 400 «вычисления только в
+        # остановленном предмете отладки» когда target не на halt'е.
         log.exception("debug_variables failed")
-        return json.dumps(
-            {"error": _rdbg_error_text(e), "error_type": type(e).__name__,
-             "target_id": target_id, "stack_level": stack_level},
-            ensure_ascii=False, indent=2,
-        )
+        return _error_json(_rdbg_error_text(e), type(e).__name__,
+                           target_id=target_id, stack_level=stack_level)
 
 
 @mcp.tool()
@@ -3100,28 +3115,29 @@ async def debug_evaluate(expression: str, target_id: str = "",
     """
     try:
         client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.",
+                               "not_connected")
         if not target_id:
             target_id = client.last_stopped_target_id or ""
             if not target_id:
                 targets = await client.get_targets()
                 target_id = _find_stopped_target(targets) or ""
             if not target_id:
-                return json.dumps({"error": "No stopped targets"})
+                return _error_json("No stopped targets", "no_stopped_target",
+                                   target_id=target_id)
         result = await client.eval_expression(
             expression=expression, target_uuid=target_id, stack_level=stack_level,
         )
         return json.dumps({"expression": expression, "result": result},
                           ensure_ascii=False, indent=2)
     except Exception as e:
-        # Graceful envelope (consistent с debug_stack_trace) вместо opaque MCP
-        # exception — типичный кейс RDBG 400 «вычисления только в остановленном
-        # предмете отладки» при target не на halt'е.
+        # Graceful envelope (единый формат с debug_stack_trace/_error_json) вместо
+        # opaque MCP-exception — типичный кейс RDBG 400 «вычисления только в
+        # остановленном предмете отладки» при target не на halt'е.
         log.exception("debug_evaluate failed")
-        return json.dumps(
-            {"error": _rdbg_error_text(e), "error_type": type(e).__name__,
-             "expression": expression, "target_id": target_id},
-            ensure_ascii=False, indent=2,
-        )
+        return _error_json(_rdbg_error_text(e), type(e).__name__,
+                           expression=expression, target_id=target_id)
 
 
 @mcp.tool()

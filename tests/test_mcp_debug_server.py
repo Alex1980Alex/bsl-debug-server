@@ -2778,6 +2778,8 @@ class TestEvalErrorEnvelope:
     @pytest.mark.asyncio
     async def test_evaluate_graceful_envelope(self, monkeypatch):
         class FakeClient:
+            _attached = True
+            _registered = True
             last_stopped_target_id = "tgt-1"
 
             async def eval_expression(self, **kw):
@@ -2793,6 +2795,8 @@ class TestEvalErrorEnvelope:
     @pytest.mark.asyncio
     async def test_variables_graceful_envelope(self, monkeypatch):
         class FakeClient:
+            _attached = True
+            _registered = True
             last_stopped_target_id = "tgt-1"
 
             async def eval_local_variables(self, **kw):
@@ -2803,3 +2807,31 @@ class TestEvalErrorEnvelope:
         assert "остановленном" in data["error"]
         assert data["error_type"] == "RuntimeError"
         assert data["target_id"] == "tgt-1"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_not_connected_envelope(self, monkeypatch):
+        """Рек.#1: не-подключённая сессия → явный not_connected, не маскируется."""
+        class FakeClient:
+            _attached = False
+            _registered = False
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_evaluate("1 + 1"))
+        assert data["error_type"] == "not_connected"
+        assert "debug_connect" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_stopped_target_envelope(self, monkeypatch):
+        """Рек.#2: единый envelope для 'No stopped targets' (error_type + target_id)."""
+        class FakeClient:
+            _attached = True
+            _registered = True
+            last_stopped_target_id = ""
+
+            async def get_targets(self):
+                return []
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_evaluate("1 + 1"))
+        assert data["error_type"] == "no_stopped_target"
+        assert data["error"] == "No stopped targets"
