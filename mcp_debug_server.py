@@ -786,6 +786,17 @@ class RDBGClient:
                 self._known_attached_targets.discard(target_id)
                 self._attached_pending.discard(target_id)  # P0.F: prevent leak
                 log.info("[event] Quit: target=%s", target_id[:8])
+            # #1 capture-mode (live-fix 2026-06-03): re-arm break-on-next для
+            # СЛЕДУЮЩЕГО нового таргета здесь (на quit), а НЕ после drain. Так
+            # каждый новый JOB халтит ровно первую инструкцию (drain применит BP
+            # и Continue), без single-step текущего таргета. Reset silent-arm не
+            # трогаем — set_break_on_next_statement выставит его заново.
+            if self._capture_mode:
+                try:
+                    await self.set_break_on_next_statement(silent=True)
+                    log.info("[capture-mode] re-armed break-on-next on quit (for next target)")
+                except Exception as e:
+                    log.warning("[capture-mode] re-arm on quit failed: %s", e)
 
         elif cmd_type == "correctedBP":
             log.warning("[event] BP corrected to adjusted line for target %s",
