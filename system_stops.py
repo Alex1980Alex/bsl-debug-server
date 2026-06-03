@@ -73,5 +73,17 @@ async def _drain_bp_propagation(client, target_id):
         await client.step("Continue", target_id)
         log.info("[P0.E] drained BPs for target=%s, sleep=%.2fs",
                  target_id[:8], BP_PROPAGATION_WAIT_SEC)
+        # #1 Sticky capture-mode (2026-06-03): re-arm break-on-next so the NEXT
+        # spawned target also halts at its first statement. Without this the arm
+        # is one-shot — only the first JOB after debug_arm_next_rphost is caught,
+        # and a fast subsequent JOB races past attach/BP-apply. Gated on opt-in
+        # _capture_mode flag → default behaviour unchanged.
+        if getattr(client, "_capture_mode", False):
+            try:
+                await client.set_break_on_next_statement(silent=True)
+                log.info("[capture-mode] re-armed break-on-next after drain target=%s",
+                         target_id[:8])
+            except Exception as e:
+                log.warning("[capture-mode] re-arm failed: %s", e)
     except Exception as e:
         log.warning("[P0.E] drain failed for target=%s: %s", target_id[:8], e)

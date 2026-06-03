@@ -239,6 +239,12 @@ class RDBGClient:
         # wrapper grabs target_id from event, attaches it, drains BPs, Continues
         # silently (no user-visible stop). Closes HTTPService warm-pool BP-fire gap.
         self._break_on_next_silent_arm: bool = False
+        # #1 Sticky capture-mode (2026-06-03): when True, break-on-next is re-armed
+        # after every drain so EVERY newly spawned target (incl. fast background JOB
+        # rphosts) halts at its first statement until BPs propagate — defeats the
+        # attach/BP race that makes BPs miss in short-lived JOB rphosts. Default off
+        # → existing behaviour unchanged. Toggled via debug_capture_mode tool.
+        self._capture_mode: bool = False
         # P0.E roadmap 260511: targets freshly spawned + auto-attached. First cascade
         # halt for these acts as BP-propagation window (drain BPs, wait, Continue).
         self._attached_pending: set[str] = set()
@@ -486,7 +492,14 @@ class RDBGClient:
         except Exception as e:
             log.debug("[cleanup_stale] getDebugID failed (no stale session): %s", e)
 
-    POST_SPAWN_POLL_INTERVAL = 3  # iterations × 2s sleep = ~6s между polls
+    # #2 (roadmap 260603): adaptive ping cadence. RDBG pingDebugUIParams возвращает
+    # снапшот очереди немедленно (не server-held long-poll), поэтому латентность =
+    # интервал сна. Idle → 2с (heartbeat, dbgs GC'нет debug UI ~60с). Active (ждём
+    # событие: capture-mode / armed break-on-next / pending-drain) → 0.1с: быстрая
+    # доставка targetStarted сужает окно гонки attach/BP в коротких JOB rphost.
+    PING_INTERVAL_IDLE = 2.0
+    PING_INTERVAL_ACTIVE = 0.1
+    POST_SPAWN_POLL_SEC = 6.0  # time-based auto-attach diff (≈ legacy 3×2с)
 
     async def _ping_loop(self) -> None:
         """Periodic ping: keep session alive. Dispatch happens inside ping().
@@ -501,8 +514,9 @@ class RDBGClient:
         alive (heartbeat — без него dbgs.exe GC'нет debug UI ~60с) и
         делегирует обработку событий в ping().
 
-        Roadmap 260511 §P0.4 (2026-05-11): каждые POST_SPAWN_POLL_INTERVAL
-        итераций (default 3 = ~6с) дополнительно вызывает get_targets() и
+        Roadmap 260511 §P0.4 (2026-05-11): каждые ~POST_SPAWN_POLL_SEC секунд
+        (time-based, ~6с — независимо от каденса ping, см. roadmap 260603 §8)
+        дополнительно вызывает get_targets() и
         diff'ит против _known_attached_targets. Закрывает residual RC2 gap:
         HTTP-service spawned rphost'ы (через 1c-mcp-crud execute_code) видны
         в getDbgAllTargetStates, но НЕ emit'ят DBGUIExtCmdInfoStarted к
@@ -510,16 +524,30 @@ class RDBGClient:
         вызовется → BPs не fire. Polling auto-attach'ит такие targets.
         """
         try:
-            poll_counter = 0
+            elapsed_since_poll = 0.0
             while self._attached and self._registered:
-                await asyncio.sleep(2.0)
+                # #2 (roadmap 260603): adaptive cadence — быстрый poll когда ждём
+                # событие (имеем armed break-on-next / capture-mode / pending-drain),
+                # иначе 2с heartbeat. Сужает окно гонки доставки targetStarted для
+                # короткоживущих JOB rphost. Default-путь (ничего не armed) = 2с, как
+                # прежде → поведение не меняется.
+                active = (
+                    self._capture_mode
+                    or self._break_on_next_silent_arm
+                    or self._break_on_next_armed
+                    or bool(self._attached_pending)
+                )
+                interval = self.PING_INTERVAL_ACTIVE if active else self.PING_INTERVAL_IDLE
+                await asyncio.sleep(interval)
                 try:
                     await self.ping()  # dispatches internally
                 except Exception as e:
                     log.debug("ping failed: %s", e)
-                poll_counter += 1
-                if poll_counter >= self.POST_SPAWN_POLL_INTERVAL:
-                    poll_counter = 0
+                # Time-based (не per-iteration) auto-attach diff: ~6с независимо от
+                # каденса ping'а, чтобы fast-poll не молотил getDbgAllTargetStates.
+                elapsed_since_poll += interval
+                if elapsed_since_poll >= self.POST_SPAWN_POLL_SEC:
+                    elapsed_since_poll = 0.0
                     try:
                         await self._post_spawn_auto_attach()
                     except Exception as e:
@@ -3304,6 +3332,47 @@ async def debug_arm_next_rphost() -> str:
         "next_stop_will_be_drained": True,
         "hint": "Trigger BSL (e.g. execute_code). Wrapper will attach the rphost silently; subsequent BPs/logpoints fire normally.",
     }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_capture_mode(on: bool = True) -> str:
+    """Sticky capture-mode (#1, 2026-06-03): reliably catch BPs in fast background JOBs.
+
+    Problem: `debug_arm_next_rphost` arms `setBreakOnNextStatement` ONE-SHOT — only the
+    first spawned target halts. A short-lived JOB rphost (execute_code →
+    ФоновыеЗадания.Выполнить, lives <100ms) races: it can spawn → run past the target
+    line → quit before the polled targetStarted handler attaches + applies BPs, so
+    `callStackFormed` never arrives. Re-arming after each drain is manual & racy.
+
+    Fix: capture-mode keeps break-on-next **re-armed after every drain**, so EVERY new
+    target halts at its first BSL statement; the wrapper then drains (attach + reapply
+    BP workspace + brief wait + Continue) and re-arms for the next. Result: each JOB is
+    BP-receptive deterministically — no race. Real BP hits (stopByBP=true) are NOT
+    drained (kept visible). Turn OFF when done — until then ALL new targets pay the
+    spawn-halt cost.
+
+    Usage:
+        debug_connect → debug_set_breakpoint → debug_capture_mode(on=True)
+        → execute_code (background JOB) → debug_ping → BP fires
+        → inspect → debug_step(Continue) → debug_capture_mode(on=False)
+
+    Args:
+        on: True — enable + arm immediately; False — disable (also clears pending arm).
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    client._capture_mode = bool(on)
+    if on:
+        await client.set_break_on_next_statement(silent=True)
+        return json.dumps({
+            "status": "capture_mode_on",
+            "armed": True,
+            "hint": "Every new target now halts at its first statement until BPs apply. "
+                    "Trigger your code, debug_ping, then debug_capture_mode(on=False) to stop.",
+        }, ensure_ascii=False, indent=2)
+    client._break_on_next_silent_arm = False
+    return json.dumps({"status": "capture_mode_off", "armed": False}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
