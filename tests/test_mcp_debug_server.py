@@ -928,19 +928,20 @@ class TestClearBreakOnNextStatement:
 
 @pytest.mark.asyncio
 class TestSetAutoAttachSettings:
-    async def test_default_targets_server_and_managed_client(self, client):
-        # Fix #1 ROLLBACK 2026-05-10 (autonomous L2 test detected regression):
-        # RDBG XSD enum для targetType ограничен [Server, ManagedClient]; values
-        # HTTPService/WebService/BackgroundJob → HTTP 400. Default возвращён к
-        # 2 safe types. Multi-rphost IIS scenario → force-recycle (Fix #2).
+    async def test_default_targets_expanded_after_p0_5(self, client):
+        # Roadmap 260511 §P0.5 (2026-05-11): расширенный filter после yukon39
+        # XSD review. debugAutoAttach.xsd подтверждает DebugTargetType enum
+        # включает HTTPService/WEBService/JOB/JobFileMode/COMConnector/OData.
+        # Previous ROLLBACK ошибочно считал их invalid → BPs не fire на JOB
+        # rphost (1c-mcp-crud execute_code spawn'ит как JOB).
         await client.set_auto_attach_settings()
         cmd, body = client._post.await_args.args
         assert cmd == "setAutoAttachSettings"
-        assert "<debugAutoAttach:targetType>Server</debugAutoAttach:targetType>" in body
-        assert "<debugAutoAttach:targetType>ManagedClient</debugAutoAttach:targetType>" in body
-        # Anti-regression: НЕ должно быть invalid XSD enum values
-        for invalid in ("HTTPService", "WebService", "BackgroundJob"):
-            assert invalid not in body
+        # Must include all 8 default types from P0.5 expansion
+        for t in ("Server", "ManagedClient", "HTTPService", "WEBService",
+                  "JOB", "JobFileMode", "COMConnector", "OData"):
+            assert f"<debugAutoAttach:targetType>{t}</debugAutoAttach:targetType>" in body, \
+                f"Missing targetType: {t}"
         # Anti-regression: must NOT route через cmd=initSettings (pre-fix bug)
         assert "breakOnNextLine" not in body
 
@@ -950,6 +951,42 @@ class TestSetAutoAttachSettings:
         assert "<debugAutoAttach:targetType>BackgroundJob</debugAutoAttach:targetType>" in body
         assert "Server" not in body
         assert "ManagedClient" not in body
+
+
+@pytest.mark.asyncio
+class TestReapplyBPWorkspace:
+    """Roadmap 260511 §P0.5: re-apply BPs on targetStarted to cover
+    short-lived JOB targets (1c-mcp-crud:execute_code)."""
+
+    async def test_noop_when_cache_empty(self, client):
+        # No BPs cached → no setBreakpoints call
+        post_count_before = client._post.await_count
+        await client._reapply_bp_workspace()
+        assert client._post.await_count == post_count_before
+
+    async def test_replays_cached_bps_as_single_setbreakpoints(self, client):
+        # Seed cache with 2 BP entries (different modules)
+        client._set_breakpoints_cache = [
+            {"module_type": "ManagerModule",
+             "object_id": "obj-1", "property_id": "prop-1",
+             "lines": [80], "ext_id": 0, "url": "",
+             "extension_name": "", "version": ""},
+            {"module_type": "CommonModule",
+             "object_id": "obj-2", "property_id": "prop-2",
+             "lines": [10, 20], "ext_id": 0, "url": "",
+             "extension_name": "", "version": ""},
+        ]
+        await client._reapply_bp_workspace()
+        cmd, body = client._post.await_args.args
+        assert cmd == "setBreakpoints"
+        # Both module groups + all lines в одном request body
+        assert "<debugBaseData:objectID>obj-1</debugBaseData:objectID>" in body
+        assert "<debugBaseData:objectID>obj-2</debugBaseData:objectID>" in body
+        assert "<debugBreakpoints:line>80</debugBreakpoints:line>" in body
+        assert "<debugBreakpoints:line>10</debugBreakpoints:line>" in body
+        assert "<debugBreakpoints:line>20</debugBreakpoints:line>" in body
+        # Single bpWorkspace wrapper (replace semantics)
+        assert body.count("<debugRDBGRequestResponse:bpWorkspace>") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1521,7 +1558,7 @@ class TestAggregateBreakpoints:
         groups = mds._aggregate_breakpoints([], new)
         assert len(groups) == 1
         key = ("ConfigModule", "obj1", "prop1", 0, "", "", "")
-        assert groups[key] == [10, 20]
+        assert groups[key] == {10: "", 20: ""}
 
     def test_two_lines_same_module_dedupe(self):
         cache = [self._entry("objA", "propA", [10])]
@@ -1529,13 +1566,13 @@ class TestAggregateBreakpoints:
         groups = mds._aggregate_breakpoints(cache, new)
         # Same module → consolidated into single key with 2 lines
         assert len(groups) == 1
-        assert list(groups.values())[0] == [10, 20]
+        assert list(groups.values())[0] == {10: "", 20: ""}
 
     def test_duplicate_lines_dedupe_to_one(self):
         cache = [self._entry("objA", "propA", [42])]
         new = self._entry("objA", "propA", [42])
         groups = mds._aggregate_breakpoints(cache, new)
-        assert list(groups.values())[0] == [42]
+        assert list(groups.values())[0] == {42: ""}
 
     def test_different_modules_keep_separate(self):
         cache = [self._entry("objA", "propA", [10])]
@@ -1553,7 +1590,7 @@ class TestAggregateBreakpoints:
         cache = [self._entry("objA", "propA", [50, 10])]
         new = self._entry("objA", "propA", [30])
         groups = mds._aggregate_breakpoints(cache, new)
-        assert list(groups.values())[0] == [10, 30, 50]
+        assert list(groups.values())[0] == {10: "", 30: "", 50: ""}
 
 
 @pytest.mark.asyncio
@@ -1957,6 +1994,12 @@ class TestDebugConnectPreflight:
         monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach_targets)
         monkeypatch.setattr(RDBGClient, "close", _close)
 
+        # Roadmap 260511 §3.1: mock alias validation → skipped (rac unreachable
+        # in unit-test env) so tests using arbitrary aliases like "X" proceed.
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda alias: {"status": "skipped",
+                                           "reason": "rac_exe_not_found"})
+
         # Reset the module-level singleton so every test starts cold
         mds._client = None
 
@@ -2049,6 +2092,400 @@ class TestDebugConnectPreflight:
         result = json.loads(raw)
         assert kill_calls == []  # registered=False guard works
         assert "force_recycle" not in result
+
+
+# ---------------------------------------------------------------------------
+# Roadmap 260511 §3.1 + §3.2: infobase alias validation + recycle_strategy
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestInfobaseAliasValidation:
+    """§3.1 — debug_connect validates alias against rac infobase list."""
+
+    async def _setup(self, monkeypatch, registered=True):
+        """Same as TestDebugConnectPreflight._setup_client_mocks but без
+        дефолтного alias-validation mock — каждый тест ставит свой."""
+        from mcp_debug_server import RDBGClient
+
+        async def _api_version(self): return "8.3.27"
+        async def _debug_id(self): return mds.ZERO_UUID
+        async def _attach(self, cleanup_stale=True):
+            self._attached = True
+            self._registered = registered
+            return {"result": "registered" if registered else "ibInDebug",
+                    "session_id": self.session_id,
+                    "fully_registered": registered}
+        async def _init_settings(self): return None
+        async def _clear_bons(self): return None
+        async def _set_aas(self, **kw): return None
+        async def _targets(self): return []
+        async def _attach_targets(self, ids, attach=True): return True
+        async def _close(self): pass
+
+        monkeypatch.setattr(RDBGClient, "get_api_version", _api_version)
+        monkeypatch.setattr(RDBGClient, "get_debug_id", _debug_id)
+        monkeypatch.setattr(RDBGClient, "attach", _attach)
+        monkeypatch.setattr(RDBGClient, "init_settings", _init_settings)
+        monkeypatch.setattr(RDBGClient, "clear_break_on_next_statement", _clear_bons)
+        monkeypatch.setattr(RDBGClient, "set_auto_attach_settings", _set_aas)
+        monkeypatch.setattr(RDBGClient, "get_targets", _targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach_targets)
+        monkeypatch.setattr(RDBGClient, "close", _close)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
+        async def _no_sleep(_): return None
+        monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
+        mds._client = None
+
+    async def test_alias_valid_proceeds_to_connect(self, monkeypatch):
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: {"status": "valid", "uuid": "uuid-1",
+                                       "name": a})
+        raw = await mds.debug_connect(infobase_alias="ИБTransport")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        assert result["alias_validation"]["status"] == "valid"
+
+    async def test_alias_invalid_blocks_with_available_list(self, monkeypatch):
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: {"status": "invalid",
+                                       "available": ["ИБReal", "DevBase"]})
+        raw = await mds.debug_connect(infobase_alias="WrongAlias")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert result["reason"] == "infobase_alias_not_found"
+        assert result["provided"] == "WrongAlias"
+        assert result["available"] == ["ИБReal", "DevBase"]
+        assert "hint" in result
+
+    async def test_alias_skipped_proceeds_to_connect(self, monkeypatch):
+        # rac.exe not found / cluster unreachable → skipped, не блокирует
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: {"status": "skipped",
+                                       "reason": "rac_exe_not_found"})
+        raw = await mds.debug_connect(infobase_alias="X")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        assert result["alias_validation"]["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+class TestRecycleStrategy:
+    """§3.2 — recycle_strategy extends force_recycle_rphost coverage."""
+
+    async def _setup(self, monkeypatch, alias_validation=None, registered=True):
+        from mcp_debug_server import RDBGClient
+        async def _api_version(self): return "8.3.27"
+        async def _debug_id(self): return mds.ZERO_UUID
+        async def _attach(self, cleanup_stale=True):
+            self._attached = True
+            self._registered = registered
+            return {"result": "registered" if registered else "ibInDebug",
+                    "session_id": self.session_id,
+                    "fully_registered": registered}
+        async def _init_settings(self): return None
+        async def _clear_bons(self): return None
+        async def _set_aas(self, **kw): return None
+        async def _targets(self): return []
+        async def _attach_targets(self, ids, attach=True): return True
+        async def _close(self): pass
+        for name, fn in (("get_api_version", _api_version),
+                         ("get_debug_id", _debug_id),
+                         ("attach", _attach),
+                         ("init_settings", _init_settings),
+                         ("clear_break_on_next_statement", _clear_bons),
+                         ("set_auto_attach_settings", _set_aas),
+                         ("get_targets", _targets),
+                         ("attach_debug_targets", _attach_targets),
+                         ("close", _close)):
+            monkeypatch.setattr(RDBGClient, name, fn)
+        async def _no_sleep(_): return None
+        monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
+        validation = alias_validation or {"status": "skipped",
+                                          "reason": "rac_exe_not_found"}
+        monkeypatch.setattr(mds, "_validate_infobase_alias",
+                            lambda a: validation)
+        mds._client = None
+
+    async def test_default_auto_no_force_means_none(self, monkeypatch):
+        # auto + force_recycle_rphost=False → recycle_strategy resolved to "none"
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 100, "name": "rphost.exe"}])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(pids) or
+                            {"killed": [], "failed": []})
+        raw = await mds.debug_connect(infobase_alias="X")
+        result = json.loads(raw)
+        assert kill_calls == []  # "none" → no kill
+        # Warning emitted because pre_existing but strategy=none
+        assert "pre_existing_rphost_warning" in result
+
+    async def test_backward_compat_force_recycle_true(self, monkeypatch):
+        # auto + force_recycle_rphost=True → resolves to "pre_existing"
+        await self._setup(monkeypatch)
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 100, "name": "rphost.exe"},
+                                     {"pid": 200, "name": "rphost.exe"}])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(pids) or
+                            {"killed": list(pids), "failed": []})
+        raw = await mds.debug_connect(infobase_alias="X",
+                                       force_recycle_rphost=True)
+        result = json.loads(raw)
+        assert kill_calls == [[100, 200]]
+        assert result["force_recycle"]["strategy"] == "pre_existing"
+
+    async def test_all_rphosts_of_ib_requires_valid_alias(self, monkeypatch):
+        # strategy=all_rphosts_of_ib + alias=skipped → returns error
+        await self._setup(monkeypatch,
+                          alias_validation={"status": "skipped",
+                                            "reason": "rac_exe_not_found"})
+        raw = await mds.debug_connect(infobase_alias="X",
+                                       recycle_strategy="all_rphosts_of_ib")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert result["reason"] == "recycle_strategy_requires_valid_alias"
+
+    async def test_all_rphosts_of_ib_resolves_via_rac(self, monkeypatch):
+        # strategy=all_rphosts_of_ib + valid alias → kills via _rac_list_rphosts_of_infobase
+        await self._setup(monkeypatch,
+                          alias_validation={"status": "valid",
+                                            "uuid": "ib-uuid-1",
+                                            "name": "ИБReal"})
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid",
+                            lambda exe: "cluster-uuid")
+        monkeypatch.setattr(mds, "_rac_list_rphosts_of_infobase",
+                            lambda exe, cluster, ib_uuid: [555, 666])
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(list(pids)) or
+                            {"killed": list(pids), "failed": []})
+        raw = await mds.debug_connect(infobase_alias="ИБReal",
+                                       recycle_strategy="all_rphosts_of_ib")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        assert kill_calls == [[555, 666]]
+        assert result["force_recycle"]["strategy"] == "all_rphosts_of_ib"
+        assert result["force_recycle"]["requested_pids"] == [555, 666]
+
+    async def test_invalid_strategy_value_blocks(self, monkeypatch):
+        await self._setup(monkeypatch)
+        raw = await mds.debug_connect(infobase_alias="X",
+                                       recycle_strategy="bogus")
+        result = json.loads(raw)
+        assert result["status"] == "error"
+        assert result["reason"] == "invalid_recycle_strategy"
+        assert "all_rphosts_of_ib" in result["allowed"]
+
+    async def test_all_rphosts_of_cluster_combines_snapshot_and_rac(
+            self, monkeypatch):
+        """HIGH RISK strategy — kills snapshot + cluster-wide rac process list,
+        dedup'ит pids между источниками. Smoke coverage для критичной ветки
+        (review feedback от code-verify quality-review)."""
+        await self._setup(monkeypatch)
+        # Snapshot returns pids [100, 200]
+        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
+                            lambda: [{"pid": 100, "name": "rphost.exe"},
+                                     {"pid": 200, "name": "rphost.exe"}])
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c-uuid")
+        # rac returns pids [200 (dup), 300, 400] — 200 уже в snapshot
+        monkeypatch.setattr(mds, "_rac_list_processes_by_pid",
+                            lambda exe, cl: {200: "p2-uuid",
+                                             300: "p3-uuid",
+                                             400: "p4-uuid"})
+        kill_calls = []
+        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
+                            lambda pids, dry_run=False:
+                            kill_calls.append(list(pids)) or
+                            {"killed": list(pids), "failed": []})
+        raw = await mds.debug_connect(
+            infobase_alias="X",
+            recycle_strategy="all_rphosts_of_cluster")
+        result = json.loads(raw)
+        assert result["status"] == "connected"
+        # 100, 200 from snapshot + 300, 400 from rac (200 dedup'ed)
+        assert kill_calls == [[100, 200, 300, 400]]
+        assert result["force_recycle"]["strategy"] == "all_rphosts_of_cluster"
+
+
+# ---------------------------------------------------------------------------
+# Roadmap 260511 §3.1: _validate_infobase_alias helper unit tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPostSpawnAutoAttach:
+    """Roadmap 260511 §P0.4 — periodic auto-attach polling в _ping_loop.
+
+    Closes residual RC2: HTTP-service spawned rphost виден в get_targets,
+    но НЕ emit'ил targetStarted к нашей session → без polling никогда
+    не attach'ится → BPs не fire.
+    """
+
+    def _make_client(self):
+        c = RDBGClient(infobase_alias="ИБTest")
+        c._attached = True
+        c._registered = True
+        return c
+
+    async def test_post_spawn_attaches_new_targets(self, monkeypatch):
+        c = self._make_client()
+        c._known_attached_targets.add("already-attached-id")
+        # get_targets returns 2: один уже attached, один новый
+        async def _get_targets(self):
+            return [{"id": "already-attached-id"},
+                    {"id": "new-spawn-id"}]
+        # attach_debug_targets captures call
+        attach_calls = []
+        async def _attach(self, uuids, attach=True):
+            attach_calls.append((list(uuids), attach))
+            return True
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 1
+        assert attach_calls == [(["new-spawn-id"], True)]
+        assert "new-spawn-id" in c._known_attached_targets
+
+    async def test_post_spawn_noop_when_all_attached(self, monkeypatch):
+        c = self._make_client()
+        c._known_attached_targets.update({"t1", "t2"})
+        async def _get_targets(self):
+            return [{"id": "t1"}, {"id": "t2"}]
+        attach_calls = []
+        async def _attach(self, uuids, attach=True):
+            attach_calls.append(uuids)
+            return True
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 0
+        assert attach_calls == []
+
+    async def test_post_spawn_handles_get_targets_failure(self, monkeypatch):
+        c = self._make_client()
+        async def _get_targets(self):
+            raise RuntimeError("connection refused")
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 0  # graceful — return 0, не raise
+
+    async def test_post_spawn_handles_attach_failure(self, monkeypatch):
+        c = self._make_client()
+        async def _get_targets(self):
+            return [{"id": "new-id"}]
+        async def _attach(self, uuids, attach=True):
+            raise RuntimeError("RDBG 500")
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 0
+        # known_attached_targets НЕ обновлён (attach failed)
+        assert "new-id" not in c._known_attached_targets
+
+    async def test_post_spawn_skips_targets_without_id(self, monkeypatch):
+        c = self._make_client()
+        async def _get_targets(self):
+            return [{"id": ""}, {"name": "no-id-field"}, {"id": "real-id"}]
+        attach_calls = []
+        async def _attach(self, uuids, attach=True):
+            attach_calls.append(list(uuids))
+            return True
+        monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
+        monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
+
+        attached_count = await c._post_spawn_auto_attach()
+        assert attached_count == 1
+        assert attach_calls == [["real-id"]]
+
+
+class TestValidateInfobaseAlias:
+    def test_skipped_when_rac_not_found(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: None)
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
+        result = mds._validate_infobase_alias("anything")
+        assert result["status"] == "skipped"
+        assert result["reason"] == "rac_exe_not_found"
+
+    def test_skipped_when_cluster_unreachable(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: None)
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
+        result = mds._validate_infobase_alias("X")
+        assert result["status"] == "skipped"
+        assert result["reason"] == "cluster_unreachable"
+
+    def test_skipped_when_empty_infobase_list(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases", lambda exe, cl: [])
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
+        result = mds._validate_infobase_alias("X")
+        assert result["status"] == "skipped"
+        assert result["reason"] == "empty_infobase_list"
+
+    def test_valid_when_alias_matches(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
+                                             {"uuid": "u2", "name": "Other"}])
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
+        result = mds._validate_infobase_alias("ИБOne")
+        assert result["status"] == "valid"
+        assert result["uuid"] == "u1"
+        assert result["name"] == "ИБOne"
+
+    def test_invalid_when_alias_not_in_list(self, monkeypatch):
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
+                                             {"uuid": "u2", "name": "Other"}])
+        monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
+        result = mds._validate_infobase_alias("Wrong")
+        assert result["status"] == "invalid"
+        assert result["available"] == ["ИБOne", "Other"]
+
+    def test_env_alias_mapping_resolves(self, monkeypatch):
+        """§3.7 P2: DEBUG_INFOBASE_ALIASES env translates short → long."""
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1",
+                                              "name": "ИБLongCyrillicName"}])
+        monkeypatch.setenv("DEBUG_INFOBASE_ALIASES",
+                           "Short:ИБLongCyrillicName;Other:OtherLong")
+        result = mds._validate_infobase_alias("Short")
+        assert result["status"] == "valid"
+        assert result["name"] == "ИБLongCyrillicName"
+        assert result["alias_resolved_from_env"] is True
+
+    def test_env_alias_mapping_no_match_passes_through(self, monkeypatch):
+        """Если alias не в env mapping — используется как есть."""
+        monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
+        monkeypatch.setattr(mds, "_rac_list_infobases",
+                            lambda exe, cl: [{"uuid": "u1",
+                                              "name": "ИБDirect"}])
+        monkeypatch.setenv("DEBUG_INFOBASE_ALIASES", "Other:OtherLong")
+        result = mds._validate_infobase_alias("ИБDirect")
+        assert result["status"] == "valid"
+        assert result.get("alias_resolved_from_env") is False
 
 
 # ---------------------------------------------------------------------------
@@ -2258,7 +2695,7 @@ class TestPingDispatch:
             "cmdId": "callStackFormed",
             "targetID": GOOD_UUID,
             "callStack": stack_dict,
-            "stopByBP": "false",
+            "stopByBP": "true",
         }]
         monkeypatch.setattr(mds, "_parse_response", lambda root: events)
         result = await client.ping()
@@ -2278,7 +2715,7 @@ class TestPingDispatch:
                 "cmdId": "callStackFormed",
                 "targetID": ANOTHER_UUID,
                 "callStack": [{"_tag": "frame"}],
-                "stopByBP": "false",
+                "stopByBP": "true",
             },
         ]
         monkeypatch.setattr(mds, "_parse_response", lambda root: events)
@@ -2306,3 +2743,95 @@ class TestPingDispatch:
         assert result == []
         assert client._last_stopped_target_id is None
         assert client._last_stack_by_target == {}
+
+
+class TestEvalErrorEnvelope:
+    """Graceful error envelope для debug_evaluate / debug_variables (follow-up 2026-06-03).
+
+    RDBG отклоняет eval/variables на НЕ-остановленном таргете (HTTP 400 с XML).
+    Раньше это пробрасывалось как opaque MCP-exception; теперь — graceful JSON
+    {"error":...} (как у debug_stack_trace). `_rdbg_error_text` извлекает чистый
+    <descr> вместо дампа всего XML.
+    """
+
+    RDBG_XML = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<exception xmlns="http://v8.1c.ru/8.2/virtual-resource-system" reason="400">'
+        '<descr xmlns="http://v8.1c.ru/8.1/data/core">Выполнение вычислений возможно '
+        'только в остановленном предмете отладки</descr></exception>'
+    )
+
+    def test_rdbg_error_text_extracts_descr(self):
+        msg = mds._rdbg_error_text(RuntimeError("RDBG evalExpr 400: " + self.RDBG_XML))
+        assert msg == ("Выполнение вычислений возможно только "
+                       "в остановленном предмете отладки")
+
+    def test_rdbg_error_text_collapses_whitespace(self):
+        xml = "<descr>line1\n   line2\t  line3</descr>"
+        assert mds._rdbg_error_text(RuntimeError(xml)) == "line1 line2 line3"
+
+    def test_rdbg_error_text_truncates_plain(self):
+        out = mds._rdbg_error_text(RuntimeError("z" * 1000), limit=50)
+        assert out.endswith("…")
+        assert len(out) <= 51
+
+    @pytest.mark.asyncio
+    async def test_evaluate_graceful_envelope(self, monkeypatch):
+        class FakeClient:
+            _attached = True
+            _registered = True
+            last_stopped_target_id = "tgt-1"
+
+            async def eval_expression(self, **kw):
+                raise RuntimeError("RDBG evalExpr 400: " + TestEvalErrorEnvelope.RDBG_XML)
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_evaluate("1 + 1"))
+        assert "остановленном" in data["error"]
+        assert data["error_type"] == "RuntimeError"
+        assert data["expression"] == "1 + 1"
+        assert data["target_id"] == "tgt-1"
+
+    @pytest.mark.asyncio
+    async def test_variables_graceful_envelope(self, monkeypatch):
+        class FakeClient:
+            _attached = True
+            _registered = True
+            last_stopped_target_id = "tgt-1"
+
+            async def eval_local_variables(self, **kw):
+                raise RuntimeError("RDBG evalLocalVariables 400: " + TestEvalErrorEnvelope.RDBG_XML)
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_variables(expressions=["A"]))
+        assert "остановленном" in data["error"]
+        assert data["error_type"] == "RuntimeError"
+        assert data["target_id"] == "tgt-1"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_not_connected_envelope(self, monkeypatch):
+        """Рек.#1: не-подключённая сессия → явный not_connected, не маскируется."""
+        class FakeClient:
+            _attached = False
+            _registered = False
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_evaluate("1 + 1"))
+        assert data["error_type"] == "not_connected"
+        assert "debug_connect" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_stopped_target_envelope(self, monkeypatch):
+        """Рек.#2: единый envelope для 'No stopped targets' (error_type + target_id)."""
+        class FakeClient:
+            _attached = True
+            _registered = True
+            last_stopped_target_id = ""
+
+            async def get_targets(self):
+                return []
+
+        monkeypatch.setattr(mds, "_get_client", lambda: FakeClient())
+        data = json.loads(await mds.debug_evaluate("1 + 1"))
+        assert data["error_type"] == "no_stopped_target"
+        assert data["error"] == "No stopped targets"

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import uuid
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -27,6 +28,13 @@ from mcp.server.fastmcp import FastMCP
 # Local modules — UUID → path resolution + BSL local-name extraction
 import bsl_locals
 import uuid_index
+import bp_conditions  # P0.A roadmap 260511
+import logpoints  # P0.B roadmap 260511
+import system_stops  # P0.D roadmap 260511
+import artifacts  # P1.B roadmap 260511
+import coverage as bsl_coverage  # P1.A roadmap 260511
+import exception_bps  # P3.B roadmap 260511
+import snapshot  # P2.A roadmap 260511
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,6 +151,19 @@ def _parse_response(root: ET.Element) -> list[dict]:
     return results
 
 
+def _escape_xml(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;"))
+
+
+def _build_bp_info_xml(line: int, condition: str = "") -> str:
+    children = _bp("line", str(line)) + _bp("isActive", "true")
+    if condition:
+        children += _bp("condition", _escape_xml(condition))
+    children += _bp("temp", "false")
+    return _bp("bpInfo", children)
+
+
 def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
     """Merge cached BP entries + new entry into per-module groups.
 
@@ -154,7 +175,7 @@ def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
 
     Returns: dict keyed by 7-tuple
         (module_type, object_id, property_id, ext_id, url, extension_name, version)
-    value = sorted list[int] of dedupe'd line numbers.
+    value = dict[line:int, condition:str] (P0.A roadmap 260511).
     """
     grouped: dict = {}
     for entry in list(cache) + [new_entry]:
@@ -165,13 +186,14 @@ def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
             entry.get("extension_name", "") or "",
             entry.get("version", "") or "",
         )
-        line_set: set = grouped.setdefault(key, set())
+        line_map: dict = grouped.setdefault(key, {})
+        cond = entry.get("condition", "") or ""
         for line in entry.get("lines", []):
             try:
-                line_set.add(int(line))
+                line_map[int(line)] = cond
             except (TypeError, ValueError):
                 continue
-    return {k: sorted(v) for k, v in grouped.items()}
+    return {k: dict(sorted(v.items())) for k, v in grouped.items()}
 
 
 class RDBGClient:
@@ -202,6 +224,39 @@ class RDBGClient:
         self._stop_reason_by_target: dict[str, str] = {}  # "breakpoint" | "step" | "exception"
         self._last_exception_by_target: dict[str, dict] = {}
         self._known_attached_targets: set[str] = set()  # idempotency for auto-attach
+        # P0.A roadmap 260511: hit-condition counters per (object_id, property_id, line).
+        # RDBG не имеет native hit-count → wrapper-level enforcement в _handle_command.
+        self._hit_conditions: dict[tuple, str] = {}  # (oid,pid,line) -> ">5" | "%3" | "=10"
+        self._hit_counters: dict[tuple, int] = {}    # (oid,pid,line) -> count
+        # P0.B roadmap 260511: logpoint templates per (object_id, property_id, line).
+        # На callStackFormed: render → write JSONL → auto-Continue (no user-visible halt).
+        self._logpoints: dict[tuple, str] = {}  # (oid,pid,line) -> "Контр={Контр.ИНН}"
+        self._log_dir: Path = Path(__file__).parent / "data" / "debug_logs"
+        # P0.D roadmap 260511: armed by set_break_on_next_statement; cleared after first stop.
+        # Used by system_stops.maybe_auto_continue_system_stop to keep user-requested stops visible.
+        self._break_on_next_armed: bool = False
+        # P0.G roadmap 260511: silent-arm variant — break_on_next halts next rphost,
+        # wrapper grabs target_id from event, attaches it, drains BPs, Continues
+        # silently (no user-visible stop). Closes HTTPService warm-pool BP-fire gap.
+        self._break_on_next_silent_arm: bool = False
+        # #1 Sticky capture-mode (2026-06-03): when True, break-on-next is re-armed
+        # after every drain so EVERY newly spawned target (incl. fast background JOB
+        # rphosts) halts at its first statement until BPs propagate — defeats the
+        # attach/BP race that makes BPs miss in short-lived JOB rphosts. Default off
+        # → existing behaviour unchanged. Toggled via debug_capture_mode tool.
+        self._capture_mode: bool = False
+        # P0.E roadmap 260511: targets freshly spawned + auto-attached. First cascade
+        # halt for these acts as BP-propagation window (drain BPs, wait, Continue).
+        self._attached_pending: set[str] = set()
+        # P1.A roadmap 260511: coverage tracker — (oid, pid, line) -> {hits, file_path}.
+        # Silent BP-counter; coverage.record_hit_and_continue auto-Continues invisibly.
+        self._coverage_tracked: dict[tuple, dict] = {}
+        # P3.B roadmap 260511: exception BP filters. Empty list = halt all exceptions
+        # (backward compat). Non-empty = halt only if any filter matches.
+        self._exception_bp_filters: list[dict] = []
+        # P2.A roadmap 260511: snapshot replay — when True, every stop event
+        # (callStackFormed + rteProcessing) appends entry to debug_replays JSONL.
+        self._recording_enabled: bool = False
 
         # P2.4 client-side BP cache (matches yukon39 BreakpointsManager pattern —
         # RDBG не имеет server-side getBreakpoints URL, поэтому ведём cache локально).
@@ -437,6 +492,15 @@ class RDBGClient:
         except Exception as e:
             log.debug("[cleanup_stale] getDebugID failed (no stale session): %s", e)
 
+    # #2 (roadmap 260603): adaptive ping cadence. RDBG pingDebugUIParams возвращает
+    # снапшот очереди немедленно (не server-held long-poll), поэтому латентность =
+    # интервал сна. Idle → 2с (heartbeat, dbgs GC'нет debug UI ~60с). Active (ждём
+    # событие: capture-mode / armed break-on-next / pending-drain) → 0.1с: быстрая
+    # доставка targetStarted сужает окно гонки attach/BP в коротких JOB rphost.
+    PING_INTERVAL_IDLE = 2.0
+    PING_INTERVAL_ACTIVE = 0.1
+    POST_SPAWN_POLL_SEC = 6.0  # time-based auto-attach diff (≈ legacy 3×2с)
+
     async def _ping_loop(self) -> None:
         """Periodic ping: keep session alive. Dispatch happens inside ping().
 
@@ -449,16 +513,99 @@ class RDBGClient:
         Post-fix: ping() dispatches inline. This loop just keeps the session
         alive (heartbeat — без него dbgs.exe GC'нет debug UI ~60с) и
         делегирует обработку событий в ping().
+
+        Roadmap 260511 §P0.4 (2026-05-11): каждые ~POST_SPAWN_POLL_SEC секунд
+        (time-based, ~6с — независимо от каденса ping, см. roadmap 260603 §8)
+        дополнительно вызывает get_targets() и
+        diff'ит против _known_attached_targets. Закрывает residual RC2 gap:
+        HTTP-service spawned rphost'ы (через 1c-mcp-crud execute_code) видны
+        в getDbgAllTargetStates, но НЕ emit'ят DBGUIExtCmdInfoStarted к
+        нашей session → без polling attach_debug_targets никогда не
+        вызовется → BPs не fire. Polling auto-attach'ит такие targets.
         """
         try:
+            elapsed_since_poll = 0.0
             while self._attached and self._registered:
-                await asyncio.sleep(2.0)
+                # #2 (roadmap 260603): adaptive cadence — быстрый poll когда ждём
+                # событие (имеем armed break-on-next / capture-mode / pending-drain),
+                # иначе 2с heartbeat. Сужает окно гонки доставки targetStarted для
+                # короткоживущих JOB rphost. Default-путь (ничего не armed) = 2с, как
+                # прежде → поведение не меняется.
+                active = (
+                    self._capture_mode
+                    or self._break_on_next_silent_arm
+                    or self._break_on_next_armed
+                    or bool(self._attached_pending)
+                )
+                interval = self.PING_INTERVAL_ACTIVE if active else self.PING_INTERVAL_IDLE
+                await asyncio.sleep(interval)
                 try:
                     await self.ping()  # dispatches internally
                 except Exception as e:
                     log.debug("ping failed: %s", e)
+                # Time-based (не per-iteration) auto-attach diff: ~6с независимо от
+                # каденса ping'а, чтобы fast-poll не молотил getDbgAllTargetStates.
+                elapsed_since_poll += interval
+                if elapsed_since_poll >= self.POST_SPAWN_POLL_SEC:
+                    elapsed_since_poll = 0.0
+                    try:
+                        await self._post_spawn_auto_attach()
+                    except Exception as e:
+                        log.debug("post-spawn poll failed: %s", e)
         except asyncio.CancelledError:
             pass
+
+    async def _post_spawn_auto_attach(self) -> int:
+        """Detect targets not yet attached + attach them. Roadmap 260511 §P0.4.
+
+        Background polling, вызывается из _ping_loop каждые ~6с. Получает
+        список всех target'ов от RDBG (`getDbgAllTargetStates`), сравнивает
+        с `_known_attached_targets`, attach'ит любые новые.
+
+        Закрывает design-level pattern для RC2: HTTP-service spawned rphost
+        emit'ит targetStarted событие, но event может потеряться (HMR-restart
+        race, EOF на ping queue, etc.). Periodic poll provides eventual
+        attachment guarantee если RDBG отдаёт rphost через getDbgAllTargetStates.
+
+        ⚠ **P0.5 caveat (E2E finding 2026-05-11):** в RDBG 8.3.27
+        `getDbgAllTargetStates` возвращает ТОЛЬКО targets, которые
+        зарегистрировались к нашей Debug UI session через
+        `DBGUIExtCmdInfoStarted` event. HTTP-service spawned rphost'ы
+        (через `1c-mcp-crud:execute_code`) fundamentally НЕ регистрируются
+        к UI session — они видны на OS-level (`detect_pre_existing_rphosts`)
+        но НЕ в `getDbgAllTargetStates` response. Polling sees empty list →
+        polling не помогает в этом сценарии. Требует P0.5 follow-up: research
+        cluster-process-UUID → debug-UUID mapping API (yukon39 reference +
+        RDBG protocol exploration). См. roadmap 260511 §P0.5.
+
+        Race note: `_handle_command(targetStarted)` параллельно может добавить
+        target в `_known_attached_targets`. На race возможен двойной attach;
+        RDBG idempotent (повторный attach OK), но `log.info` сдублируется.
+
+        Returns: количество newly attached targets (для логирования / тестов).
+        """
+        try:
+            targets = await self.get_targets()
+        except Exception as e:
+            log.debug("post-spawn poll get_targets failed: %s", e)
+            return 0
+        new_ids: list[str] = []
+        for t in targets:
+            tid = t.get("id")
+            if tid and tid not in self._known_attached_targets:
+                new_ids.append(tid)
+        if not new_ids:
+            return 0
+        try:
+            await self.attach_debug_targets(new_ids, attach=True)
+            for tid in new_ids:
+                self._known_attached_targets.add(tid)
+            log.info("[post-spawn] auto-attached %d new target(s): %s",
+                     len(new_ids), [tid[:8] for tid in new_ids])
+            return len(new_ids)
+        except Exception as e:
+            log.warning("post-spawn attach failed: %s", e)
+            return 0
 
     # Real-world finding 2026-05-09 §13.18: RDBG может emit `cmdIDNum=N` без
     # literal `cmdId="literal"`. Map ordinal → cmdId per yukon39 DBGUIExtCmds
@@ -505,6 +652,27 @@ class RDBGClient:
                     await self.attach_debug_targets([target_id])
                     self._known_attached_targets.add(target_id)
                     log.info("[event] Started: target %s → attached", target_id[:8])
+                    # ⚠ CORRECTION (deep research 2026-06-03, roadmap 260603 §10):
+                    # RDBG `setBreakpoints` — SESSION-GLOBAL, НЕ per-target (запрос
+                    # несёт только bpWorkspace + idOfDebuggerUI, без target-id);
+                    # сервер dbgs САМ пропагирует workspace каждому авто-attach'енному
+                    # таргету. yukon39 ставит BP один раз на сессию и НЕ ре-применяет
+                    # per-target. Поэтому правильная модель — регистрировать
+                    # bpWorkspace session-global ДО спавна JOB (что и делает
+                    # debug_set_breakpoint). Этот re-apply оставлен лишь как BACKSTOP
+                    # (HMR-recovery / потеря workspace), НЕ как primary-механизм — на
+                    # эфемерном JOB реактивный per-target re-apply проигрывает гонку.
+                    if self._set_breakpoints_cache:
+                        try:
+                            await self._reapply_bp_workspace()
+                            log.debug("[event] BPs re-applied for target %s",
+                                      target_id[:8])
+                        except Exception as e:
+                            log.warning("BP re-apply failed for %s: %s",
+                                        target_id[:8], e)
+                    # P0.E: mark target as pending BP-propagation drain.
+                    # First cascade halt for this target → drain BPs + brief wait + Continue.
+                    self._attached_pending.add(target_id)
                 except Exception as e:
                     log.warning("auto-attach failed for %s: %s", target_id[:8], e)
 
@@ -526,6 +694,38 @@ class RDBGClient:
             self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
             log.info("[event] CallStackFormed: target=%s frames=%d reason=%s",
                      target_id[:8], len(stack), self._stop_reason_by_target[target_id])
+            # P0.D roadmap 260511: filter system-initiated stops (spawn-halt, stop_on_next)
+            system_stop_suppressed = await system_stops.maybe_auto_continue_system_stop(
+                self, target_id, stop_by_bp,
+            )
+            if system_stop_suppressed:
+                return
+            # Clear break_on_next flag: user got the stop they armed
+            if self._break_on_next_armed:
+                self._break_on_next_armed = False
+            # P1.A roadmap 260511: coverage hit (silent counter, auto-Continue)
+            coverage_hit = False
+            if stop_by_bp and stack and self._coverage_tracked:
+                coverage_hit = await bsl_coverage.record_hit_and_continue(
+                    self, target_id, stack,
+                )
+            if coverage_hit:
+                return
+            # P0.B roadmap 260511: logpoint check (render+log+auto-Continue, never user-visible)
+            logpoint_fired = False
+            if stop_by_bp and stack and self._logpoints:
+                logpoint_fired = await logpoints.fire_logpoint(
+                    self, target_id, stack, self._log_dir,
+                )
+            # P0.A roadmap 260511: hit_condition enforcement
+            hit_condition_suppressed = False
+            if not logpoint_fired and stop_by_bp and stack and self._hit_conditions:
+                hit_condition_suppressed = await bp_conditions.auto_continue_if_unsatisfied(
+                    self, target_id, stack,
+                )
+            # Suppressed stops (logpoint/hit_condition not satisfied) — auto-Continue'd,
+            # user never saw them → don't pollute _stop_events/_bp_fire_count metrics.
+            stop_suppressed = logpoint_fired or hit_condition_suppressed
             # §12.3 Level 3 — track stop event для session_summary
             from datetime import datetime as _dt
             top = stack[0] if stack else {}
@@ -535,18 +735,23 @@ class RDBGClient:
                 mod_id = top.get("moduleID")
                 if isinstance(mod_id, dict):
                     obj_id_top = mod_id.get("objectID", "")
-            self._stop_events.append({
-                "ts": _dt.now().isoformat(),
-                "target_id": target_id,
-                "lineNo": line_no,
-                "reason": self._stop_reason_by_target[target_id],
-            })
-            self._rphosts_seen.add(target_id)
-            if stop_by_bp:
+            if not stop_suppressed:
+                self._stop_events.append({
+                    "ts": _dt.now().isoformat(),
+                    "target_id": target_id,
+                    "lineNo": line_no,
+                    "reason": self._stop_reason_by_target[target_id],
+                })
+                self._rphosts_seen.add(target_id)
+            if stop_by_bp and not stop_suppressed:
                 self._bp_fire_count += 1
                 if obj_id_top and line_no != "?":
                     key = f"{obj_id_top}:{line_no}"
                     self._bp_by_location[key] = self._bp_by_location.get(key, 0) + 1
+            # P2.A roadmap 260511: replay snapshot recording (after metrics gate so
+            # only user-visible stops are recorded)
+            if not stop_suppressed:
+                snapshot.record(self, target_id, self._stop_reason_by_target.get(target_id, "bp"), stack)
 
         elif cmd_type == "rteProcessing":
             # 🟠 IMPORTANT: unhandled exception — also a stop event
@@ -565,6 +770,16 @@ class RDBGClient:
                 self._last_exception_by_target[target_id] = exc
             log.warning("[event] RTE: target=%s exception_present=%s frames=%d",
                         target_id[:8], bool(exc), len(stack))
+            # P3.B roadmap 260511: exception BP filter — if defined and none match,
+            # auto-Continue silently (don't pollute stop_events with filtered out exc).
+            if self._exception_bp_filters:
+                suppressed = await exception_bps.maybe_suppress(
+                    self, target_id, exc, stack,
+                )
+                if suppressed:
+                    return
+            # P2.A roadmap 260511: replay snapshot for user-visible exception
+            snapshot.record(self, target_id, "exception", stack, exc if isinstance(exc, dict) else None)
 
         elif cmd_type == "targetQuit":
             if target_id:
@@ -573,7 +788,19 @@ class RDBGClient:
                 self._stop_reason_by_target.pop(target_id, None)
                 self._last_exception_by_target.pop(target_id, None)
                 self._known_attached_targets.discard(target_id)
+                self._attached_pending.discard(target_id)  # P0.F: prevent leak
                 log.info("[event] Quit: target=%s", target_id[:8])
+            # #1 capture-mode (live-fix 2026-06-03): re-arm break-on-next для
+            # СЛЕДУЮЩЕГО нового таргета здесь (на quit), а НЕ после drain. Так
+            # каждый новый JOB халтит ровно первую инструкцию (drain применит BP
+            # и Continue), без single-step текущего таргета. Reset silent-arm не
+            # трогаем — set_break_on_next_statement выставит его заново.
+            if self._capture_mode:
+                try:
+                    await self.set_break_on_next_statement(silent=True)
+                    log.info("[capture-mode] re-armed break-on-next on quit (for next target)")
+                except Exception as e:
+                    log.warning("[capture-mode] re-arm on quit failed: %s", e)
 
         elif cmd_type == "correctedBP":
             log.warning("[event] BP corrected to adjusted line for target %s",
@@ -700,17 +927,24 @@ class RDBGClient:
         Settings). Default subscribes to Server (rphost) + ManagedClient
         (1cv8c.exe) — covers thin-client + server-side rphost session.
         """
-        # Fix #1 ROLLBACK 2026-05-10 (autonomous L2 test detected regression):
-        # RDBG returns HTTP 400 «Несоответствие свойства targetType» when XSD
-        # enum gets values вне [Server, ManagedClient]. HTTPService/WebService/
-        # BackgroundJob — НЕ valid в этой версии XSD. Default revert to safe
-        # 2-type set; per-scenario expansion должен передаваться явно через
-        # target_types kwarg + проверка XSD'а в roadmap §11.5 follow-up.
-        # Note: Server filter всё ещё ловит rphost'ы которые обрабатывают IIS
-        # HTTP-services (они тоже rphost workers), но не emit'ят отдельный
-        # HTTPService event. Multi-rphost IIS scenario требует force-recycle
-        # (Fix #2) для предсказуемого attach.
-        types = target_types or ["Server", "ManagedClient"]
+        # Roadmap 260511 §P0.5 (2026-05-11): расширенный filter после yukon39 XSD review.
+        # `debugAutoAttach.xsd` подтверждает что DebugTargetType enum включает
+        # HTTPService, WEBService, JOB, OData, COMConnector — все эти target types
+        # spawn'ятся как separate rphost workers ragent'ом для соответствующих
+        # session kinds. Закрывает RC2 deeper gap из GKSTCPLK-2468 E2E: до этого
+        # filter был `["Server", "ManagedClient"]` → HTTPService rphost'ы (через
+        # 1c-mcp-crud:execute_code) пропускались → 0 BP fire.
+        #
+        # Previous ROLLBACK 2026-05-10 ошибочно интерпретировал HTTP 400 «несоот-
+        # ветствие targetType» как XSD invalidation. По yukon39/bsl-debug-server
+        # XSD (tools/bsl-debug-server/src/test/resources/xsd/debugBaseData.xsd:105-
+        # 123), enum полный: Unknown/Client/ManagedClient/WEBClient/COMConnector/
+        # Server/ServerEmulation/WEBService/HTTPService/OData/JOB/JobFileMode/
+        # Mobile*. 400 был на typo / case-sensitivity, не XSD violation.
+        types = target_types or [
+            "Server", "ManagedClient", "HTTPService", "WEBService",
+            "JOB", "JobFileMode", "COMConnector", "OData",
+        ]
         auto_attach = "".join(_auto("targetType", t) for t in types)
         body = _build_request(
             self._base_fields(),
@@ -747,8 +981,13 @@ class RDBGClient:
         await self._post("attachDetachDbgTargets", body)
         return True
 
-    async def set_break_on_next_statement(self) -> bool:
+    async def set_break_on_next_statement(self, silent: bool = False) -> bool:
         """RDBG global op — break on next BSL statement on any eligible target.
+
+        Args:
+            silent: P0.G — if True, resulting halt is drained silently (target
+                attached + BPs reapplied + Continue), no user-visible stop. Used
+                by `debug_arm_next_rphost` for autonomous warm-pool BP fire.
 
         Closes the gap detected 2026-05-10: pre-existing rphosts (alive before
         debug_connect) are invisible to a fresh debug UI session; getDbgAll-
@@ -764,6 +1003,10 @@ class RDBGClient:
         """
         body = _build_request(self._base_fields())
         await self._post("setBreakOnNextStatement", body)
+        if silent:
+            self._break_on_next_silent_arm = True  # P0.G: drain halt invisibly
+        else:
+            self._break_on_next_armed = True  # P0.D: keep next stop visible
         return True
 
     # -- Observation API ---------------------------------------------------
@@ -1183,6 +1426,66 @@ class RDBGClient:
 
     # -- Breakpoints API -----------------------------------------------------
 
+    async def _reapply_bp_workspace(self) -> None:
+        """Re-apply cached BP workspace to RDBG. Roadmap 260511 §P0.5.
+
+        Used by `_handle_command(targetStarted)` для гарантии что свежий
+        target (JOB / HTTPService / etc) получит BPs ДО первой BSL операции.
+        Short-lived JOB targets (execute_code via 1c-mcp-crud) могут
+        spawn → execute → quit за <100ms; без re-apply BPs не push'ятся
+        вовремя и BP не fire.
+
+        Идемпотентно: если cache пуст — noop. Полный workspace отправляется
+        одним setBreakpoints request'ом. **RDBG `setBreakpoints` REPLACES
+        workspace per call** (Fix #5 / live finding 2026-05-10) — повторный
+        push того же state идempotent на RDBG-side.
+
+        Race note: multiple targets started simultaneously → N parallel
+        calls. Поскольку RDBG REPLACES, последний wins; intermediate
+        излишни, но НЕ вредны (correctness preserved, ~N HTTP cost).
+        """
+        if not self._set_breakpoints_cache:
+            return
+        module_bp_infos: list = []
+        for entry in self._set_breakpoints_cache:
+            mod_xml = (_base("type", entry["module_type"])
+                       + _base("objectID", entry["object_id"])
+                       + _base("propertyID", entry["property_id"]))
+            if entry.get("url"):
+                mod_xml += _base("url", entry["url"])
+            if entry.get("extension_name"):
+                mod_xml += _base("extensionName", entry["extension_name"])
+            if entry.get("ext_id"):
+                mod_xml += _base("extId", str(entry["ext_id"]))
+            if entry.get("version"):
+                mod_xml += _base("version", entry["version"])
+            bp_xml = "".join(
+                _bp("bpInfo",
+                    _bp("line", str(L))
+                    + _bp("isActive", "true")
+                    + _bp("temp", "false"))
+                for L in entry["lines"]
+            )
+            module_bp_infos.append(
+                _bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml)
+            )
+        workspace_xml = _rdbg("bpWorkspace", "".join(module_bp_infos))
+        body = _build_request(self._base_fields(), workspace_xml)
+        await self._post("setBreakpoints", body)
+
+    def _record_hit_condition(self, object_id, property_id, lines, hit_condition):
+        """P0.A: register hit-condition per (oid, pid, line)."""
+        for ln in lines:
+            key = (object_id, property_id, int(ln))
+            self._hit_conditions[key] = hit_condition
+            self._hit_counters.setdefault(key, 0)
+
+    def _record_logpoint(self, object_id, property_id, lines, template):
+        """P0.B: register logpoint template per (oid, pid, line)."""
+        for ln in lines:
+            key = (object_id, property_id, int(ln))
+            self._logpoints[key] = template
+
     async def set_breakpoints(
         self,
         module_type: str,
@@ -1193,6 +1496,9 @@ class RDBGClient:
         url: str = "",
         extension_name: str = "",
         version: str = "",
+        condition: str = "",
+        hit_condition: str = "",
+        logpoint_template: str = "",
     ) -> list[dict]:
         """Set breakpoints on specific lines in a BSL module.
 
@@ -1217,7 +1523,12 @@ class RDBGClient:
             "property_id": property_id, "lines": list(lines),
             "ext_id": ext_id, "url": url,
             "extension_name": extension_name, "version": version,
+            "condition": condition or "",
         }
+        if hit_condition:
+            self._record_hit_condition(object_id, property_id, lines, hit_condition)
+        if logpoint_template:
+            self._record_logpoint(object_id, property_id, lines, logpoint_template)
         groups = _aggregate_breakpoints(self._set_breakpoints_cache, new_entry)
         module_bp_infos: list = []
         for (mt, oid, pid, eid, url_, ext_, ver_), bp_lines in groups.items():
@@ -1231,11 +1542,7 @@ class RDBGClient:
             if ver_:
                 mod_xml += _base("version", ver_)
             bp_xml = "".join(
-                _bp("bpInfo",
-                    _bp("line", str(L))
-                    + _bp("isActive", "true")
-                    + _bp("temp", "false"))
-                for L in bp_lines
+                _build_bp_info_xml(L, cond) for L, cond in bp_lines.items()
             )
             module_bp_infos.append(
                 _bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml)
@@ -1250,7 +1557,8 @@ class RDBGClient:
                 "module_type": k[0], "object_id": k[1], "property_id": k[2],
                 "ext_id": k[3], "url": k[4],
                 "extension_name": k[5], "version": k[6],
-                "lines": list(v),
+                "lines": list(v.keys()),
+                "condition": next(iter(v.values()), "") if v else "",
             }
             for k, v in groups.items()
         ]
@@ -1325,6 +1633,38 @@ def _find_stopped_target(targets: list[dict]) -> Optional[str]:
     return None
 
 
+def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
+    """Clean, concise message from an exception, stripping RDBG's verbose XML.
+
+    RDBG 4xx errors embed the human-readable reason inside a <descr> element
+    wrapped in a large XML/stylesheet preamble (e.g. «Выполнение вычислений
+    возможно только в остановленном предмете отладки»). For graceful error
+    envelopes (debug_evaluate / debug_variables) we extract just that descr so
+    the result is actionable rather than dumping the whole XML document.
+    """
+    text = str(exc)
+    m = re.search(r"<descr[^>]*>(.*?)</descr>", text, re.DOTALL)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _error_json(message: str, error_type: str = "error", **extra) -> str:
+    """Единый error-envelope для inspection-tools (stack_trace/variables/evaluate).
+
+    Все ошибочные выходы этих tool'ов имеют одинаковую форму: `error` (текст),
+    `error_type` (машинно-читаемый разряд: "not_connected" / "no_stopped_target"
+    / имя класса исключения) + контекстные поля через `extra` (target_id,
+    expression, ...). Это позволяет вызывающему различать причины программно.
+    """
+    # Reserved-ключи приоритетны: extra не может перетереть error/error_type
+    # (защита от TypeError «multiple values» при будущем неосторожном вызове).
+    extra.pop("error", None)
+    extra.pop("error_type", None)
+    return json.dumps({"error": message, "error_type": error_type, **extra},
+                      ensure_ascii=False, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Roadmap §11 (Solutions A/B): pre-existing rphost detection + force-recycle
 # ---------------------------------------------------------------------------
@@ -1376,6 +1716,11 @@ _RAC_BIN_CANDIDATES = (
     r"C:\Program Files (x86)\1cv8\common\rac.exe",
 )
 
+_1CV8C_BIN_CANDIDATES = (
+    r"C:\Program Files (x86)\1cv8\8.3.27.1936\bin\1cv8c.exe",
+    r"C:\Program Files\1cv8\8.3.27.1936\bin\1cv8c.exe",
+)
+
 
 def _find_rac_exe() -> Optional[str]:
     """Locate rac.exe (1С Remote Administrative Client) on disk."""
@@ -1383,6 +1728,24 @@ def _find_rac_exe() -> Optional[str]:
     for path in _RAC_BIN_CANDIDATES:
         if os.path.isfile(path):
             return path
+    return None
+
+
+def _find_1cv8c_exe() -> Optional[str]:
+    """Locate 1cv8c.exe (1С thin client) on disk. Roadmap 260511 §3.5 (P1).
+
+    Tries hardcoded paths first; falls back to WMI-style globbing if needed.
+    """
+    import os
+    import glob
+    for path in _1CV8C_BIN_CANDIDATES:
+        if os.path.isfile(path):
+            return path
+    # Fallback: glob through `C:\Program Files*\1cv8\*\bin\1cv8c.exe`
+    for prefix in (r"C:\Program Files (x86)\1cv8",
+                   r"C:\Program Files\1cv8"):
+        for found in glob.glob(os.path.join(prefix, "*", "bin", "1cv8c.exe")):
+            return found
     return None
 
 
@@ -1491,6 +1854,147 @@ def _rac_list_processes_by_pid(rac_exe: str, cluster: str) -> dict:
                 except ValueError:
                     pass
     return pid_to_uuid
+
+
+def _rac_list_infobases(rac_exe: str, cluster: str) -> list[dict]:
+    """Run `rac infobase summary list --cluster=<UUID>`, parse {uuid, name} pairs.
+
+    Returns: list[{"uuid": "...", "name": "..."}] — empty list если cluster
+    unreachable / rac fails. Used by _validate_infobase_alias и
+    _rac_list_rphosts_of_infobase (recycle_strategy=all_rphosts_of_ib).
+    """
+    try:
+        result = subprocess.run(
+            [rac_exe, "infobase", f"--cluster={cluster}", "summary", "list",
+             *_rac_auth_args()],
+            capture_output=True, text=True, timeout=5,
+            encoding="cp866", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    infobases: list[dict] = []
+    current_uuid: Optional[str] = None
+    current_name: Optional[str] = None
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("infobase"):
+            if current_uuid and current_name:
+                infobases.append({"uuid": current_uuid, "name": current_name})
+            current_uuid = None
+            current_name = None
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                u = parts[1].strip()
+                if len(u) >= 32 and "-" in u:
+                    current_uuid = u
+        elif line.startswith("name"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                current_name = parts[1].strip()
+    if current_uuid and current_name:
+        infobases.append({"uuid": current_uuid, "name": current_name})
+    return infobases
+
+
+def _resolve_alias_from_env(alias: str) -> str:
+    """Resolve short alias from DEBUG_INFOBASE_ALIASES env mapping.
+
+    Roadmap 260511 §3.7 (P2). Env format: "Short:Long;Short2:Long2".
+
+    Example: DEBUG_INFOBASE_ALIASES="TestDB:ИБTransportManagementDevelop;Dev:260507_DEV_ATERLETSKIY_53196"
+
+    Returns: resolved long-form alias, or original if no mapping.
+    """
+    import os
+    raw = os.environ.get("DEBUG_INFOBASE_ALIASES", "")
+    if not raw:
+        return alias
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        short, long_name = entry.split(":", 1)
+        if short.strip() == alias:
+            return long_name.strip()
+    return alias
+
+
+def _validate_infobase_alias(alias: str) -> dict:
+    """Cross-check infobase_alias против реального cluster IB list.
+
+    Returns dict с одним из трёх состояний:
+    - {"status": "valid", "uuid": "<UUID>", "name": alias} — alias найден
+    - {"status": "invalid", "available": [<names>]} — alias НЕ найден
+    - {"status": "skipped", "reason": "<rac_exe_not_found|cluster_unreachable
+       |empty_infobase_list>"} — validation невозможна (graceful degradation,
+       НЕ блокирует connect)
+
+    Roadmap 260511 §3.1 (P0) + §3.7 (P2, env alias mapping).
+    Closes RC1 из GKSTCPLK-2468 incident.
+    """
+    # §3.7: resolve через env mapping ДО валидации (short → long)
+    resolved_alias = _resolve_alias_from_env(alias)
+    rac_exe = _find_rac_exe()
+    if not rac_exe:
+        return {"status": "skipped", "reason": "rac_exe_not_found",
+                "resolved_alias": resolved_alias}
+    cluster = _rac_get_cluster_uuid(rac_exe)
+    if not cluster:
+        return {"status": "skipped", "reason": "cluster_unreachable",
+                "resolved_alias": resolved_alias}
+    infobases = _rac_list_infobases(rac_exe, cluster)
+    if not infobases:
+        return {"status": "skipped", "reason": "empty_infobase_list",
+                "resolved_alias": resolved_alias}
+    for ib in infobases:
+        if ib["name"] == resolved_alias:
+            return {"status": "valid", "uuid": ib["uuid"],
+                    "name": resolved_alias,
+                    "alias_resolved_from_env": (alias != resolved_alias)}
+    return {"status": "invalid",
+            "provided": alias,
+            "resolved_alias": resolved_alias,
+            "available": [ib["name"] for ib in infobases]}
+
+
+def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str,
+                                  infobase_uuid: str) -> list[int]:
+    """List rphost OS pids serving the given infobase UUID.
+
+    Used by recycle_strategy=all_rphosts_of_ib (roadmap 260511 §3.2 P0).
+
+    Encoding: cp866 для consistency с _rac_list_infobases — защита от
+    UnicodeDecodeError при exotic Windows locales (даже если этот парсер
+    смотрит только числовые pids, defensive symmetry дешевле чем silent
+    SubprocessError → пустой list).
+    """
+    try:
+        result = subprocess.run(
+            [rac_exe, "process", "list", f"--cluster={cluster}",
+             f"--infobase={infobase_uuid}",
+             *_rac_auth_args()],
+            capture_output=True, text=True, timeout=5,
+            encoding="cp866", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    pids: list[int] = []
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("pid"):
+            parts = line.split(":", 1)
+            if len(parts) == 2:
+                try:
+                    pids.append(int(parts[1].strip()))
+                except ValueError:
+                    pass
+    return pids
 
 
 def _recycle_via_rac(rac_exe: str, cluster: str, pids: list,
@@ -1781,7 +2285,31 @@ def _hc_collect_checks(client) -> dict:
         "env_vars": _hc_probe_env_vars(),
         "sddl_au_grant": _hc_probe_sddl_au_grant(),
         "active_session": _hc_probe_active_session(client),
+        "infobase_list": _hc_probe_infobase_list(),
     }
+
+
+def _hc_probe_infobase_list() -> dict:
+    """Roadmap 260511 §3.3 partial — surface available infobases в health_check.
+
+    Не полный bp_fire_smoke (тот требует triggering BSL — invasive в probe
+    mode), но lists available infobases чтобы пользователь сразу видел
+    valid aliases вместо silent invalid-alias path.
+    """
+    rac_exe = _find_rac_exe()
+    if not rac_exe:
+        return {"status": "skip",
+                "detail": "rac.exe not found — cannot list infobases"}
+    cluster = _rac_get_cluster_uuid(rac_exe)
+    if not cluster:
+        return {"status": "skip", "detail": "cluster unreachable"}
+    infobases = _rac_list_infobases(rac_exe, cluster)
+    if not infobases:
+        return {"status": "warn",
+                "detail": "cluster has zero infobases registered"}
+    return {"status": "pass",
+            "detail": f"{len(infobases)} infobase(s) discovered",
+            "_extras": {"infobases": [ib["name"] for ib in infobases]}}
 
 
 # ---------------------------------------------------------------------------
@@ -1793,7 +2321,8 @@ mcp = FastMCP("1c-debug")
 @mcp.tool()
 async def debug_connect(debug_url: str = "http://localhost:1550",
                         infobase_alias: str = "TestDB",
-                        force_recycle_rphost: bool = False) -> str:
+                        force_recycle_rphost: bool = False,
+                        recycle_strategy: str = "auto") -> str:
     """Connect to 1C debug agent and attach as debug client.
 
     IMPORTANT: Only ONE debug UI can be active per infobase.
@@ -1802,21 +2331,56 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
 
     Args:
         debug_url: URL of 1C debug agent (default: http://localhost:1550)
-        infobase_alias: Infobase name in 1C cluster
-        force_recycle_rphost: Solution A from roadmap §11.2. When True,
-            after successful attach + setAutoAttachSettings, taskkill /F
-            on every rphost.exe alive ДО connect. Ragent then spawns
-            fresh worker(s) which read the filter at registration time
-            → emit DBGUIExtCmdInfoStarted → wrapper auto-attaches → BPs
-            fire on subsequent BSL execution (closes §10 «pre-existing
-            rphost invisible» gap). Default False = preflight-warning
-            mode (response includes pre_existing_rphost_warning with
-            PIDs + next-step suggestions). RISK when True: разрыв
-            активных пользовательских сессий в killed rphost'ах.
+        infobase_alias: Infobase name in 1C cluster. Validated against
+            `rac infobase summary list` perед attach — если не найден,
+            возвращает status=error с available list (roadmap 260511 §3.1
+            P0, closes RC1 из GKSTCPLK-2468). Validation graceful skip'ится
+            если rac.exe/cluster unreachable.
+        force_recycle_rphost: DEPRECATED — используй recycle_strategy.
+            Backward-compat: True → recycle_strategy="pre_existing".
+        recycle_strategy: roadmap 260511 §3.2 P0. Один из:
+            "auto" (default) — = "pre_existing" если force_recycle_rphost=True,
+                иначе "none"
+            "none" — preflight-warning mode (текущее default поведение)
+            "pre_existing" — kill только pre-existing pids (existing
+                force_recycle_rphost=True behaviour)
+            "all_rphosts_of_ib" — kill ВСЕ rphost workers обслуживающие
+                эту IB через `rac process list --infobase` (closes RC2 —
+                HTTP-service spawned rphost вне pre-existing snapshot).
+                Требует valid infobase_alias.
+            "all_rphosts_of_cluster" — kill ВСЕ rphost cluster'а (HIGH RISK:
+                разрыв всех user sessions). Только для personal dev-баз.
     """
     global _client
     if _client and _client._attached:
         await _client.close()
+
+    # Roadmap 260511 §3.1 (P0) — validate infobase_alias ПЕРЕД attach.
+    # Closes RC1 (silent registered=true для несуществующего alias).
+    alias_validation = _validate_infobase_alias(infobase_alias)
+    if alias_validation["status"] == "invalid":
+        return json.dumps({
+            "status": "error",
+            "reason": "infobase_alias_not_found",
+            "provided": infobase_alias,
+            "available": alias_validation["available"],
+            "hint": ("Use one of available infobases. Provide the cluster IB "
+                     "name from `rac infobase list`, not IIS publication name "
+                     "or arbitrary alias. See roadmap 260511 §3.1."),
+        }, ensure_ascii=False, indent=2)
+
+    # Resolve recycle_strategy (backward-compat для force_recycle_rphost).
+    if recycle_strategy == "auto":
+        recycle_strategy = "pre_existing" if force_recycle_rphost else "none"
+    if recycle_strategy not in ("none", "pre_existing",
+                                "all_rphosts_of_ib", "all_rphosts_of_cluster"):
+        return json.dumps({
+            "status": "error",
+            "reason": "invalid_recycle_strategy",
+            "provided": recycle_strategy,
+            "allowed": ["auto", "none", "pre_existing",
+                        "all_rphosts_of_ib", "all_rphosts_of_cluster"],
+        }, ensure_ascii=False, indent=2)
 
     # Preflight (Solution B): snapshot rphost.exe ДО attach. Roadmap §11.
     pre_existing_rphosts = detect_pre_existing_rphosts()
@@ -1840,15 +2404,50 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
 
         # Solution A: force-recycle ПОСЛЕ setAutoAttachSettings — фильтр уже
         # pushed в dbgs, fresh rphost'ы прочитают его на регистрации.
+        # Roadmap 260511 §3.2 (P0): extended recycle_strategy (closes RC2).
         recycle_info: Optional[dict] = None
-        if force_recycle_rphost and pre_existing_rphosts and _client._registered:
-            pids_to_kill = [r["pid"] for r in pre_existing_rphosts]
+        pids_to_kill: list[int] = []
+        if recycle_strategy != "none" and _client._registered:
+            # Resolve pid list based on strategy
+            if recycle_strategy == "pre_existing":
+                pids_to_kill = [r["pid"] for r in pre_existing_rphosts]
+            elif recycle_strategy == "all_rphosts_of_ib":
+                # Requires resolved infobase UUID from validation step
+                if alias_validation["status"] != "valid":
+                    return json.dumps({
+                        "status": "error",
+                        "reason": "recycle_strategy_requires_valid_alias",
+                        "recycle_strategy": recycle_strategy,
+                        "alias_validation": alias_validation,
+                        "hint": ("all_rphosts_of_ib needs cluster reachable + "
+                                 "alias validated. Use recycle_strategy="
+                                 "pre_existing for snapshot-based recycle."),
+                    }, ensure_ascii=False, indent=2)
+                rac_exe = _find_rac_exe()
+                cluster = _rac_get_cluster_uuid(rac_exe) if rac_exe else None
+                if rac_exe and cluster:
+                    pids_to_kill = _rac_list_rphosts_of_infobase(
+                        rac_exe, cluster, alias_validation["uuid"])
+            elif recycle_strategy == "all_rphosts_of_cluster":
+                # HIGH RISK — kill every rphost in cluster
+                pids_to_kill = [r["pid"] for r in detect_pre_existing_rphosts()]
+                # Also include rphosts that may not be detected via process
+                # snapshot (cluster-wide perspective via rac)
+                rac_exe = _find_rac_exe()
+                cluster = _rac_get_cluster_uuid(rac_exe) if rac_exe else None
+                if rac_exe and cluster:
+                    pid_to_uuid = _rac_list_processes_by_pid(rac_exe, cluster)
+                    for pid in pid_to_uuid.keys():
+                        if pid not in pids_to_kill:
+                            pids_to_kill.append(pid)
+        if pids_to_kill:
             # Fix #4 §12.8: env BSL_DEBUG_DRY_RUN_RECYCLE=true → preview only
             import os
             dry_run = (os.environ.get("BSL_DEBUG_DRY_RUN_RECYCLE", "")
                        .lower() == "true")
-            log.warning("[connect] force-recycling pre-existing rphost(s): %s%s",
-                        pids_to_kill, " (DRY-RUN)" if dry_run else "")
+            log.warning("[connect] recycle_strategy=%s killing rphost(s): %s%s",
+                        recycle_strategy, pids_to_kill,
+                        " (DRY-RUN)" if dry_run else "")
             # §12.3 Level 3 — track recycle invocation
             _client._force_recycle_invoked = True
             kill_result = force_recycle_rphost_processes(pids_to_kill, dry_run=dry_run)
@@ -1858,6 +2457,7 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
             await asyncio.sleep(3.0)
             recycle_info = {
                 "_tag": "force_recycle_result",
+                "strategy": recycle_strategy,
                 "requested_pids": pids_to_kill,
                 "killed": kill_result["killed"],
                 "failed": kill_result["failed"],
@@ -1884,10 +2484,13 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
             "stopped_target": stopped,
         }
 
+        # Surface alias validation status в result (roadmap 260511 §3.1).
+        result["alias_validation"] = alias_validation
+
         # Solution B: preflight warning when есть pre-existing rphost'ы и
         # пользователь НЕ запросил force-recycle — surface gap явно вместо
         # silent BP-no-fire (root cause § 10).
-        if pre_existing_rphosts and not force_recycle_rphost:
+        if pre_existing_rphosts and recycle_strategy == "none":
             result["pre_existing_rphost_warning"] = {
                 "_tag": "preflight_warning",
                 "message": (
@@ -1901,10 +2504,14 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
                 "pre_existing_pids": [r["pid"] for r in pre_existing_rphosts],
                 "next_steps": [
                     "Solution C: триггер через UI запущенный ПОСЛЕ debug_connect "
-                    "(тонкий клиент с /Debug /DebuggerURL — validated)",
-                    "Solution A: retry с force_recycle_rphost=True (kills pre-"
-                    "existing, ragent spawn'ит fresh worker с активным filter; "
-                    "РИСК: разрыв активных пользовательских сессий)",
+                    "(тонкий клиент с /Debug -http /DebuggerURL=http://localhost:1550)",
+                    "Solution A (snapshot): retry с recycle_strategy=pre_existing "
+                    "(kills pre-existing snapshot pids; ragent spawn'ит fresh "
+                    "worker с активным filter; РИСК: разрыв user sessions в "
+                    "killed rphost'ах)",
+                    "Solution A+ (extended, roadmap 260511 §3.2): retry с "
+                    "recycle_strategy=all_rphosts_of_ib (covers HTTP-service "
+                    "spawned rphost вне pre-existing snapshot — closes RC2)",
                     "Manual: Console кластера → «Выключить» процесс (graceful "
                     "drain активных сессий другому worker'у) → retry connect",
                 ],
@@ -2136,7 +2743,11 @@ async def debug_session_summary(format: str = "json") -> str:
     Tracking is in-process counters (append-only); no DB persistence.
 
     Args:
-        format: "json" (structured) | "markdown" (human-readable PR transcript)
+        format: "json" (structured) | "markdown" (human-readable PR transcript) |
+                "artifacts" (P1.B roadmap 260511: ZIP bundle с summary.json +
+                summary.md + breakpoints_cache.json + stop_events.json +
+                logpoint_log.jsonl (если есть) + stack_snapshots/<tid>.json).
+                Returns `{path, size_bytes, files[]}`. ZIP в `data/debug_artifacts/<session>.zip`
 
     Если нет активной session (debug_connect не вызывался) — возвращает
     {"status": "no_session"}.
@@ -2179,23 +2790,31 @@ async def debug_session_summary(format: str = "json") -> str:
     if stale:
         summary["_stale_hint"] = stale
     if format == "markdown":
-        bp = summary["breakpoints"]
-        ev = summary["evaluations"]
-        rec = summary["recycle"]
-        md_lines = [
-            f"## Debug Session {summary['session_id'][:8]} ({summary['started_at']})",
-            f"- Infobase: **{summary['infobase_alias']}**",
-            f"- BPs: **{bp['set_count']} set, {bp['fire_count']} fired** "
-            f"({(bp['fire_rate'] or 0) * 100:.0f}% fire rate)",
-            f"- Locations: {bp['by_location'] or '—'}",
-            f"- Evals: **{ev['count']}** (failures: {ev['failures']})",
-            f"- UI+ retries: **{summary['ui_plus_retries']}**",
-            f"- Recycle: invoked={rec['force_invoked']}, method={rec['method_used'] or '—'}",
-            f"- Stop events: **{len(summary['stop_events'])}**",
-            f"- Targets seen: {len(summary['rphosts_seen'])}",
-        ]
-        return "\n".join(md_lines)
+        return _render_summary_md(summary)
+    if format == "artifacts":
+        result = artifacts.build_session_zip(_client, summary, _render_summary_md)
+        return json.dumps(result, ensure_ascii=False, indent=2)
     return json.dumps(summary, ensure_ascii=False, indent=2)
+
+
+def _render_summary_md(summary: dict) -> str:
+    """P1.B: extracted markdown render for reuse via artifacts ZIP bundle."""
+    bp = summary["breakpoints"]
+    ev = summary["evaluations"]
+    rec = summary["recycle"]
+    md_lines = [
+        f"## Debug Session {summary['session_id'][:8]} ({summary['started_at']})",
+        f"- Infobase: **{summary['infobase_alias']}**",
+        f"- BPs: **{bp['set_count']} set, {bp['fire_count']} fired** "
+        f"({(bp['fire_rate'] or 0) * 100:.0f}% fire rate)",
+        f"- Locations: {bp['by_location'] or '—'}",
+        f"- Evals: **{ev['count']}** (failures: {ev['failures']})",
+        f"- UI+ retries: **{summary['ui_plus_retries']}**",
+        f"- Recycle: invoked={rec['force_invoked']}, method={rec['method_used'] or '—'}",
+        f"- Stop events: **{len(summary['stop_events'])}**",
+        f"- Targets seen: {len(summary['rphosts_seen'])}",
+    ]
+    return "\n".join(md_lines)
 
 
 @mcp.tool()
@@ -2301,11 +2920,80 @@ async def debug_targets() -> str:
 
 @mcp.tool()
 async def debug_ping() -> str:
-    """Ping debug server for pending events (breakpoint hit, target started/quit)."""
+    """Ping debug server for pending events (breakpoint hit, target started/quit).
+
+    Roadmap 260511 §3.6 (P2): после 3+ consecutive empty pings — append
+    no_fire_diagnostics с auto-detected root-cause hints (RC1/RC2 from
+    GKSTCPLK-2468 incident).
+    """
     client = _get_client()
     events = await client.ping()
-    return json.dumps({"events": events, "count": len(events)},
-                      ensure_ascii=False, indent=2)
+    # Track consecutive empty pings on client (P2 no-fire diagnostics)
+    if not hasattr(client, "_consecutive_empty_pings"):
+        client._consecutive_empty_pings = 0
+    if events:
+        client._consecutive_empty_pings = 0
+    else:
+        client._consecutive_empty_pings += 1
+    result = {"events": events, "count": len(events)}
+    if client._consecutive_empty_pings >= 3:
+        result["no_fire_diagnostics"] = _build_no_fire_diagnostics(client)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _build_no_fire_diagnostics(client) -> dict:
+    """Auto-detect likely no-fire causes (roadmap 260511 §3.6 P2).
+
+    Surfaces:
+    - alias validity (if rac reachable)
+    - targets_attached count
+    - active rphosts in cluster
+    - actionable suggestions
+    """
+    diag: dict = {
+        "consecutive_empty_pings": client._consecutive_empty_pings,
+        "infobase_alias": getattr(client, "infobase_alias", None),
+        "session_id": getattr(client, "session_id", None),
+    }
+    # Targets check
+    try:
+        attached_ids = list(getattr(client, "_attached_targets", set()))
+        diag["targets_attached"] = len(attached_ids)
+    except Exception:
+        diag["targets_attached"] = "unknown"
+    # Alias validation
+    alias = getattr(client, "infobase_alias", None) or ""
+    if alias:
+        validation = _validate_infobase_alias(alias)
+        diag["infobase_validation"] = validation
+    # Active rphosts
+    try:
+        rphosts = detect_pre_existing_rphosts()
+        diag["active_rphost_pids"] = [r["pid"] for r in rphosts]
+    except Exception:
+        diag["active_rphost_pids"] = []
+    # Build suggestions
+    suggestions: list[str] = []
+    if diag.get("infobase_validation", {}).get("status") == "invalid":
+        suggestions.append(
+            f"RC1: infobase_alias '{alias}' NOT in cluster. "
+            f"Available: {diag['infobase_validation'].get('available', [])}. "
+            "Reconnect with valid alias.")
+    if diag.get("targets_attached") == 0 and diag.get("active_rphost_pids"):
+        suggestions.append(
+            "RC2: rphost'ы запущены но НЕ attached к debug session. "
+            "Try: reconnect с recycle_strategy='all_rphosts_of_ib' или "
+            "debug_launch_thin_client после connect (Solution C).")
+    if not diag.get("active_rphost_pids"):
+        suggestions.append(
+            "No rphosts running — trigger BSL via execute_code or "
+            "debug_launch_thin_client to spawn one.")
+    if not suggestions:
+        suggestions.append(
+            "BPs may be on inactive code paths. Try debug_break_on_next "
+            "to catch ANY BSL operation, or set BP closer to trigger entry.")
+    diag["suggestions"] = suggestions
+    return diag
 
 
 @mcp.tool()
@@ -2323,27 +3011,37 @@ async def debug_stack_trace(target_id: str = "") -> str:
     """
     try:
         client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.",
+                               "not_connected")
         if not target_id:
             target_id = client.last_stopped_target_id or ""
             if not target_id:
                 targets = await client.get_targets()
                 target_id = _find_stopped_target(targets) or ""
                 if not target_id:
-                    return json.dumps(
-                        {"error": "No stopped targets", "targets": targets},
-                        ensure_ascii=False, indent=2,
-                    )
+                    return _error_json("No stopped targets", "no_stopped_target",
+                                       targets=targets)
         stack = await client.get_call_stack(target_id)
+        # P0.C roadmap 260511: enrich each frame with resolved_source (FQN + file path)
+        enriched = []
+        for frame in stack:
+            if isinstance(frame, dict):
+                mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
+                info = uuid_index.get_source_info(
+                    mod.get("objectID", ""), mod.get("propertyID", ""),
+                )
+                if info:
+                    frame = dict(frame)
+                    frame["resolved_source"] = info
+            enriched.append(frame)
         return json.dumps(
-            {"target_id": target_id, "stack": stack, "depth": len(stack)},
+            {"target_id": target_id, "stack": enriched, "depth": len(enriched)},
             ensure_ascii=False, indent=2,
         )
     except Exception as e:
         log.exception("debug_stack_trace failed")
-        return json.dumps(
-            {"error": f"{type(e).__name__}: {e!r}", "target_id": target_id},
-            ensure_ascii=False, indent=2,
-        )
+        return _error_json(_rdbg_error_text(e), type(e).__name__, target_id=target_id)
 
 
 @mcp.tool()
@@ -2367,29 +3065,41 @@ async def debug_variables(target_id: str = "", stack_level: int = 0,
         expressions: explicit variable names to read. Default None → auto-
             discover from BSL source.
     """
-    client = _get_client()
-    if not target_id:
-        target_id = client.last_stopped_target_id or ""
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.",
+                               "not_connected")
         if not target_id:
-            targets = await client.get_targets()
-            target_id = _find_stopped_target(targets) or ""
-        if not target_id:
-            return json.dumps({"error": "No stopped targets"})
-    if expressions:
-        variables = await client.eval_local_variables(
-            target_uuid=target_id, stack_level=stack_level,
-            expressions=expressions,
-        )
-        mode = "explicit"
-    else:
-        variables = await client.eval_locals_auto(
-            target_uuid=target_id, stack_level=stack_level,
-        )
-        mode = "auto"
-    return json.dumps({"target_id": target_id, "variables": variables,
-                       "count": len(variables), "stack_level": stack_level,
-                       "mode": mode},
-                      ensure_ascii=False, indent=2)
+            target_id = client.last_stopped_target_id or ""
+            if not target_id:
+                targets = await client.get_targets()
+                target_id = _find_stopped_target(targets) or ""
+            if not target_id:
+                return _error_json("No stopped targets", "no_stopped_target",
+                                   target_id=target_id)
+        if expressions:
+            variables = await client.eval_local_variables(
+                target_uuid=target_id, stack_level=stack_level,
+                expressions=expressions,
+            )
+            mode = "explicit"
+        else:
+            variables = await client.eval_locals_auto(
+                target_uuid=target_id, stack_level=stack_level,
+            )
+            mode = "auto"
+        return json.dumps({"target_id": target_id, "variables": variables,
+                           "count": len(variables), "stack_level": stack_level,
+                           "mode": mode},
+                          ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Graceful envelope (единый формат с debug_stack_trace/_error_json) вместо
+        # opaque MCP-exception. Типичный кейс: RDBG 400 «вычисления только в
+        # остановленном предмете отладки» когда target не на halt'е.
+        log.exception("debug_variables failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__,
+                           target_id=target_id, stack_level=stack_level)
 
 
 @mcp.tool()
@@ -2403,19 +3113,31 @@ async def debug_evaluate(expression: str, target_id: str = "",
             cached state (P1.3) или fallback на get_targets pull.
         stack_level: 0 = current frame.
     """
-    client = _get_client()
-    if not target_id:
-        target_id = client.last_stopped_target_id or ""
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.",
+                               "not_connected")
         if not target_id:
-            targets = await client.get_targets()
-            target_id = _find_stopped_target(targets) or ""
-        if not target_id:
-            return json.dumps({"error": "No stopped targets"})
-    result = await client.eval_expression(
-        expression=expression, target_uuid=target_id, stack_level=stack_level,
-    )
-    return json.dumps({"expression": expression, "result": result},
-                      ensure_ascii=False, indent=2)
+            target_id = client.last_stopped_target_id or ""
+            if not target_id:
+                targets = await client.get_targets()
+                target_id = _find_stopped_target(targets) or ""
+            if not target_id:
+                return _error_json("No stopped targets", "no_stopped_target",
+                                   target_id=target_id)
+        result = await client.eval_expression(
+            expression=expression, target_uuid=target_id, stack_level=stack_level,
+        )
+        return json.dumps({"expression": expression, "result": result},
+                          ensure_ascii=False, indent=2)
+    except Exception as e:
+        # Graceful envelope (единый формат с debug_stack_trace/_error_json) вместо
+        # opaque MCP-exception — типичный кейс RDBG 400 «вычисления только в
+        # остановленном предмете отладки» при target не на halt'е.
+        log.exception("debug_evaluate failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__,
+                           expression=expression, target_id=target_id)
 
 
 @mcp.tool()
@@ -2424,19 +3146,23 @@ async def debug_set_breakpoint(
     line: int,
     module_type: str = "CommonModule",
     property_id: str = "",
+    condition: str = "",
+    hit_condition: str = "",
 ) -> str:
     """Set a breakpoint in a BSL module.
 
+    Roadmap 260511 §P0.A (2026-05-11): condition + hit_condition support.
+    - `condition`: BSL expression, BP fire'ит только если True (RDBG native).
+    - `hit_condition`: VS Code DAP syntax `>N`/`>=N`/`<N`/`<=N`/`=N`/`%N`
+      (wrapper enforce'ит counter в _handle_command, auto-Continue if не satisfied).
+
     Args:
-        object_id: UUID of metadata object (CommonModule UUID, Document UUID, ...)
-            from edt-mcp get_metadata_details.
-        property_id: Optional explicit propertyID UUID. Leave empty to auto-resolve
-            from module_type via MODULE_PROPERTY_IDS magic UUIDs.
+        object_id: UUID of metadata object.
+        property_id: Optional explicit propertyID UUID. Auto-resolves from module_type.
         line: Line number.
-        module_type: BSL module kind: CommonModule | ManagerModule | ObjectModule |
-            RecordSetModule | FormModule | CommandModule. When this matches a known
-            kind, propertyID auto-resolves and XML type is set to "ConfigModule"
-            (platform disambiguates by propertyID, not type literal).
+        module_type: CommonModule|ManagerModule|ObjectModule|RecordSetModule|FormModule|CommandModule.
+        condition: BSL conditional expression (e.g. `Контрагент.ИНН = "1234567890"`).
+        hit_condition: hit-count predicate `>N`/`%N`/`=N`.
     """
     client = _get_client()
     if not client._attached:
@@ -2456,6 +3182,8 @@ async def debug_set_breakpoint(
         object_id=object_id,
         property_id=property_id,
         lines=[line],
+        condition=condition,
+        hit_condition=hit_condition,
     )
     return json.dumps({
         "status": "breakpoint_set",
@@ -2464,6 +3192,60 @@ async def debug_set_breakpoint(
         "line": line,
         "module_type": module_type,
         "response": result,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_set_logpoint(
+    object_id: str,
+    line: int,
+    message_template: str,
+    module_type: str = "CommonModule",
+    property_id: str = "",
+) -> str:
+    """Set a logpoint (tracepoint): log + auto-Continue without user-visible halt.
+
+    Roadmap 260511 P0.B. VS Code DAP Logpoint analog: sets a wrapper-side BP,
+    on hit renders message_template (with {expr} placeholders evaluated against
+    current stack frame), appends JSONL entry to data/debug_logs/<session>.jsonl,
+    then auto-Continue.
+
+    SECURITY: {expr} placeholders в message_template исполняются как BSL-выражения
+    в running rphost через client.evaluate (privileged operation, has full access
+    to BSL execution context). Не передавайте untrusted templates.
+
+    Args:
+        object_id: UUID of metadata object.
+        line: Line number.
+        message_template: e.g. "ИНН={Контрагент.ИНН} flag={Флаг}".
+        module_type: CommonModule|ManagerModule|ObjectModule|RecordSetModule|FormModule|CommandModule.
+        property_id: Optional explicit propertyID UUID.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    xml_module_type = module_type
+    if not property_id or property_id == ZERO_UUID:
+        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
+        if kind_uuid:
+            property_id = kind_uuid
+            xml_module_type = "ConfigModule"
+    await client.set_breakpoints(
+        module_type=xml_module_type,
+        object_id=object_id,
+        property_id=property_id,
+        lines=[line],
+        logpoint_template=message_template,
+    )
+    return json.dumps({
+        "status": "logpoint_set",
+        "object_id": object_id,
+        "property_id": property_id,
+        "line": line,
+        "module_type": module_type,
+        "message_template": message_template,
+        "log_path": str(client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.jsonl"),
+        "placeholders": logpoints.extract_placeholders(message_template),
     }, ensure_ascii=False, indent=2)
 
 
@@ -2539,6 +3321,307 @@ async def debug_attach_targets(target_ids: list[str], attach: bool = True) -> st
 
 
 @mcp.tool()
+async def debug_arm_warm_rphosts(target_types: Optional[list[str]] = None) -> str:
+    """P0.F roadmap 260511: arm warm-pool rphosts for autonomous BP fire.
+
+    1С ragent holds a warm pool of rphost workers. HTTPService triggers (e.g.
+    1c-mcp-crud execute_code) reuse these warm rphosts instead of spawning
+    fresh ones — so BPs registered post-spawn never reach them (RDBG attach
+    is one-shot at spawn).
+
+    This tool lists all current targets, filters to specified types, attaches
+    each to current Debug UI session, marks them as `_attached_pending` (so
+    P0.E drain applies on next halt), then re-applies BP workspace.
+
+    Args:
+        target_types: filter list. None (default) → ["HTTPService","JOB","Server"].
+            Pass empty list `[]` to arm ALL targets unconditionally (no filter).
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    if target_types is None:
+        target_types = ["HTTPService", "JOB", "Server"]
+    try:
+        all_targets = await client.get_targets()
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"get_targets failed: {e}"})
+    armed = []
+    for t in all_targets:
+        ttype = t.get("targetType", "")
+        if target_types and ttype not in target_types:
+            continue
+        tid = t.get("id", "")
+        if not tid:
+            continue
+        try:
+            await client.attach_debug_targets([tid], attach=True)
+            client._known_attached_targets.add(tid)
+            client._attached_pending.add(tid)
+            armed.append({"id": tid, "type": ttype})
+        except Exception as e:
+            log.warning("[P0.F] arm failed for target=%s: %s", tid[:8], e)
+    reapplied_ok = False
+    if armed and client._set_breakpoints_cache:
+        try:
+            await client._reapply_bp_workspace()
+            reapplied_ok = True
+        except Exception as e:
+            log.warning("[P0.F] BP re-apply after arm failed: %s", e)
+    return json.dumps({
+        "status": "armed",
+        "count": len(armed),
+        "filter_types": target_types,
+        "armed_targets": armed,
+        "bp_workspace_reapplied": reapplied_ok,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_arm_next_rphost() -> str:
+    """P0.G roadmap 260511: silently arm next rphost (incl. warm pool) for BP fire.
+
+    HTTPService warm-pool rphost is invisible to a new debug session — RDBG only
+    auto-attaches NEWLY spawned targets via DBGUIExtCmdInfoStarted. P0.F's
+    `debug_arm_warm_rphosts` only sees targets exposed by getDbgAllTargetStates
+    (excludes warm pool). This tool uses RDBG global `setBreakOnNextStatement`
+    to force-halt the next BSL statement on ANY rphost (including warm pool),
+    then the wrapper drains the halt silently — attaches the target + reapplies
+    BPs + Continue — making it BP-receptive for the rest of its lifetime.
+
+    Usage:
+        debug_connect → set BPs → debug_arm_next_rphost → execute_code → BP fires
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    await client.set_break_on_next_statement(silent=True)
+    return json.dumps({
+        "status": "silent_arm_armed",
+        "next_stop_will_be_drained": True,
+        "hint": "Trigger BSL (e.g. execute_code). Wrapper will attach the rphost silently; subsequent BPs/logpoints fire normally.",
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_capture_mode(on: bool = True) -> str:
+    """Sticky capture-mode (#1, 2026-06-03): reliably catch BPs in fast background JOBs.
+
+    Problem: `debug_arm_next_rphost` arms `setBreakOnNextStatement` ONE-SHOT — only the
+    first spawned target halts. A short-lived JOB rphost (execute_code →
+    ФоновыеЗадания.Выполнить, lives <100ms) races: it can spawn → run past the target
+    line → quit before the polled targetStarted handler attaches + applies BPs, so
+    `callStackFormed` never arrives. Re-arming after each drain is manual & racy.
+
+    Fix: capture-mode keeps break-on-next **re-armed after every drain**, so EVERY new
+    target halts at its first BSL statement; the wrapper then drains (attach + reapply
+    BP workspace + brief wait + Continue) and re-arms for the next. Result: each JOB is
+    BP-receptive deterministically — no race. Real BP hits (stopByBP=true) are NOT
+    drained (kept visible). Turn OFF when done — until then ALL new targets pay the
+    spawn-halt cost.
+
+    Usage:
+        debug_connect → debug_set_breakpoint → debug_capture_mode(on=True)
+        → execute_code (background JOB) → debug_ping → BP fires
+        → inspect → debug_step(Continue) → debug_capture_mode(on=False)
+
+    Args:
+        on: True — enable + arm immediately; False — disable (also clears pending arm).
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    client._capture_mode = bool(on)
+    if on:
+        await client.set_break_on_next_statement(silent=True)
+        return json.dumps({
+            "status": "capture_mode_on",
+            "armed": True,
+            "hint": "Every new target now halts at its first statement until BPs apply. "
+                    "Trigger your code, debug_ping, then debug_capture_mode(on=False) to stop.",
+        }, ensure_ascii=False, indent=2)
+    client._break_on_next_silent_arm = False
+    return json.dumps({"status": "capture_mode_off", "armed": False}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_coverage_register(lines: list[dict]) -> str:
+    """P1.A roadmap 260511: register BSL lines for code coverage tracking.
+
+    Each entry registered as a silent coverage BP — on fire, wrapper increments
+    hit counter + auto-Continues (no user-visible halt, no JSONL noise).
+
+    Args:
+        lines: list of `{object_id, line, module_type?, property_id?, file_path?}`
+            - module_type auto-resolves propertyID via MODULE_PROPERTY_IDS
+            - file_path used in genericCoverage.xml output (optional)
+
+    Returns: `{status, registered_count, sample}` JSON envelope.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    registered = []
+    for spec in lines:
+        oid = spec.get("object_id", "")
+        if not oid:
+            continue
+        line = spec.get("line", 0)
+        module_type = spec.get("module_type", "CommonModule")
+        pid = spec.get("property_id", "") or MODULE_PROPERTY_IDS.get(module_type, "")
+        xml_mt = "ConfigModule" if pid and not spec.get("property_id") else module_type
+        fp = spec.get("file_path", "")
+        bsl_coverage.register_line(client, oid, pid, line, fp)
+        # Register as BP via existing aggregation (no condition, no template)
+        await client.set_breakpoints(
+            module_type=xml_mt, object_id=oid, property_id=pid, lines=[int(line)],
+        )
+        registered.append({"object_id": oid, "line": int(line), "property_id": pid})
+    return json.dumps({
+        "status": "registered",
+        "registered_count": len(registered),
+        "sample": registered[:5],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_coverage_export(output_path: str = "") -> str:
+    """P1.A roadmap 260511: export coverage as SonarQube genericCoverage.xml.
+
+    Args:
+        output_path: where to write XML (default: `data/debug_coverage/<session>.xml`)
+
+    Returns: `{path, files_count, lines_total, lines_covered, coverage_pct}` JSON.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    if not output_path:
+        out_dir = Path(__file__).parent / "data" / "debug_coverage"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sess = getattr(client, "session_id", None) or "unknown"
+        output_path = str(out_dir / f"{sess}.xml")
+    result = bsl_coverage.export_generic_coverage_xml(client, output_path)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_session_record(enable: bool = True) -> str:
+    """P2.A roadmap 260511: toggle session snapshot recording.
+
+    When enabled, every user-visible stop event (BP fire / exception not filtered)
+    appends snapshot entry to `data/debug_replays/<session>.jsonl`. Entry shape:
+    `{ts, iso, session_id, target_id, reason, stack, exception?}`.
+
+    NOT true time-travel — snapshots are read-only post-mortem inspection. Use
+    `debug_replay_seek(index)` / `debug_replay_list()` для retrieval.
+
+    Args:
+        enable: True (default) — start recording. False — stop recording.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    client._recording_enabled = bool(enable)
+    return json.dumps({
+        "status": "recording_enabled" if enable else "recording_disabled",
+        "recording_enabled": client._recording_enabled,
+        "session_id": getattr(client, "session_id", None),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_replay_list() -> str:
+    """P2.A roadmap 260511: list snapshots recorded in current session.
+
+    Returns array of `{index, iso, target_id, reason, line, has_exception}`.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    sess = getattr(client, "session_id", None)
+    snapshots = snapshot.list_snapshots(sess) if sess else []
+    return json.dumps({
+        "session_id": sess,
+        "count": len(snapshots),
+        "snapshots": snapshots,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_replay_seek(index: int) -> str:
+    """P2.A roadmap 260511: retrieve full snapshot at given index.
+
+    Returns full entry: `{ts, iso, session_id, target_id, reason, stack, exception?}`
+    or `{error: "out of range"}`.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    sess = getattr(client, "session_id", None)
+    entry = snapshot.seek_snapshot(sess, index) if sess else None
+    if entry is None:
+        return json.dumps({"error": "out of range", "index": index, "session_id": sess},
+                          ensure_ascii=False, indent=2)
+    return json.dumps(entry, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_set_exception_bp(message_pattern: str = "", module_pattern: str = "") -> str:
+    """P3.B roadmap 260511: add filter for exception BPs.
+
+    Wrapper's `_handle_command(rteProcessing)` halts on unhandled exceptions.
+    Without filters — halts on ALL exceptions (default). With filters — halts
+    only if at least one filter matches the exception.
+
+    Each filter has 2 axes (both case-insensitive substring match, empty = "match any"):
+    - `message_pattern`: matched against `messageText` of the exception
+    - `module_pattern`: matched against top stack frame's `presentation` field
+
+    Args:
+        message_pattern: e.g. "ошибка проведения" or "deadlock"
+        module_pattern: e.g. "гкс_ДокументРегистрации" or "ОбщегоНазначения"
+
+    Multiple `debug_set_exception_bp` calls accumulate filters (OR semantics —
+    halt if ANY filter matches). Use `debug_clear_exception_bps` to reset.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    f = {"message_pattern": message_pattern, "module_pattern": module_pattern}
+    client._exception_bp_filters.append(f)
+    return json.dumps({
+        "status": "filter_added",
+        "filter": f,
+        "total_filters": len(client._exception_bp_filters),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_clear_exception_bps() -> str:
+    """P3.B roadmap 260511: clear all exception BP filters → default (halt on ALL exceptions)."""
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    cleared = len(client._exception_bp_filters)
+    client._exception_bp_filters.clear()
+    return json.dumps({"status": "cleared", "filters_removed": cleared}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_list_exception_bps() -> str:
+    """P3.B roadmap 260511: list current exception BP filters."""
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    return json.dumps({
+        "filters": list(client._exception_bp_filters),
+        "count": len(client._exception_bp_filters),
+        "default_behavior": "halt-all" if not client._exception_bp_filters else "filter-only",
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def debug_break_on_next() -> str:
     """Force-break next BSL statement on any rphost (covers pre-existing targets).
 
@@ -2569,6 +3652,171 @@ async def debug_break_on_next() -> str:
         }, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def debug_launch_thin_client(infobase_alias: str = "",
+                                    user: str = "",
+                                    password: str = "",
+                                    server: str = "localhost:1541",
+                                    debugger_url: str = "http://localhost:1550",
+                                    wait_target_timeout_sec: int = 15) -> str:
+    """Launch 1cv8c.exe (thin client) с правильными /Debug -http /DebuggerURL флагами.
+
+    Roadmap 260511 §3.5 (P1). Auto-flagged thin client launch closes RC3
+    (protocol mismatch tcp:// vs http://) and provides Solution C как
+    first-class workflow вместо manual workaround.
+
+    Args:
+        infobase_alias: cluster IB name (mandatory если пуст — error)
+        user: optional /N username
+        password: optional /P password (be careful with secrets in logs)
+        server: cluster server (default localhost:1541)
+        debugger_url: debug agent URL (default http://localhost:1550)
+        wait_target_timeout_sec: timeout для ожидания регистрации target'а
+
+    Returns: {status, pid, command_line, target_registered, first_target_id,
+              elapsed_ms}
+    """
+    import os
+    import subprocess as sp
+    if not infobase_alias:
+        return json.dumps({"status": "error",
+                           "reason": "infobase_alias_required"},
+                          ensure_ascii=False, indent=2)
+    exe = _find_1cv8c_exe()
+    if not exe:
+        return json.dumps({
+            "status": "error", "reason": "1cv8c_exe_not_found",
+            "searched": list(_1CV8C_BIN_CANDIDATES),
+            "hint": "Provide explicit path via env or install 1С platform",
+        }, ensure_ascii=False, indent=2)
+    # Validate infobase_alias unless cluster unreachable
+    validation = _validate_infobase_alias(infobase_alias)
+    if validation["status"] == "invalid":
+        return json.dumps({
+            "status": "error", "reason": "infobase_alias_not_found",
+            "provided": infobase_alias,
+            "available": validation["available"],
+        }, ensure_ascii=False, indent=2)
+    args = [exe, f'/S{server}\\{infobase_alias}',
+            "/Debug", "-http", f'/DebuggerURL={debugger_url}']
+    if user:
+        args.extend(["/N", user])
+    if password:
+        args.extend(["/P", password])
+    try:
+        # Detached background launch (Windows) — DETACHED_PROCESS=0x00000008
+        creationflags = getattr(sp, "DETACHED_PROCESS", 0) | \
+                        getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = sp.Popen(args, creationflags=creationflags,
+                        stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                        close_fds=True)
+    except (OSError, sp.SubprocessError) as e:
+        return json.dumps({"status": "error", "reason": "launch_failed",
+                           "error": str(e)}, ensure_ascii=False, indent=2)
+    # Wait for target registration via existing client (if connected)
+    target_registered = False
+    first_target_id = None
+    elapsed_ms = 0
+    not_connected_warning = None
+    if _client and _client._attached:
+        import time as _t
+        start = _t.monotonic()
+        timeout = max(1, min(60, wait_target_timeout_sec))
+        while _t.monotonic() - start < timeout:
+            try:
+                targets = await _client.get_targets()
+            except Exception:
+                targets = []
+            if targets:
+                target_registered = True
+                first_target_id = next(
+                    (t.get("id") for t in targets if t.get("id")), None)
+                break
+            await asyncio.sleep(0.5)
+        elapsed_ms = int((_t.monotonic() - start) * 1000)
+    else:
+        not_connected_warning = (
+            "Not connected to debug agent — target_registered detection "
+            "skipped. Call debug_connect first для polling.")
+    # Hide password в command_line на возврате
+    command_line_safe = " ".join(
+        ("/P***" if arg == password and password else f'"{arg}"' if " " in arg else arg)
+        for arg in args)
+    response = {
+        "status": "ok" if target_registered else "launched",
+        "pid": proc.pid,
+        "command_line": command_line_safe,
+        "target_registered": target_registered,
+        "first_target_id": first_target_id,
+        "elapsed_ms": elapsed_ms,
+        "note": ("Target not yet registered — perform any action в GUI "
+                 "to trigger BSL execution, then debug_wait_for_target"
+                 if not target_registered else None),
+    }
+    if not_connected_warning:
+        response["warning"] = not_connected_warning
+    if password:
+        response["security_note"] = (
+            "/P password передаётся через CLI argv — виден в OS process list "
+            "(Get-Process | Select CommandLine). НЕ использовать в shared/"
+            "production контекстах. Предпочтительно: сохранённые credentials "
+            "в Windows-storage клиента или Windows-auth.")
+    return json.dumps(response, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_wait_for_target(timeout_sec: int = 10,
+                                 poll_interval_sec: float = 0.5) -> str:
+    """Block until ≥1 target appears in debug_targets, or timeout.
+
+    Roadmap 260511 §3.4 (P1). Synchronous primitive для guaranteed-attached
+    workflow: после debug_connect / launch_thin_client часто требуется
+    дождаться регистрации target'а (rphost spawn + DBGUIExtCmdInfoStarted
+    handler) перед set_breakpoint.
+
+    Args:
+        timeout_sec: max wait time. Clamped to [1, 60].
+        poll_interval_sec: pause между debug_targets polls.
+
+    Returns: {status: "ok"|"timeout", targets_count, first_target_id,
+              elapsed_ms, [suggestion if timeout]}
+    """
+    import time as _t
+    timeout_sec = max(1, min(60, timeout_sec))
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."},
+                          ensure_ascii=False, indent=2)
+    start = _t.monotonic()
+    while _t.monotonic() - start < timeout_sec:
+        try:
+            targets = await client.get_targets()
+        except Exception:
+            targets = []
+        if targets:
+            first_id = next((t.get("id") for t in targets if t.get("id")), None)
+            return json.dumps({
+                "status": "ok",
+                "targets_count": len(targets),
+                "first_target_id": first_id,
+                "elapsed_ms": int((_t.monotonic() - start) * 1000),
+            }, ensure_ascii=False, indent=2)
+        await asyncio.sleep(poll_interval_sec)
+    return json.dumps({
+        "status": "timeout",
+        "targets_count": 0,
+        "first_target_id": None,
+        "elapsed_ms": int((_t.monotonic() - start) * 1000),
+        "suggestion": (
+            "No targets registered within timeout. Try: (1) launch thin "
+            "client with /Debug -http /DebuggerURL=http://localhost:1550, "
+            "(2) trigger BSL via execute_code, (3) check infobase_alias "
+            "valid via debug_health_check, (4) try recycle_strategy="
+            "all_rphosts_of_ib if pre-existing rphost gap."
+        ),
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
