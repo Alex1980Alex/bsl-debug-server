@@ -1459,11 +1459,11 @@ class RDBGClient:
                 mod_xml += _base("extId", str(entry["ext_id"]))
             if entry.get("version"):
                 mod_xml += _base("version", entry["version"])
+            # Preserve per-entry condition on re-apply (review PR#1 #2): use the
+            # shared _build_bp_info_xml helper so conditional BPs do not silently
+            # revert to unconditional during targetStarted / HMR-recovery re-apply.
             bp_xml = "".join(
-                _bp("bpInfo",
-                    _bp("line", str(L))
-                    + _bp("isActive", "true")
-                    + _bp("temp", "false"))
+                _build_bp_info_xml(L, entry.get("condition", ""))
                 for L in entry["lines"]
             )
             module_bp_infos.append(
