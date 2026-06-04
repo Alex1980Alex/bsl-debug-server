@@ -11,6 +11,10 @@ from pathlib import Path
 
 log = logging.getLogger("1c-debug-mcp.logpoints")
 
+# Strong refs to in-flight deferred logpoint tasks — asyncio keeps only a weak
+# ref to create_task() results, so without this they can be GC'd mid-run.
+_active_tasks: set = set()
+
 
 _PLACEHOLDER_RE = re.compile(r"(?<!\{)\{([^{}]+)\}(?!\})")
 
@@ -146,6 +150,8 @@ async def fire_logpoint(client, target_id: str, stack: list, log_dir: Path) -> b
     if key is None or key not in client._logpoints:
         return False
     template = client._logpoints[key]
-    asyncio.create_task(
+    task = asyncio.create_task(
         _eval_log_continue(client, target_id, key, template, log_dir))
+    _active_tasks.add(task)
+    task.add_done_callback(_active_tasks.discard)
     return True
