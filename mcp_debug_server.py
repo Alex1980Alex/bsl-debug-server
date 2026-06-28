@@ -161,6 +161,7 @@ def _build_bp_info_xml(line: int, condition: str = "") -> str:
     if condition:
         children += _bp("condition", _escape_xml(condition))
     children += _bp("temp", "false")
+    children += _bp("user", "true")  # yukon39 BreakpointInfo.user — dbgs halt только для user-BP
     return _bp("bpInfo", children)
 
 
