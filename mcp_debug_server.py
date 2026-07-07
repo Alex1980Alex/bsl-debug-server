@@ -3507,6 +3507,164 @@ async def debug_coverage_export(output_path: str = "") -> str:
 
 
 @mcp.tool()
+async def debug_calibrate_lines(
+    object_id: str,
+    line: int,
+    module_type: str = "CommonModule",
+    property_id: str = "",
+    radius: int = 8,
+) -> str:
+    """Калибровка строк живой конфигурации: silent-веер BP вокруг целевой строки.
+
+    Живой факт 2026-07-07 (гкс_АсинхронныеСервисы): номера строк repo/EDT-src
+    систематически смещены относительно deployed-конфигурации → BP по строке
+    из git-src молча не fire'ит. Этот tool ставит coverage-BP (hit + auto-
+    Continue, без user-visible halt) на диапазон [line-radius, line+radius];
+    после триггера кода `debug_calibrate_result` возвращает РЕАЛЬНО исполняемые
+    строки и смещение — точечный BP/logpoint ставится уже по ним.
+
+    Workflow:
+        debug_calibrate_lines → trigger (ФоновыеЗадания.Выполнить через
+        execute_code) → debug_ping ×2-3 → debug_calibrate_result
+
+    Args:
+        object_id: UUID metadata-объекта.
+        line: целевая строка по локальным исходникам (repo/EDT).
+        module_type: CommonModule|ManagerModule|ObjectModule|RecordSetModule|FormModule|CommandModule.
+        property_id: явный propertyID (авто-резолв из module_type если пуст).
+        radius: полуширина веера (1..30, default 8).
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    xml_module_type = module_type
+    if not property_id or property_id == ZERO_UUID:
+        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
+        if kind_uuid:
+            property_id = kind_uuid
+            xml_module_type = "ConfigModule"
+    radius = max(1, min(int(radius), 30))
+    fan = list(range(max(1, int(line) - radius), int(line) + radius + 1))
+    for ln in fan:
+        bsl_coverage.register_line(client, object_id, property_id, ln)
+    await client.set_breakpoints(
+        module_type=xml_module_type, object_id=object_id,
+        property_id=property_id, lines=fan,
+    )
+    if not hasattr(client, "_calibrations"):
+        client._calibrations = {}
+    client._calibrations[object_id] = {
+        "requested_line": int(line),
+        "lines": fan,
+        "property_id": property_id,
+        "module_type": module_type,
+        "xml_module_type": xml_module_type,
+    }
+    return json.dumps({
+        "status": "calibration_armed",
+        "object_id": object_id,
+        "requested_line": int(line),
+        "range": [fan[0], fan[-1]],
+        "count": len(fan),
+        "next_steps": [
+            "Trigger: execute_code → ФоновыеЗадания.Выполнить(\"Модуль.Метод\", Параметры)",
+            "debug_ping ×2-3 (пока не увидишь callStackFormed / коду дадут пройти)",
+            "debug_calibrate_result(object_id) → реальные строки + offset",
+        ],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def debug_calibrate_result(
+    object_id: str = "",
+    clear: bool = True,
+    keep_bp_on_nearest: bool = True,
+) -> str:
+    """Результат калибровки строк: какие строки веера реально исполнились.
+
+    Возвращает fired-строки (hits>0 из coverage-трекера), ближайшую к
+    запрошенной и offset (реальная − запрошенная) — типовой сдвиг применим
+    ко всему модулю. По умолчанию чистит веер (coverage-ключи + BP workspace)
+    и оставляет ОДИН обычный BP на ближайшей fired-строке (уже без auto-
+    Continue — следующий проход остановится видимо).
+
+    Args:
+        object_id: UUID из debug_calibrate_lines (пусто = все активные калибровки).
+        clear: снять веер после чтения результата.
+        keep_bp_on_nearest: оставить точечный BP на ближайшей fired-строке.
+    """
+    client = _get_client()
+    if not client._attached:
+        return json.dumps({"error": "Not connected. Call debug_connect first."})
+    calibs = getattr(client, "_calibrations", {}) or {}
+    if object_id:
+        calibs = {k: v for k, v in calibs.items() if k == object_id}
+    if not calibs:
+        return json.dumps({
+            "error": "no active calibration",
+            "hint": "debug_calibrate_lines first",
+        }, ensure_ascii=False)
+    tracked = getattr(client, "_coverage_tracked", {}) or {}
+    results = []
+    for oid, meta in calibs.items():
+        pid = meta["property_id"]
+        requested = meta["requested_line"]
+        fired = sorted(
+            ln for ln in meta["lines"]
+            if tracked.get((oid, pid, ln), {}).get("hits", 0) > 0
+        )
+        nearest = min(fired, key=lambda L: abs(L - requested)) if fired else None
+        entry = {
+            "object_id": oid,
+            "requested_line": requested,
+            "fired_lines": fired,
+            "nearest_fired": nearest,
+            "offset": (nearest - requested) if nearest is not None else None,
+        }
+        if not fired:
+            entry["hint"] = ("веер не сработал: проверь trigger (JOB, не "
+                             "HTTP-service), pre-existing rphost, radius")
+        results.append(entry)
+        if clear:
+            fan_set = set(meta["lines"])
+            for ln in meta["lines"]:
+                tracked.pop((oid, pid, ln), None)
+            nearest_kept = False
+            for cache_entry in list(client._set_breakpoints_cache):
+                if (cache_entry["object_id"] == oid
+                        and cache_entry["property_id"] == pid):
+                    kept = [L for L in cache_entry["lines"] if L not in fan_set]
+                    if keep_bp_on_nearest and nearest is not None:
+                        kept.append(nearest)
+                        nearest_kept = True
+                    cache_entry["lines"] = sorted(set(kept))
+                    if not cache_entry["lines"]:
+                        client._set_breakpoints_cache.remove(cache_entry)
+            if keep_bp_on_nearest and nearest is not None and not nearest_kept:
+                # кэш мог не содержать веер (HMR-restart) — создаём запись явно
+                client._set_breakpoints_cache.append({
+                    "module_type": meta["xml_module_type"], "object_id": oid,
+                    "property_id": pid, "lines": [nearest],
+                    "ext_id": 0, "url": "", "extension_name": "",
+                    "version": "", "condition": "",
+                })
+            client._calibrations.pop(oid, None)
+    if clear:
+        if client._set_breakpoints_cache:
+            await client._reapply_bp_workspace()
+        else:
+            # workspace REPLACES per call — пустой push снимает остатки веера
+            body = _build_request(client._base_fields(), _rdbg("bpWorkspace", ""))
+            await client._post("setBreakpoints", body)
+    return json.dumps({
+        "status": "calibration_result",
+        "results": results,
+        "cleared": bool(clear),
+        "bp_kept_on_nearest": bool(keep_bp_on_nearest),
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 async def debug_session_record(enable: bool = True) -> str:
     """P2.A roadmap 260511: toggle session snapshot recording.
 
