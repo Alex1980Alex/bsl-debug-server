@@ -3543,16 +3543,31 @@ async def debug_calibrate_lines(
         if kind_uuid:
             property_id = kind_uuid
             xml_module_type = "ConfigModule"
+    line = max(1, int(line))
     radius = max(1, min(int(radius), 30))
-    fan = list(range(max(1, int(line) - radius), int(line) + radius + 1))
+    fan = list(range(max(1, line - radius), line + radius + 1))
+    if not hasattr(client, "_calibrations"):
+        client._calibrations = {}
+    stale = client._calibrations.pop(object_id, None)
+    if stale:
+        # повторная калибровка того же объекта: снять старый веер, иначе его
+        # silent auto-Continue BP живут до disconnect (утечка)
+        stale_set = set(stale["lines"])
+        stale_tracked = getattr(client, "_coverage_tracked", {}) or {}
+        for ln in stale["lines"]:
+            stale_tracked.pop((object_id, stale["property_id"], ln), None)
+        for ce in list(client._set_breakpoints_cache):
+            if (ce["object_id"] == object_id
+                    and ce["property_id"] == stale["property_id"]):
+                ce["lines"] = [L for L in ce["lines"] if L not in stale_set]
+                if not ce["lines"]:
+                    client._set_breakpoints_cache.remove(ce)
     for ln in fan:
         bsl_coverage.register_line(client, object_id, property_id, ln)
     await client.set_breakpoints(
         module_type=xml_module_type, object_id=object_id,
         property_id=property_id, lines=fan,
     )
-    if not hasattr(client, "_calibrations"):
-        client._calibrations = {}
     client._calibrations[object_id] = {
         "requested_line": int(line),
         "lines": fan,

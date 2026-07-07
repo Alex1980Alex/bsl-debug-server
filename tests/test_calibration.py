@@ -64,6 +64,42 @@ class TestCalibrateLines:
         # radius clamp 30, floor строки = 1
         assert out["range"] == [1, 32]
 
+    async def test_recalibrate_same_object_cleans_stale_fan(self, monkeypatch):
+        c = _make_client(monkeypatch)
+
+        async def _set_bps(self, **kw):
+            return []
+
+        monkeypatch.setattr(RDBGClient, "set_breakpoints", _set_bps)
+        await srv.debug_calibrate_lines(object_id=OID, line=67, radius=3)
+        pid = c._calibrations[OID]["property_id"]
+        # эмулируем попадание в кэш (реальный set_breakpoints его заполняет)
+        c._set_breakpoints_cache.append({
+            "module_type": "ConfigModule", "object_id": OID,
+            "property_id": pid, "lines": list(range(64, 71)),
+            "ext_id": 0, "url": "", "extension_name": "",
+            "version": "", "condition": "",
+        })
+        await srv.debug_calibrate_lines(object_id=OID, line=100, radius=2)
+        # старый веер вычищен из coverage-трекера и BP-кэша
+        assert not any(64 <= k[2] <= 70 for k in c._coverage_tracked if k[0] == OID)
+        assert not [e for e in c._set_breakpoints_cache if e["object_id"] == OID]
+        # новый веер зарегистрирован, калибровка перезаписана
+        assert all((OID, pid, ln) in c._coverage_tracked for ln in range(98, 103))
+        assert c._calibrations[OID]["requested_line"] == 100
+
+    async def test_negative_line_floored(self, monkeypatch):
+        _make_client(monkeypatch)
+
+        async def _set_bps(self, **kw):
+            return []
+
+        monkeypatch.setattr(RDBGClient, "set_breakpoints", _set_bps)
+        out = json.loads(await srv.debug_calibrate_lines(
+            object_id=OID, line=-5, radius=3))
+        # отрицательная строка не даёт пустой веер / IndexError
+        assert out["range"] == [1, 4]
+
     async def test_requires_connection(self, monkeypatch):
         c = _make_client(monkeypatch)
         c._attached = False
