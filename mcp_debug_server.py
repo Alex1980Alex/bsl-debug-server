@@ -35,6 +35,7 @@ import artifacts  # P1.B roadmap 260511
 import coverage as bsl_coverage  # P1.A roadmap 260511
 import exception_bps  # P3.B roadmap 260511
 import snapshot  # P2.A roadmap 260511
+import autonomy  # A0/A1 roadmap 260708
 
 logging.basicConfig(
     level=logging.INFO,
@@ -3409,6 +3410,41 @@ async def debug_evaluate(expression: str, target_id: str = "", stack_level: int 
         return _error_json(
             _rdbg_error_text(e), type(e).__name__, expression=expression, target_id=target_id
         )
+
+
+@mcp.tool()
+async def debug_inspect_frame(
+    target_id: str = "", stack_level: int = 0, context_radius: int = 3
+) -> str:
+    """A0 (roadmap 260708 §7.2): rich frame bundle в один вызов.
+
+    Сворачивает цепочку debug_stack_trace → debug_variables → N×debug_evaluate
+    в один ответ: текущий фрейм + resolved_source (FQN/файл) + auto-discovered
+    локали + исходник строки ±context_radius (маркер `current` на текущей).
+    Основной агент-центричный примитив (ADI/InspectCoder frame-bundle).
+
+    Args:
+        target_id: UUID; пусто → cached last_stopped → get_targets scan.
+        stack_level: 0 = текущий/innermost фрейм, 1 = вызывающий, ...
+        context_radius: строк исходника выше/ниже текущей (default 3).
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        target_id, scanned = await _resolve_stopped_target(client, target_id)
+        if not target_id:
+            return _error_json("No stopped targets", "no_stopped_target", targets=scanned)
+        bundle = await autonomy.build_frame_bundle(
+            client,
+            target_id,
+            stack_level=stack_level,
+            context_radius=context_radius,
+        )
+        return json.dumps(bundle, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.exception("debug_inspect_frame failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, target_id=target_id)
 
 
 @mcp.tool()
