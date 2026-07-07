@@ -55,14 +55,37 @@ NS = {
 
 # Magic propertyID UUIDs per BSL module kind (yukon39/bsl-debug-server ModulePropertyId.java)
 MODULE_PROPERTY_IDS = {
-    "CommonModule":  "d5963243-262e-4398-b4d7-fb16d06484f6",
+    "CommonModule": "d5963243-262e-4398-b4d7-fb16d06484f6",
     "ManagerModule": "d1b64a2c-8078-4982-8190-8f81aefda192",
-    "ObjectModule":  "a637f77f-3840-441d-a1c3-699c8c5cb7e0",
+    "ObjectModule": "a637f77f-3840-441d-a1c3-699c8c5cb7e0",
     "RecordSetModule": "9f36fd70-4bf4-47f6-b235-935f73aab43f",
-    "FormModule":    "32e087ab-1491-49b6-aba7-43571b41ac2b",
+    "FormModule": "32e087ab-1491-49b6-aba7-43571b41ac2b",
     "CommandModule": "078a6af8-d22c-4248-9c33-7e90075a3d2c",
 }
 ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _resolve_property_id(module_type: str, property_id: str = "") -> tuple[str, str]:
+    """Resolve propertyID UUID from module_type when unset/zero.
+
+    RDBG silently ignores BPs with zero/empty propertyID (see
+    cache/dbgs-rdbg-debug-server.md §11). When property_id is empty or
+    ZERO_UUID, look up MODULE_PROPERTY_IDS[module_type] and switch the wire
+    module_type to "ConfigModule" (RDBG addresses config sub-modules by
+    propertyID kind). An explicit non-zero property_id is returned unchanged
+    with module_type intact.
+
+    Returns (xml_module_type, property_id).
+
+    W1.0.1 (2026-07-08): dedup of identical inline blocks previously in
+    debug_set_breakpoint / debug_set_logpoint / debug_calibrate_lines /
+    debug_coverage_register.
+    """
+    if not property_id or property_id == ZERO_UUID:
+        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
+        if kind_uuid:
+            return "ConfigModule", kind_uuid
+    return module_type, property_id
 
 
 def _build_request(*children_xml: str) -> str:
@@ -72,16 +95,14 @@ def _build_request(*children_xml: str) -> str:
     """
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        '<debugBaseData:request'
+        "<debugBaseData:request"
         f' xmlns:debugRDBGRequestResponse="{NS["rdbg"]}"'
         f' xmlns:debugBaseData="{NS["base"]}"'
         f' xmlns:debugCalculations="{NS["calc"]}"'
         f' xmlns:debugAutoAttach="{NS["auto"]}"'
         f' xmlns:debugBreakpoints="{NS["bp"]}"'
         f' xmlns:debugRTEFilter="{NS["rte"]}"'
-        ">"
-        + "".join(children_xml)
-        + "</debugBaseData:request>"
+        ">" + "".join(children_xml) + "</debugBaseData:request>"
     )
 
 
@@ -152,8 +173,13 @@ def _parse_response(root: ET.Element) -> list[dict]:
 
 
 def _escape_xml(s: str) -> str:
-    return (s.replace("&", "&amp;").replace("<", "&lt;")
-             .replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;"))
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
 
 
 def _build_bp_info_xml(line: int, condition: str = "") -> str:
@@ -181,7 +207,9 @@ def _aggregate_breakpoints(cache: list, new_entry: dict) -> dict:
     grouped: dict = {}
     for entry in list(cache) + [new_entry]:
         key = (
-            entry["module_type"], entry["object_id"], entry["property_id"],
+            entry["module_type"],
+            entry["object_id"],
+            entry["property_id"],
             entry.get("ext_id", 0) or 0,
             entry.get("url", "") or "",
             entry.get("extension_name", "") or "",
@@ -206,8 +234,7 @@ class RDBGClient:
         "User-Agent": "1CV8",
     }
 
-    def __init__(self, debug_url: str = "http://localhost:1550",
-                 infobase_alias: str = "DefAlias"):
+    def __init__(self, debug_url: str = "http://localhost:1550", infobase_alias: str = "DefAlias"):
         self.debug_url = debug_url.rstrip("/")
         self.infobase_alias = infobase_alias
         self.session_id = str(uuid.uuid4())
@@ -228,7 +255,7 @@ class RDBGClient:
         # P0.A roadmap 260511: hit-condition counters per (object_id, property_id, line).
         # RDBG не имеет native hit-count → wrapper-level enforcement в _handle_command.
         self._hit_conditions: dict[tuple, str] = {}  # (oid,pid,line) -> ">5" | "%3" | "=10"
-        self._hit_counters: dict[tuple, int] = {}    # (oid,pid,line) -> count
+        self._hit_counters: dict[tuple, int] = {}  # (oid,pid,line) -> count
         # P0.B roadmap 260511: logpoint templates per (object_id, property_id, line).
         # На callStackFormed: render → write JSONL → auto-Continue (no user-visible halt).
         self._logpoints: dict[tuple, str] = {}  # (oid,pid,line) -> "Контр={Контр.ИНН}"
@@ -272,22 +299,23 @@ class RDBGClient:
 
         # §12.3 Level 3 — session metrics tracking (append-only counters)
         from datetime import datetime as _dt
+
         self._session_started_at = _dt.now().isoformat()
         self._bp_set_count = 0
         self._bp_fire_count = 0
-        self._bp_by_location: dict = {}    # "obj_id:line" → fire count
+        self._bp_by_location: dict = {}  # "obj_id:line" → fire count
         self._eval_count = 0
         self._eval_failures = 0
-        self._eval_errors: list = []       # last N error strings
+        self._eval_errors: list = []  # last N error strings
         self._ui_plus_retry_count = 0
         self._recycle_method_used: Optional[str] = None
         self._force_recycle_invoked = False
-        self._stop_events: list = []       # [{ts, target_id, lineNo}]
+        self._stop_events: list = []  # [{ts, target_id, lineNo}]
         self._rphosts_seen: set = set()
 
-    async def _post(self, command: str, body: str,
-                    include_dbgui_url: bool = False,
-                    _ui_plus_retry: bool = True) -> ET.Element:
+    async def _post(
+        self, command: str, body: str, include_dbgui_url: bool = False, _ui_plus_retry: bool = True
+    ) -> ET.Element:
         """POST to RDBG endpoint. Only ping uses dbgui in URL.
 
         UI+ auto-retry (2026-05-10): if RDBG returns 400 with \u00abUI+ \u0447\u0430\u0441\u0442\u044c
@@ -310,27 +338,41 @@ class RDBGClient:
             ui_plus_lost = (
                 _ui_plus_retry
                 and resp.status_code == 400
-                and command not in ("initSettings", "clearBreakOnNextStatement",
-                                    "attachDebugUI", "detachDebugUI")
-                and ("UI+ - \u0447\u0430\u0441\u0442\u044c \u043e\u0442\u043b\u0430\u0434\u043a\u0438 \u043d\u0435 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u0430" in err_body
-                     or "UI+ debug part not registered" in err_body)
+                and command
+                not in (
+                    "initSettings",
+                    "clearBreakOnNextStatement",
+                    "attachDebugUI",
+                    "detachDebugUI",
+                )
+                and (
+                    "UI+ - \u0447\u0430\u0441\u0442\u044c \u043e\u0442\u043b\u0430\u0434\u043a\u0438 \u043d\u0435 \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d\u0430"
+                    in err_body
+                    or "UI+ debug part not registered" in err_body
+                )
             )
             if ui_plus_lost:
                 return await self._ui_plus_recover_and_retry(
-                    command, body, include_dbgui_url, resp, err_body,
+                    command,
+                    body,
+                    include_dbgui_url,
+                    resp,
+                    err_body,
                 )
             log.error("RDBG %s -> HTTP %s body=%s", command, resp.status_code, err_body)
             raise httpx.HTTPStatusError(
                 f"RDBG {command} {resp.status_code}: {err_body}",
-                request=resp.request, response=resp,
+                request=resp.request,
+                response=resp,
             )
         text = resp.text.lstrip("\ufeff")
         if not text:
             return ET.Element("empty")
         return ET.fromstring(text)
 
-    async def _ui_plus_recover_and_retry(self, command, body,
-                                          include_dbgui_url, failed_resp, err_body):
+    async def _ui_plus_recover_and_retry(
+        self, command, body, include_dbgui_url, failed_resp, err_body
+    ):
         """Two-stage UI+ recovery: light handshake → escalate to full re-attach.
 
         Live test 2026-05-10: when UI+ is revoked, even initSettings itself
@@ -350,15 +392,14 @@ class RDBGClient:
             light_failed = True
         if not light_failed:
             try:
-                return await self._post(command, body,
-                                         include_dbgui_url=include_dbgui_url,
-                                         _ui_plus_retry=False)
+                return await self._post(
+                    command, body, include_dbgui_url=include_dbgui_url, _ui_plus_retry=False
+                )
             except httpx.HTTPStatusError as light_err:
                 if not self._is_ui_plus_lost(light_err):
                     raise
         log.warning("RDBG %s → escalating to full detach+attach", command)
-        return await self._ui_plus_full_reattach_and_retry(
-            command, body, include_dbgui_url)
+        return await self._ui_plus_full_reattach_and_retry(command, body, include_dbgui_url)
 
     async def _ui_plus_full_reattach_and_retry(self, command, body, include_dbgui_url):
         """Stage 2 escalation: detach + new attachDebugUI + 4-step handshake."""
@@ -379,9 +420,9 @@ class RDBGClient:
             await self.clear_break_on_next_statement()
             await self.set_auto_attach_settings()
         log.info("UI+ escalation: re-attached %s → %s", old_sid[:8], self.session_id[:8])
-        return await self._post(command, body,
-                                 include_dbgui_url=include_dbgui_url,
-                                 _ui_plus_retry=False)
+        return await self._post(
+            command, body, include_dbgui_url=include_dbgui_url, _ui_plus_retry=False
+        )
 
     @staticmethod
     def _is_ui_plus_lost(err: "httpx.HTTPStatusError") -> bool:
@@ -394,9 +435,8 @@ class RDBGClient:
 
     def _base_fields(self) -> str:
         """Common fields: infoBaseAlias + idOfDebuggerUI."""
-        return (
-            _rdbg("infoBaseAlias", self.infobase_alias)
-            + _rdbg("idOfDebuggerUI", self.session_id)
+        return _rdbg("infoBaseAlias", self.infobase_alias) + _rdbg(
+            "idOfDebuggerUI", self.session_id
         )
 
     # -- Connection API ----------------------------------------------------
@@ -458,8 +498,11 @@ class RDBGClient:
         # then calls attach() again — so the new id overwrites the stale file).
         if self._registered:
             _persist_active_session(self)
-        return {"result": result, "session_id": self.session_id,
-                "fully_registered": self._registered}
+        return {
+            "result": result,
+            "session_id": self.session_id,
+            "fully_registered": self._registered,
+        }
 
     async def _cleanup_stale_session(self) -> None:
         """Probe getDebugID — если existing session ID найден, попытаться detach.
@@ -477,10 +520,11 @@ class RDBGClient:
         """
         try:
             stale_id = await self.get_debug_id()
-            if (stale_id and stale_id != self.session_id
-                    and stale_id != ZERO_UUID):
-                log.info("[cleanup_stale] existing debug UI session %s found, "
-                         "attempting detach", stale_id[:8])
+            if stale_id and stale_id != self.session_id and stale_id != ZERO_UUID:
+                log.info(
+                    "[cleanup_stale] existing debug UI session %s found, attempting detach",
+                    stale_id[:8],
+                )
                 detach_body = _build_request(
                     _rdbg("infoBaseAlias", self.infobase_alias),
                     _rdbg("idOfDebuggerUI", stale_id),
@@ -601,8 +645,11 @@ class RDBGClient:
             await self.attach_debug_targets(new_ids, attach=True)
             for tid in new_ids:
                 self._known_attached_targets.add(tid)
-            log.info("[post-spawn] auto-attached %d new target(s): %s",
-                     len(new_ids), [tid[:8] for tid in new_ids])
+            log.info(
+                "[post-spawn] auto-attached %d new target(s): %s",
+                len(new_ids),
+                [tid[:8] for tid in new_ids],
+            )
             return len(new_ids)
         except Exception as e:
             log.warning("post-spawn attach failed: %s", e)
@@ -641,8 +688,7 @@ class RDBGClient:
             num = cmd.get("cmdIDNum") or ""
             if isinstance(num, str) and num in self._CMD_ID_NUM_TO_LITERAL:
                 cmd_type = self._CMD_ID_NUM_TO_LITERAL[num]
-                log.debug("[event] cmdId derived from cmdIDNum=%s -> %s",
-                          num, cmd_type)
+                log.debug("[event] cmdId derived from cmdIDNum=%s -> %s", num, cmd_type)
         # Extract target_id — payload может иметь nested targetID или targetIDStr
         target_id = self._extract_target_id(cmd)
 
@@ -666,11 +712,9 @@ class RDBGClient:
                     if self._set_breakpoints_cache:
                         try:
                             await self._reapply_bp_workspace()
-                            log.debug("[event] BPs re-applied for target %s",
-                                      target_id[:8])
+                            log.debug("[event] BPs re-applied for target %s", target_id[:8])
                         except Exception as e:
-                            log.warning("BP re-apply failed for %s: %s",
-                                        target_id[:8], e)
+                            log.warning("BP re-apply failed for %s: %s", target_id[:8], e)
                     # P0.E: mark target as pending BP-propagation drain.
                     # First cascade halt for this target → drain BPs + brief wait + Continue.
                     self._attached_pending.add(target_id)
@@ -693,11 +737,17 @@ class RDBGClient:
             self._last_stack_by_target[target_id] = stack
             stop_by_bp = str(cmd.get("stopByBP", "")).lower() == "true"
             self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
-            log.info("[event] CallStackFormed: target=%s frames=%d reason=%s",
-                     target_id[:8], len(stack), self._stop_reason_by_target[target_id])
+            log.info(
+                "[event] CallStackFormed: target=%s frames=%d reason=%s",
+                target_id[:8],
+                len(stack),
+                self._stop_reason_by_target[target_id],
+            )
             # P0.D roadmap 260511: filter system-initiated stops (spawn-halt, stop_on_next)
             system_stop_suppressed = await system_stops.maybe_auto_continue_system_stop(
-                self, target_id, stop_by_bp,
+                self,
+                target_id,
+                stop_by_bp,
             )
             if system_stop_suppressed:
                 return
@@ -708,7 +758,9 @@ class RDBGClient:
             coverage_hit = False
             if stop_by_bp and stack and self._coverage_tracked:
                 coverage_hit = await bsl_coverage.record_hit_and_continue(
-                    self, target_id, stack,
+                    self,
+                    target_id,
+                    stack,
                 )
             if coverage_hit:
                 return
@@ -716,19 +768,25 @@ class RDBGClient:
             logpoint_fired = False
             if stop_by_bp and stack and self._logpoints:
                 logpoint_fired = await logpoints.fire_logpoint(
-                    self, target_id, stack, self._log_dir,
+                    self,
+                    target_id,
+                    stack,
+                    self._log_dir,
                 )
             # P0.A roadmap 260511: hit_condition enforcement
             hit_condition_suppressed = False
             if not logpoint_fired and stop_by_bp and stack and self._hit_conditions:
                 hit_condition_suppressed = await bp_conditions.auto_continue_if_unsatisfied(
-                    self, target_id, stack,
+                    self,
+                    target_id,
+                    stack,
                 )
             # Suppressed stops (logpoint/hit_condition not satisfied) — auto-Continue'd,
             # user never saw them → don't pollute _stop_events/_bp_fire_count metrics.
             stop_suppressed = logpoint_fired or hit_condition_suppressed
             # §12.3 Level 3 — track stop event для session_summary
             from datetime import datetime as _dt
+
             top = stack[0] if stack else {}
             line_no = top.get("lineNo", "?") if isinstance(top, dict) else "?"
             obj_id_top = ""
@@ -737,12 +795,14 @@ class RDBGClient:
                 if isinstance(mod_id, dict):
                     obj_id_top = mod_id.get("objectID", "")
             if not stop_suppressed:
-                self._stop_events.append({
-                    "ts": _dt.now().isoformat(),
-                    "target_id": target_id,
-                    "lineNo": line_no,
-                    "reason": self._stop_reason_by_target[target_id],
-                })
+                self._stop_events.append(
+                    {
+                        "ts": _dt.now().isoformat(),
+                        "target_id": target_id,
+                        "lineNo": line_no,
+                        "reason": self._stop_reason_by_target[target_id],
+                    }
+                )
                 self._rphosts_seen.add(target_id)
             if stop_by_bp and not stop_suppressed:
                 self._bp_fire_count += 1
@@ -752,7 +812,9 @@ class RDBGClient:
             # P2.A roadmap 260511: replay snapshot recording (after metrics gate so
             # only user-visible stops are recorded)
             if not stop_suppressed:
-                snapshot.record(self, target_id, self._stop_reason_by_target.get(target_id, "bp"), stack)
+                snapshot.record(
+                    self, target_id, self._stop_reason_by_target.get(target_id, "bp"), stack
+                )
 
         elif cmd_type == "rteProcessing":
             # 🟠 IMPORTANT: unhandled exception — also a stop event
@@ -762,25 +824,39 @@ class RDBGClient:
             self._stopped_targets.add(target_id)
             self._last_stopped_target_id = target_id
             stack_raw = cmd.get("callStack")
-            stack = stack_raw if isinstance(stack_raw, list) else \
-                    [stack_raw] if isinstance(stack_raw, dict) else []
+            stack = (
+                stack_raw
+                if isinstance(stack_raw, list)
+                else [stack_raw]
+                if isinstance(stack_raw, dict)
+                else []
+            )
             self._last_stack_by_target[target_id] = stack
             self._stop_reason_by_target[target_id] = "exception"
             exc = cmd.get("exception")
             if isinstance(exc, dict):
                 self._last_exception_by_target[target_id] = exc
-            log.warning("[event] RTE: target=%s exception_present=%s frames=%d",
-                        target_id[:8], bool(exc), len(stack))
+            log.warning(
+                "[event] RTE: target=%s exception_present=%s frames=%d",
+                target_id[:8],
+                bool(exc),
+                len(stack),
+            )
             # P3.B roadmap 260511: exception BP filter — if defined and none match,
             # auto-Continue silently (don't pollute stop_events with filtered out exc).
             if self._exception_bp_filters:
                 suppressed = await exception_bps.maybe_suppress(
-                    self, target_id, exc, stack,
+                    self,
+                    target_id,
+                    exc,
+                    stack,
                 )
                 if suppressed:
                     return
             # P2.A roadmap 260511: replay snapshot for user-visible exception
-            snapshot.record(self, target_id, "exception", stack, exc if isinstance(exc, dict) else None)
+            snapshot.record(
+                self, target_id, "exception", stack, exc if isinstance(exc, dict) else None
+            )
 
         elif cmd_type == "targetQuit":
             if target_id:
@@ -804,8 +880,9 @@ class RDBGClient:
                     log.warning("[capture-mode] re-arm on quit failed: %s", e)
 
         elif cmd_type == "correctedBP":
-            log.warning("[event] BP corrected to adjusted line for target %s",
-                        (target_id or "?")[:8])
+            log.warning(
+                "[event] BP corrected to adjusted line for target %s", (target_id or "?")[:8]
+            )
 
         elif cmd_type == "exprEvaluated":
             # Async eval result delivery: evalExpr POST queues the evaluation
@@ -828,19 +905,30 @@ class RDBGClient:
                     fut.set_result(eval_data)
                 log.info("[event] ExprEvaluated: result_id=%s resolved", result_id[:8])
             else:
-                log.debug("[event] ExprEvaluated for unknown result_id=%s (no pending future)",
-                          (result_id or "?")[:8])
+                log.debug(
+                    "[event] ExprEvaluated for unknown result_id=%s (no pending future)",
+                    (result_id or "?")[:8],
+                )
 
-        elif cmd_type in ("ForegroundHelperSet", "ForegroundHelperRequest",
-                           "ForegroundHelperProcess", "measureResultProcessing",
-                           "errorViewInfo", "rteOnBPConditionProcessing",
-                           "valueModified", "unknown", ""):
+        elif cmd_type in (
+            "ForegroundHelperSet",
+            "ForegroundHelperRequest",
+            "ForegroundHelperProcess",
+            "measureResultProcessing",
+            "errorViewInfo",
+            "rteOnBPConditionProcessing",
+            "valueModified",
+            "unknown",
+            "",
+        ):
             log.debug("[event] Skipping %s", cmd_type or "<empty>")
 
         else:
             log.debug("[event] Unrecognised cmdId=%r tag=%r", cmd_type, cmd.get("_tag"))
 
-    _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+    _UUID_RE = re.compile(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+    )
 
     @classmethod
     def _extract_target_id(cls, cmd: dict) -> Optional[str]:
@@ -918,9 +1006,7 @@ class RDBGClient:
         await self._post("clearBreakOnNextStatement", body)
         return True
 
-    async def set_auto_attach_settings(
-        self, target_types: list[str] | None = None
-    ) -> bool:
+    async def set_auto_attach_settings(self, target_types: list[str] | None = None) -> bool:
         """RDBG setAutoAttachSettings — declare which target kinds auto-attach.
 
         Separate cmd from initSettings (yukon39 Debugee.attach() calls them in
@@ -943,8 +1029,14 @@ class RDBGClient:
         # Server/ServerEmulation/WEBService/HTTPService/OData/JOB/JobFileMode/
         # Mobile*. 400 был на typo / case-sensitivity, не XSD violation.
         types = target_types or [
-            "Server", "ManagedClient", "HTTPService", "WEBService",
-            "JOB", "JobFileMode", "COMConnector", "OData",
+            "Server",
+            "ManagedClient",
+            "HTTPService",
+            "WEBService",
+            "JOB",
+            "JobFileMode",
+            "COMConnector",
+            "OData",
         ]
         auto_attach = "".join(_auto("targetType", t) for t in types)
         body = _build_request(
@@ -970,8 +1062,7 @@ class RDBGClient:
         except Exception:
             return False
 
-    async def attach_debug_targets(self, target_uuids: list[str],
-                                    attach: bool = True) -> bool:
+    async def attach_debug_targets(self, target_uuids: list[str], attach: bool = True) -> bool:
         """Attach/detach specific debug targets to this session."""
         ids = "".join(_rdbg("id", _target_id_light(uid)) for uid in target_uuids)
         body = _build_request(
@@ -1094,8 +1185,7 @@ class RDBGClient:
         body = _build_request(
             _rdbg("idOfDebuggerUI", self.session_id),
         )
-        root = await self._post("pingDebugUIParams", body,
-                                include_dbgui_url=True)
+        root = await self._post("pingDebugUIParams", body, include_dbgui_url=True)
         events = _parse_response(root)
         for ev in events:
             try:
@@ -1162,8 +1252,9 @@ class RDBGClient:
         # Cached push-stack (preferred path)
         cached = self._last_stack_by_target.get(target_uuid)
         if cached:
-            log.debug("[get_call_stack] cache hit target=%s frames=%d",
-                      target_uuid[:8], len(cached))
+            log.debug(
+                "[get_call_stack] cache hit target=%s frames=%d", target_uuid[:8], len(cached)
+            )
             return cached
 
         # Pull fallback — может вернуть 400 если target не attached
@@ -1181,11 +1272,14 @@ class RDBGClient:
 
     # -- Evaluation API ----------------------------------------------------
 
-    async def eval_local_variables(self, target_uuid: Optional[str] = None,
-                                    stack_level: int = 0,
-                                    expressions: Optional[list[str]] = None,
-                                    async_wait_timeout: float = 10.0,
-                                    max_text_size: int = 4096) -> list[dict]:
+    async def eval_local_variables(
+        self,
+        target_uuid: Optional[str] = None,
+        stack_level: int = 0,
+        expressions: Optional[list[str]] = None,
+        async_wait_timeout: float = 10.0,
+        max_text_size: int = 4096,
+    ) -> list[dict]:
         """Evaluate named local variables via batch evalLocalVariables.
 
         yukon39 RDBGEvalLocalVariablesRequest takes a list of `Calculation-
@@ -1211,18 +1305,17 @@ class RDBGClient:
             fut: asyncio.Future = loop.create_future()
             self._pending_evals[result_id] = fut
             result_ids.append((name, result_id, fut))
-            src_calc_info = (
-                _calc("expressionResultID", result_id)
-                + _calc("calcItem",
-                        _calc("itemType", "expression")
-                        + _calc("expression", name))
+            src_calc_info = _calc("expressionResultID", result_id) + _calc(
+                "calcItem", _calc("itemType", "expression") + _calc("expression", name)
             )
-            expr_blocks.append(_rdbg(
-                "expr",
-                _calc("stackLevel", str(stack_level))
-                + _calc("srcCalcInfo", src_calc_info)
-                + _calc("presOptions", _calc("maxTextSize", str(max_text_size))),
-            ))
+            expr_blocks.append(
+                _rdbg(
+                    "expr",
+                    _calc("stackLevel", str(stack_level))
+                    + _calc("srcCalcInfo", src_calc_info)
+                    + _calc("presOptions", _calc("maxTextSize", str(max_text_size))),
+                )
+            )
         body = _build_request(
             self._base_fields(),
             _rdbg("calcWaitingTime", "3"),
@@ -1250,18 +1343,22 @@ class RDBGClient:
                     eval_data = await asyncio.wait_for(fut, timeout=async_wait_timeout)
                     out.append({"name": name, **(eval_data or {})})
                 except asyncio.TimeoutError:
-                    log.warning("eval_local_variables[%s] timeout after %ss",
-                                name, async_wait_timeout)
+                    log.warning(
+                        "eval_local_variables[%s] timeout after %ss", name, async_wait_timeout
+                    )
                     out.append({"name": name, "evalResultState": "timeout"})
             return out
         finally:
             for _, result_id, _ in result_ids:
                 self._pending_evals.pop(result_id, None)
 
-    async def eval_locals_auto(self, target_uuid: Optional[str] = None,
-                                stack_level: int = 0,
-                                async_wait_timeout: float = 10.0,
-                                max_text_size: int = 4096) -> list[dict]:
+    async def eval_locals_auto(
+        self,
+        target_uuid: Optional[str] = None,
+        stack_level: int = 0,
+        async_wait_timeout: float = 10.0,
+        max_text_size: int = 4096,
+    ) -> list[dict]:
         """Auto-discover local names from BSL source then evaluate them.
 
         Pipeline:
@@ -1291,16 +1388,15 @@ class RDBGClient:
             return []
         path = uuid_index.resolve_uuid(object_id, property_id)
         if path is None or not path.exists():
-            log.info("eval_locals_auto: UUID %s + %s -> no source path",
-                     object_id[:8], property_id[:8])
+            log.info(
+                "eval_locals_auto: UUID %s + %s -> no source path", object_id[:8], property_id[:8]
+            )
             return []
         names = bsl_locals.extract_locals_at_line(path, line_no)
         if not names:
-            log.info("eval_locals_auto: no locals extracted at %s:%d",
-                     path.name, line_no)
+            log.info("eval_locals_auto: no locals extracted at %s:%d", path.name, line_no)
             return []
-        log.info("eval_locals_auto: extracted %d names at %s:%d",
-                 len(names), path.name, line_no)
+        log.info("eval_locals_auto: extracted %d names at %s:%d", len(names), path.name, line_no)
         return await self.eval_local_variables(
             target_uuid=target_uuid,
             stack_level=stack_level,
@@ -1309,12 +1405,15 @@ class RDBGClient:
             max_text_size=max_text_size,
         )
 
-    async def eval_expression(self, expression: str,
-                               target_uuid: Optional[str] = None,
-                               stack_level: int = 0,
-                               view_interface: Optional[str] = None,
-                               max_text_size: int = 4096,
-                               async_wait_timeout: float = 10.0) -> list[dict]:
+    async def eval_expression(
+        self,
+        expression: str,
+        target_uuid: Optional[str] = None,
+        stack_level: int = 0,
+        view_interface: Optional[str] = None,
+        max_text_size: int = 4096,
+        async_wait_timeout: float = 10.0,
+    ) -> list[dict]:
         """Evaluate a specific BSL expression at a breakpoint.
 
         Roadmap §13 P1.2: idempotent re-attach + fallback на last_stopped.
@@ -1346,11 +1445,8 @@ class RDBGClient:
         loop = asyncio.get_event_loop()
         pending_fut: asyncio.Future = loop.create_future()
         self._pending_evals[expr_result_id] = pending_fut
-        src_calc_info = (
-            _calc("expressionResultID", expr_result_id)
-            + _calc("calcItem",
-                    _calc("itemType", "expression")
-                    + _calc("expression", expression))
+        src_calc_info = _calc("expressionResultID", expr_result_id) + _calc(
+            "calcItem", _calc("itemType", "expression") + _calc("expression", expression)
         )
         pres_options_xml = _calc("maxTextSize", str(max_text_size))
         if view_interface:
@@ -1385,17 +1481,19 @@ class RDBGClient:
                 eval_data = await asyncio.wait_for(pending_fut, timeout=async_wait_timeout)
                 return [eval_data] if eval_data else []
             except asyncio.TimeoutError:
-                log.warning("eval_expression timeout for result_id=%s — RDBG didn't deliver "
-                            "exprEvaluated event within %ss",
-                            expr_result_id[:8], async_wait_timeout)
+                log.warning(
+                    "eval_expression timeout for result_id=%s — RDBG didn't deliver "
+                    "exprEvaluated event within %ss",
+                    expr_result_id[:8],
+                    async_wait_timeout,
+                )
                 return []
         finally:
             self._pending_evals.pop(expr_result_id, None)
 
     # -- Control API -------------------------------------------------------
 
-    async def step(self, action: str = "Continue",
-                   target_uuid: Optional[str] = None) -> list[dict]:
+    async def step(self, action: str = "Continue", target_uuid: Optional[str] = None) -> list[dict]:
         """Step execution. Actions: Continue, Step, StepIn, StepOut.
 
         Roadmap §13 P1.2 + P2.2 Continue resume semantic:
@@ -1449,9 +1547,11 @@ class RDBGClient:
             return
         module_bp_infos: list = []
         for entry in self._set_breakpoints_cache:
-            mod_xml = (_base("type", entry["module_type"])
-                       + _base("objectID", entry["object_id"])
-                       + _base("propertyID", entry["property_id"]))
+            mod_xml = (
+                _base("type", entry["module_type"])
+                + _base("objectID", entry["object_id"])
+                + _base("propertyID", entry["property_id"])
+            )
             if entry.get("url"):
                 mod_xml += _base("url", entry["url"])
             if entry.get("extension_name"):
@@ -1464,12 +1564,9 @@ class RDBGClient:
             # shared _build_bp_info_xml helper so conditional BPs do not silently
             # revert to unconditional during targetStarted / HMR-recovery re-apply.
             bp_xml = "".join(
-                _build_bp_info_xml(L, entry.get("condition", ""))
-                for L in entry["lines"]
+                _build_bp_info_xml(L, entry.get("condition", "")) for L in entry["lines"]
             )
-            module_bp_infos.append(
-                _bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml)
-            )
+            module_bp_infos.append(_bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml))
         workspace_xml = _rdbg("bpWorkspace", "".join(module_bp_infos))
         body = _build_request(self._base_fields(), workspace_xml)
         await self._post("setBreakpoints", body)
@@ -1520,10 +1617,14 @@ class RDBGClient:
         # workspace each call. Aggregating cache + new entry → submit FULL
         # workspace XML с multiple moduleBPInfo, иначе предыдущие BPs теряются.
         new_entry = {
-            "module_type": module_type, "object_id": object_id,
-            "property_id": property_id, "lines": list(lines),
-            "ext_id": ext_id, "url": url,
-            "extension_name": extension_name, "version": version,
+            "module_type": module_type,
+            "object_id": object_id,
+            "property_id": property_id,
+            "lines": list(lines),
+            "ext_id": ext_id,
+            "url": url,
+            "extension_name": extension_name,
+            "version": version,
             "condition": condition or "",
         }
         if hit_condition:
@@ -1542,12 +1643,8 @@ class RDBGClient:
                 mod_xml += _base("extId", str(eid))
             if ver_:
                 mod_xml += _base("version", ver_)
-            bp_xml = "".join(
-                _build_bp_info_xml(L, cond) for L, cond in bp_lines.items()
-            )
-            module_bp_infos.append(
-                _bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml)
-            )
+            bp_xml = "".join(_build_bp_info_xml(L, cond) for L, cond in bp_lines.items())
+            module_bp_infos.append(_bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml))
         workspace_xml = _rdbg("bpWorkspace", "".join(module_bp_infos))
         body = _build_request(self._base_fields(), workspace_xml)
         root = await self._post("setBreakpoints", body)
@@ -1555,9 +1652,13 @@ class RDBGClient:
         # сохраняет full state для следующего set call).
         self._set_breakpoints_cache = [
             {
-                "module_type": k[0], "object_id": k[1], "property_id": k[2],
-                "ext_id": k[3], "url": k[4],
-                "extension_name": k[5], "version": k[6],
+                "module_type": k[0],
+                "object_id": k[1],
+                "property_id": k[2],
+                "ext_id": k[3],
+                "url": k[4],
+                "extension_name": k[5],
+                "version": k[6],
                 "lines": list(v.keys()),
                 "condition": next(iter(v.values()), "") if v else "",
             }
@@ -1613,11 +1714,12 @@ def _get_client() -> RDBGClient:
                     _client._ping_task = loop.create_task(_client._ping_loop())
             except RuntimeError:
                 pass
-            log.info("[hmr-restore] active session restored: sid=%s alias=%s "
-                     "(persisted %.0fs ago)",
-                     state["session_id"][:8],
-                     state.get("infobase_alias", "?"),
-                     _time.time() - state.get("persisted_at", _time.time()))
+            log.info(
+                "[hmr-restore] active session restored: sid=%s alias=%s (persisted %.0fs ago)",
+                state["session_id"][:8],
+                state.get("infobase_alias", "?"),
+                _time.time() - state.get("persisted_at", _time.time()),
+            )
         else:
             _client = RDBGClient()
     return _client
@@ -1632,6 +1734,57 @@ def _find_stopped_target(targets: list[dict]) -> Optional[str]:
             if tid:
                 return tid
     return None
+
+
+async def _resolve_stopped_target(
+    client: "RDBGClient",
+    target_id: str = "",
+) -> tuple[str, Optional[list]]:
+    """Resolve target UUID for inspection tools.
+
+    Chain (unchanged behavior): explicit `target_id` → cached
+    `last_stopped_target_id` → scan `get_targets()` for a stopped target.
+
+    Returns (target_id, scanned_targets). `scanned_targets` is the list from
+    `get_targets()` when a scan happened (so callers can surface it in a
+    no-stopped-target error envelope, как делал debug_stack_trace), иначе None.
+    Returns ("", targets) when a scan happened but found nothing stopped.
+
+    W1.0.2 (2026-07-08): dedup of identical resolve blocks previously inline in
+    debug_stack_trace / debug_variables / debug_evaluate / debug_step.
+    """
+    if target_id:
+        return target_id, None
+    target_id = client.last_stopped_target_id or ""
+    if target_id:
+        return target_id, None
+    targets = await client.get_targets()
+    return (_find_stopped_target(targets) or ""), targets
+
+
+def _enrich_stack(stack: list) -> list:
+    """Enrich each stack frame with `resolved_source` (FQN + file path).
+
+    P0.C roadmap 260511: resolve frame moduleID (objectID/propertyID UUIDs) →
+    `{fqn, file_path, exists}` via uuid_index. Frames without a resolvable
+    module pass through unchanged.
+
+    W1.0.3 (2026-07-08): extracted from debug_stack_trace inline loop for reuse
+    by debug_inspect_frame (A0).
+    """
+    enriched = []
+    for frame in stack:
+        if isinstance(frame, dict):
+            mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
+            info = uuid_index.get_source_info(
+                mod.get("objectID", ""),
+                mod.get("propertyID", ""),
+            )
+            if info:
+                frame = dict(frame)
+                frame["resolved_source"] = info
+        enriched.append(frame)
+    return enriched
 
 
 def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
@@ -1662,8 +1815,9 @@ def _error_json(message: str, error_type: str = "error", **extra) -> str:
     # (защита от TypeError «multiple values» при будущем неосторожном вызове).
     extra.pop("error", None)
     extra.pop("error_type", None)
-    return json.dumps({"error": message, "error_type": error_type, **extra},
-                      ensure_ascii=False, indent=2)
+    return json.dumps(
+        {"error": message, "error_type": error_type, **extra}, ensure_ascii=False, indent=2
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1674,6 +1828,7 @@ def _error_json(message: str, error_type: str = "error", **extra) -> str:
 # (alive до attachDebugUI) невидимы; DBGUIExtCmdInfoStarted event не
 # replay'ится для них. Empirically validated 2026-05-10 (roadmap §0).
 # Эти helpers закрывают gap на OS-уровне.
+
 
 def detect_pre_existing_rphosts() -> list[dict]:
     """Detect rphost.exe worker processes on local Windows machine.
@@ -1689,7 +1844,9 @@ def detect_pre_existing_rphosts() -> list[dict]:
     try:
         result = subprocess.run(
             ["tasklist.exe", "/FI", "IMAGENAME eq rphost.exe", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError, FileNotFoundError):
@@ -1726,6 +1883,7 @@ _1CV8C_BIN_CANDIDATES = (
 def _find_rac_exe() -> Optional[str]:
     """Locate rac.exe (1С Remote Administrative Client) on disk."""
     import os
+
     for path in _RAC_BIN_CANDIDATES:
         if os.path.isfile(path):
             return path
@@ -1739,12 +1897,12 @@ def _find_1cv8c_exe() -> Optional[str]:
     """
     import os
     import glob
+
     for path in _1CV8C_BIN_CANDIDATES:
         if os.path.isfile(path):
             return path
     # Fallback: glob through `C:\Program Files*\1cv8\*\bin\1cv8c.exe`
-    for prefix in (r"C:\Program Files (x86)\1cv8",
-                   r"C:\Program Files\1cv8"):
+    for prefix in (r"C:\Program Files (x86)\1cv8", r"C:\Program Files\1cv8"):
         for found in glob.glob(os.path.join(prefix, "*", "bin", "1cv8c.exe")):
             return found
     return None
@@ -1758,6 +1916,7 @@ def _rac_auth_args() -> list:
     backward compat с security-level=0 (default localhost).
     """
     import os
+
     args: list = []
     user = os.environ.get("RAC_CLUSTER_USER", "").strip()
     pwd = os.environ.get("RAC_CLUSTER_PWD", "")
@@ -1783,9 +1942,13 @@ def force_recycle_rphost_processes(pids: list[int], dry_run: bool = False) -> di
         return {"killed": [], "failed": [], "method": "noop"}
     # Fix #4 §12.8: dry_run mode — preview без destructive ops
     if dry_run:
-        return {"killed": [], "failed": [], "method": "dry_run",
-                "would_kill": list(pids),
-                "note": "dry_run=True — no subprocess invoked"}
+        return {
+            "killed": [],
+            "failed": [],
+            "method": "dry_run",
+            "would_kill": list(pids),
+            "note": "dry_run=True — no subprocess invoked",
+        }
     # Path 1 — rac (graceful, no admin, only if rac.exe available + cluster reachable)
     rac_exe = _find_rac_exe()
     if rac_exe:
@@ -1797,6 +1960,7 @@ def force_recycle_rphost_processes(pids: list[int], dry_run: bool = False) -> di
     # т.к. invasive — обрывает чужие user sessions). Требует SDDL grant
     # (scripts/grant-1c-debug-permissions.ps1) или admin elevation.
     import os
+
     if os.environ.get("BSL_DEBUG_ALLOW_SERVICE_RESTART", "").lower() == "true":
         return _recycle_via_service(pids)
     # Path 3 — taskkill fallback (Access Denied для SYSTEM-owned rphost)
@@ -1808,7 +1972,9 @@ def _rac_get_cluster_uuid(rac_exe: str) -> Optional[str]:
     try:
         result = subprocess.run(
             [rac_exe, "cluster", "list"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError):
@@ -1829,9 +1995,10 @@ def _rac_list_processes_by_pid(rac_exe: str, cluster: str) -> dict:
     """Map OS pid → cluster process UUID via `rac process list`."""
     try:
         result = subprocess.run(
-            [rac_exe, "process", "list", f"--cluster={cluster}",
-             *_rac_auth_args()],
-            capture_output=True, text=True, timeout=5,
+            [rac_exe, "process", "list", f"--cluster={cluster}", *_rac_auth_args()],
+            capture_output=True,
+            text=True,
+            timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError):
@@ -1866,10 +2033,12 @@ def _rac_list_infobases(rac_exe: str, cluster: str) -> list[dict]:
     """
     try:
         result = subprocess.run(
-            [rac_exe, "infobase", f"--cluster={cluster}", "summary", "list",
-             *_rac_auth_args()],
-            capture_output=True, text=True, timeout=5,
-            encoding="cp866", errors="replace",
+            [rac_exe, "infobase", f"--cluster={cluster}", "summary", "list", *_rac_auth_args()],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="cp866",
+            errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError):
@@ -1910,6 +2079,7 @@ def _resolve_alias_from_env(alias: str) -> str:
     Returns: resolved long-form alias, or original if no mapping.
     """
     import os
+
     raw = os.environ.get("DEBUG_INFOBASE_ALIASES", "")
     if not raw:
         return alias
@@ -1940,29 +2110,42 @@ def _validate_infobase_alias(alias: str) -> dict:
     resolved_alias = _resolve_alias_from_env(alias)
     rac_exe = _find_rac_exe()
     if not rac_exe:
-        return {"status": "skipped", "reason": "rac_exe_not_found",
-                "resolved_alias": resolved_alias}
+        return {
+            "status": "skipped",
+            "reason": "rac_exe_not_found",
+            "resolved_alias": resolved_alias,
+        }
     cluster = _rac_get_cluster_uuid(rac_exe)
     if not cluster:
-        return {"status": "skipped", "reason": "cluster_unreachable",
-                "resolved_alias": resolved_alias}
+        return {
+            "status": "skipped",
+            "reason": "cluster_unreachable",
+            "resolved_alias": resolved_alias,
+        }
     infobases = _rac_list_infobases(rac_exe, cluster)
     if not infobases:
-        return {"status": "skipped", "reason": "empty_infobase_list",
-                "resolved_alias": resolved_alias}
+        return {
+            "status": "skipped",
+            "reason": "empty_infobase_list",
+            "resolved_alias": resolved_alias,
+        }
     for ib in infobases:
         if ib["name"] == resolved_alias:
-            return {"status": "valid", "uuid": ib["uuid"],
-                    "name": resolved_alias,
-                    "alias_resolved_from_env": (alias != resolved_alias)}
-    return {"status": "invalid",
-            "provided": alias,
-            "resolved_alias": resolved_alias,
-            "available": [ib["name"] for ib in infobases]}
+            return {
+                "status": "valid",
+                "uuid": ib["uuid"],
+                "name": resolved_alias,
+                "alias_resolved_from_env": (alias != resolved_alias),
+            }
+    return {
+        "status": "invalid",
+        "provided": alias,
+        "resolved_alias": resolved_alias,
+        "available": [ib["name"] for ib in infobases],
+    }
 
 
-def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str,
-                                  infobase_uuid: str) -> list[int]:
+def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str, infobase_uuid: str) -> list[int]:
     """List rphost OS pids serving the given infobase UUID.
 
     Used by recycle_strategy=all_rphosts_of_ib (roadmap 260511 §3.2 P0).
@@ -1974,11 +2157,19 @@ def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str,
     """
     try:
         result = subprocess.run(
-            [rac_exe, "process", "list", f"--cluster={cluster}",
-             f"--infobase={infobase_uuid}",
-             *_rac_auth_args()],
-            capture_output=True, text=True, timeout=5,
-            encoding="cp866", errors="replace",
+            [
+                rac_exe,
+                "process",
+                "list",
+                f"--cluster={cluster}",
+                f"--infobase={infobase_uuid}",
+                *_rac_auth_args(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding="cp866",
+            errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError):
@@ -1998,31 +2189,35 @@ def _rac_list_rphosts_of_infobase(rac_exe: str, cluster: str,
     return pids
 
 
-def _recycle_via_rac(rac_exe: str, cluster: str, pids: list,
-                     pid_to_uuid: dict) -> dict:
+def _recycle_via_rac(rac_exe: str, cluster: str, pids: list, pid_to_uuid: dict) -> dict:
     """Turn off rphost workers через `rac process turn-off` (graceful drain)."""
     killed: list = []
     failed: list = []
     for pid in pids:
         proc_uuid = pid_to_uuid.get(pid)
         if not proc_uuid:
-            failed.append({"pid": pid,
-                           "error": "no cluster process UUID for this PID"})
+            failed.append({"pid": pid, "error": "no cluster process UUID for this PID"})
             continue
         try:
             result = subprocess.run(
-                [rac_exe, "process", "turn-off",
-                 f"--cluster={cluster}", f"--process={proc_uuid}",
-                 *_rac_auth_args()],
-                capture_output=True, text=True, timeout=10,
+                [
+                    rac_exe,
+                    "process",
+                    "turn-off",
+                    f"--cluster={cluster}",
+                    f"--process={proc_uuid}",
+                    *_rac_auth_args(),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode == 0:
                 killed.append(pid)
             else:
                 err = (result.stderr or result.stdout or "").strip()
-                failed.append({"pid": pid,
-                               "error": err or f"rac exit={result.returncode}"})
+                failed.append({"pid": pid, "error": err or f"rac exit={result.returncode}"})
         except (subprocess.SubprocessError, OSError) as e:
             failed.append({"pid": pid, "error": str(e)})
     return {"killed": killed, "failed": failed, "method": "rac.turn_off"}
@@ -2043,25 +2238,34 @@ def _recycle_via_service(pids: list) -> dict:
     """
     if sys.platform != "win32":
         return {"killed": [], "failed": [], "method": "noop"}
-    cmd = ("Restart-Service -Name '1C:Enterprise 8.3 Server Agent' "
-           "-Force -ErrorAction Stop; Write-Output 'OK'")
+    cmd = (
+        "Restart-Service -Name '1C:Enterprise 8.3 Server Agent' "
+        "-Force -ErrorAction Stop; Write-Output 'OK'"
+    )
     try:
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True,
+            text=True,
+            timeout=30,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError) as e:
-        return {"killed": [],
-                "failed": [{"pid": p, "error": str(e)} for p in pids],
-                "method": "service.restart"}
+        return {
+            "killed": [],
+            "failed": [{"pid": p, "error": str(e)} for p in pids],
+            "method": "service.restart",
+        }
     if result.returncode == 0 and "OK" in (result.stdout or ""):
         return {"killed": list(pids), "failed": [], "method": "service.restart"}
     err = (result.stderr or result.stdout or "").strip()
-    return {"killed": [],
-            "failed": [{"pid": p, "error": err or f"powershell exit={result.returncode}"}
-                       for p in pids],
-            "method": "service.restart"}
+    return {
+        "killed": [],
+        "failed": [
+            {"pid": p, "error": err or f"powershell exit={result.returncode}"} for p in pids
+        ],
+        "method": "service.restart",
+    }
 
 
 def _recycle_via_taskkill(pids: list) -> dict:
@@ -2072,15 +2276,16 @@ def _recycle_via_taskkill(pids: list) -> dict:
         try:
             result = subprocess.run(
                 ["taskkill.exe", "/F", "/PID", str(pid)],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode == 0:
                 killed.append(pid)
             else:
                 err = (result.stderr or result.stdout or "").strip()
-                failed.append({"pid": pid,
-                               "error": err or f"taskkill exit={result.returncode}"})
+                failed.append({"pid": pid, "error": err or f"taskkill exit={result.returncode}"})
         except (subprocess.SubprocessError, OSError) as e:
             failed.append({"pid": pid, "error": str(e)})
     return {"killed": killed, "failed": failed, "method": "taskkill"}
@@ -2090,9 +2295,11 @@ def _recycle_via_taskkill(pids: list) -> dict:
 # §12 Level 1 — health-check probes (K8s-style readiness pattern)
 # ---------------------------------------------------------------------------
 
+
 def _hc_probe_dbgs_port(host: str = "localhost", port: int = 1550) -> dict:
     """TCP probe для dbgs.exe RDBG endpoint. Cheap (50ms timeout)."""
     import socket
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(0.05)
     try:
@@ -2100,20 +2307,27 @@ def _hc_probe_dbgs_port(host: str = "localhost", port: int = 1550) -> dict:
         sock.close()
         return {"status": "pass", "detail": f"listening on {host}:{port}"}
     except (socket.timeout, ConnectionRefusedError, OSError) as e:
-        return {"status": "fail", "detail": f"{host}:{port} not reachable ({e})",
-                "fix": "start ragent service with -debug -http flags"}
+        return {
+            "status": "fail",
+            "detail": f"{host}:{port} not reachable ({e})",
+            "fix": "start ragent service with -debug -http flags",
+        }
 
 
 def _hc_probe_ragent_debug_flag() -> dict:
     """Verify ragent service has -debug + -http flags (Windows-only)."""
     if sys.platform != "win32":
         return {"status": "warn", "detail": "non-Windows — skip"}
-    cmd = ('Get-CimInstance Win32_Service -Filter "Name=\'1C:Enterprise 8.3 Server Agent\'" '
-           '| Select-Object -ExpandProperty PathName')
+    cmd = (
+        "Get-CimInstance Win32_Service -Filter \"Name='1C:Enterprise 8.3 Server Agent'\" "
+        "| Select-Object -ExpandProperty PathName"
+    )
     try:
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmd],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError) as e:
@@ -2126,8 +2340,11 @@ def _hc_probe_ragent_debug_flag() -> dict:
     if has_debug and has_http:
         return {"status": "pass", "detail": "ragent has -debug -http"}
     missing = [f for f, present in (("-debug", has_debug), ("-http", has_http)) if not present]
-    return {"status": "fail", "detail": f"ragent missing flags: {missing}",
-            "fix": "scripts/enable-1c-server-debug-http.cmd (run as admin)"}
+    return {
+        "status": "fail",
+        "detail": f"ragent missing flags: {missing}",
+        "fix": "scripts/enable-1c-server-debug-http.cmd (run as admin)",
+    }
 
 
 def _hc_probe_rphost_baseline() -> dict:
@@ -2136,39 +2353,45 @@ def _hc_probe_rphost_baseline() -> dict:
     if not rphosts:
         return {"status": "pass", "detail": "no pre-existing rphost — fresh env"}
     pids = [r["pid"] for r in rphosts]
-    return {"status": "warn",
-            "detail": f"{len(pids)} pre-existing rphost(s): {pids}",
-            "fix": "kill-stale-rphosts (auto-prepare action)"}
+    return {
+        "status": "warn",
+        "detail": f"{len(pids)} pre-existing rphost(s): {pids}",
+        "fix": "kill-stale-rphosts (auto-prepare action)",
+    }
 
 
 def _hc_probe_rac_available() -> dict:
     """rac.exe found + reachable cluster?"""
     rac = _find_rac_exe()
     if not rac:
-        return {"status": "warn", "detail": "rac.exe not found in standard paths",
-                "fix": "install 1С platform OR rely on taskkill fallback"}
+        return {
+            "status": "warn",
+            "detail": "rac.exe not found in standard paths",
+            "fix": "install 1С platform OR rely on taskkill fallback",
+        }
     cluster = _rac_get_cluster_uuid(rac)
     if not cluster:
-        return {"status": "warn",
-                "detail": f"rac.exe found at {rac} but cluster unreachable",
-                "fix": "check ragent on :1540"}
-    return {"status": "pass",
-            "detail": f"rac.exe + cluster {cluster[:8]}…"}
+        return {
+            "status": "warn",
+            "detail": f"rac.exe found at {rac} but cluster unreachable",
+            "fix": "check ragent on :1540",
+        }
+    return {"status": "pass", "detail": f"rac.exe + cluster {cluster[:8]}…"}
 
 
 def _hc_probe_env_vars() -> dict:
     """Env vars для force_recycle paths."""
     import os
+
     rac_user = bool(os.environ.get("RAC_CLUSTER_USER", "").strip())
     rac_pwd = bool(os.environ.get("RAC_CLUSTER_PWD", ""))
-    svc_restart = (os.environ.get("BSL_DEBUG_ALLOW_SERVICE_RESTART", "")
-                   .lower() == "true")
+    svc_restart = os.environ.get("BSL_DEBUG_ALLOW_SERVICE_RESTART", "").lower() == "true"
     flags = {
-        "RAC_CLUSTER_USER": rac_user, "RAC_CLUSTER_PWD": rac_pwd,
+        "RAC_CLUSTER_USER": rac_user,
+        "RAC_CLUSTER_PWD": rac_pwd,
         "BSL_DEBUG_ALLOW_SERVICE_RESTART": svc_restart,
     }
-    return {"status": "pass", "detail": f"env: {flags}",
-            "_extras": flags}
+    return {"status": "pass", "detail": f"env: {flags}", "_extras": flags}
 
 
 def _hc_probe_sddl_au_grant() -> dict:
@@ -2178,7 +2401,9 @@ def _hc_probe_sddl_au_grant() -> dict:
     try:
         result = subprocess.run(
             ["sc.exe", "sdshow", "1C:Enterprise 8.3 Server Agent"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError) as e:
@@ -2189,18 +2414,21 @@ def _hc_probe_sddl_au_grant() -> dict:
     has_au = "(A;;LCSWRPWPCR;;;AU)" in sddl
     if has_au:
         return {"status": "pass", "detail": "AU ACE present (Fix #4 path enabled)"}
-    return {"status": "warn",
-            "detail": "AU ACE not found — service.restart требует admin",
-            "fix": "scripts/grant-1c-debug-permissions.ps1 (run as admin once)"}
+    return {
+        "status": "warn",
+        "detail": "AU ACE not found — service.restart требует admin",
+        "fix": "scripts/grant-1c-debug-permissions.ps1 (run as admin once)",
+    }
 
 
 def _hc_probe_active_session(client) -> dict:
     """wrapper-side state — есть ли активная debug session?"""
     if client is None or not getattr(client, "_attached", False):
         return {"status": "pass", "detail": "no active debug session"}
-    return {"status": "pass",
-            "detail": f"attached to {client.infobase_alias}, "
-                      f"session={client.session_id[:8]}…"}
+    return {
+        "status": "pass",
+        "detail": f"attached to {client.infobase_alias}, session={client.session_id[:8]}…",
+    }
 
 
 def _hc_probe_cluster_load() -> dict:
@@ -2212,6 +2440,7 @@ def _hc_probe_cluster_load() -> dict:
     окно.
     """
     import os
+
     rac = _find_rac_exe()
     if not rac:
         return {"status": "warn", "detail": "rac.exe not found — skip"}
@@ -2221,9 +2450,10 @@ def _hc_probe_cluster_load() -> dict:
     threshold = int(os.environ.get("BSL_DEBUG_CONN_THRESHOLD", "10"))
     try:
         result = subprocess.run(
-            [rac, "process", "list", f"--cluster={cluster}",
-             *_rac_auth_args()],
-            capture_output=True, text=True, timeout=5,
+            [rac, "process", "list", f"--cluster={cluster}", *_rac_auth_args()],
+            capture_output=True,
+            text=True,
+            timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError) as e:
@@ -2251,9 +2481,11 @@ def _hc_probe_cluster_load() -> dict:
                 except ValueError:
                     pass
     if high_load:
-        return {"status": "warn",
-                "detail": f"high-load rphost(s) >{threshold} conns: {high_load}",
-                "fix": "wait for low-load window OR force_recycle (kills active sessions)"}
+        return {
+            "status": "warn",
+            "detail": f"high-load rphost(s) >{threshold} conns: {high_load}",
+            "fix": "wait for low-load window OR force_recycle (kills active sessions)",
+        }
     return {"status": "pass", "detail": f"all rphost'ы ≤{threshold} connections"}
 
 
@@ -2263,9 +2495,10 @@ def _hc_recommend_workflow(checks: dict) -> str:
         return "read-only"
     rphost_warn = checks.get("rphost_count_baseline", {}).get("status") == "warn"
     rac_ok = checks.get("rac_exe_path", {}).get("status") == "pass"
-    svc_ok = (checks.get("env_vars", {}).get("_extras", {})
-              .get("BSL_DEBUG_ALLOW_SERVICE_RESTART") and
-              checks.get("sddl_au_grant", {}).get("status") == "pass")
+    svc_ok = (
+        checks.get("env_vars", {}).get("_extras", {}).get("BSL_DEBUG_ALLOW_SERVICE_RESTART")
+        and checks.get("sddl_au_grant", {}).get("status") == "pass"
+    )
     if not rphost_warn:
         return "thin-client"  # no pre-existing → all paths work
     if rac_ok:
@@ -2299,18 +2532,18 @@ def _hc_probe_infobase_list() -> dict:
     """
     rac_exe = _find_rac_exe()
     if not rac_exe:
-        return {"status": "skip",
-                "detail": "rac.exe not found — cannot list infobases"}
+        return {"status": "skip", "detail": "rac.exe not found — cannot list infobases"}
     cluster = _rac_get_cluster_uuid(rac_exe)
     if not cluster:
         return {"status": "skip", "detail": "cluster unreachable"}
     infobases = _rac_list_infobases(rac_exe, cluster)
     if not infobases:
-        return {"status": "warn",
-                "detail": "cluster has zero infobases registered"}
-    return {"status": "pass",
-            "detail": f"{len(infobases)} infobase(s) discovered",
-            "_extras": {"infobases": [ib["name"] for ib in infobases]}}
+        return {"status": "warn", "detail": "cluster has zero infobases registered"}
+    return {
+        "status": "pass",
+        "detail": f"{len(infobases)} infobase(s) discovered",
+        "_extras": {"infobases": [ib["name"] for ib in infobases]},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2320,10 +2553,12 @@ mcp = FastMCP("1c-debug")
 
 
 @mcp.tool()
-async def debug_connect(debug_url: str = "http://localhost:1550",
-                        infobase_alias: str = "TestDB",
-                        force_recycle_rphost: bool = False,
-                        recycle_strategy: str = "auto") -> str:
+async def debug_connect(
+    debug_url: str = "http://localhost:1550",
+    infobase_alias: str = "TestDB",
+    force_recycle_rphost: bool = False,
+    recycle_strategy: str = "auto",
+) -> str:
     """Connect to 1C debug agent and attach as debug client.
 
     IMPORTANT: Only ONE debug UI can be active per infobase.
@@ -2360,28 +2595,47 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
     # Closes RC1 (silent registered=true для несуществующего alias).
     alias_validation = _validate_infobase_alias(infobase_alias)
     if alias_validation["status"] == "invalid":
-        return json.dumps({
-            "status": "error",
-            "reason": "infobase_alias_not_found",
-            "provided": infobase_alias,
-            "available": alias_validation["available"],
-            "hint": ("Use one of available infobases. Provide the cluster IB "
-                     "name from `rac infobase list`, not IIS publication name "
-                     "or arbitrary alias. See roadmap 260511 §3.1."),
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "infobase_alias_not_found",
+                "provided": infobase_alias,
+                "available": alias_validation["available"],
+                "hint": (
+                    "Use one of available infobases. Provide the cluster IB "
+                    "name from `rac infobase list`, not IIS publication name "
+                    "or arbitrary alias. See roadmap 260511 §3.1."
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # Resolve recycle_strategy (backward-compat для force_recycle_rphost).
     if recycle_strategy == "auto":
         recycle_strategy = "pre_existing" if force_recycle_rphost else "none"
-    if recycle_strategy not in ("none", "pre_existing",
-                                "all_rphosts_of_ib", "all_rphosts_of_cluster"):
-        return json.dumps({
-            "status": "error",
-            "reason": "invalid_recycle_strategy",
-            "provided": recycle_strategy,
-            "allowed": ["auto", "none", "pre_existing",
-                        "all_rphosts_of_ib", "all_rphosts_of_cluster"],
-        }, ensure_ascii=False, indent=2)
+    if recycle_strategy not in (
+        "none",
+        "pre_existing",
+        "all_rphosts_of_ib",
+        "all_rphosts_of_cluster",
+    ):
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "invalid_recycle_strategy",
+                "provided": recycle_strategy,
+                "allowed": [
+                    "auto",
+                    "none",
+                    "pre_existing",
+                    "all_rphosts_of_ib",
+                    "all_rphosts_of_cluster",
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
     # Preflight (Solution B): snapshot rphost.exe ДО attach. Roadmap §11.
     pre_existing_rphosts = detect_pre_existing_rphosts()
@@ -2415,20 +2669,27 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
             elif recycle_strategy == "all_rphosts_of_ib":
                 # Requires resolved infobase UUID from validation step
                 if alias_validation["status"] != "valid":
-                    return json.dumps({
-                        "status": "error",
-                        "reason": "recycle_strategy_requires_valid_alias",
-                        "recycle_strategy": recycle_strategy,
-                        "alias_validation": alias_validation,
-                        "hint": ("all_rphosts_of_ib needs cluster reachable + "
-                                 "alias validated. Use recycle_strategy="
-                                 "pre_existing for snapshot-based recycle."),
-                    }, ensure_ascii=False, indent=2)
+                    return json.dumps(
+                        {
+                            "status": "error",
+                            "reason": "recycle_strategy_requires_valid_alias",
+                            "recycle_strategy": recycle_strategy,
+                            "alias_validation": alias_validation,
+                            "hint": (
+                                "all_rphosts_of_ib needs cluster reachable + "
+                                "alias validated. Use recycle_strategy="
+                                "pre_existing for snapshot-based recycle."
+                            ),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
                 rac_exe = _find_rac_exe()
                 cluster = _rac_get_cluster_uuid(rac_exe) if rac_exe else None
                 if rac_exe and cluster:
                     pids_to_kill = _rac_list_rphosts_of_infobase(
-                        rac_exe, cluster, alias_validation["uuid"])
+                        rac_exe, cluster, alias_validation["uuid"]
+                    )
             elif recycle_strategy == "all_rphosts_of_cluster":
                 # HIGH RISK — kill every rphost in cluster
                 pids_to_kill = [r["pid"] for r in detect_pre_existing_rphosts()]
@@ -2444,11 +2705,14 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
         if pids_to_kill:
             # Fix #4 §12.8: env BSL_DEBUG_DRY_RUN_RECYCLE=true → preview only
             import os
-            dry_run = (os.environ.get("BSL_DEBUG_DRY_RUN_RECYCLE", "")
-                       .lower() == "true")
-            log.warning("[connect] recycle_strategy=%s killing rphost(s): %s%s",
-                        recycle_strategy, pids_to_kill,
-                        " (DRY-RUN)" if dry_run else "")
+
+            dry_run = os.environ.get("BSL_DEBUG_DRY_RUN_RECYCLE", "").lower() == "true"
+            log.warning(
+                "[connect] recycle_strategy=%s killing rphost(s): %s%s",
+                recycle_strategy,
+                pids_to_kill,
+                " (DRY-RUN)" if dry_run else "",
+            )
             # §12.3 Level 3 — track recycle invocation
             _client._force_recycle_invoked = True
             kill_result = force_recycle_rphost_processes(pids_to_kill, dry_run=dry_run)
@@ -2517,8 +2781,7 @@ async def debug_connect(debug_url: str = "http://localhost:1550",
                     "drain активных сессий другому worker'у) → retry connect",
                 ],
                 "roadmap_ref": (
-                    "docs/roadmap/260508_ROADMAP_BSL_DEBUG_WRAPPER_POST_BP_HANDSHAKE.md"
-                    " §10 + §11"
+                    "docs/roadmap/260508_ROADMAP_BSL_DEBUG_WRAPPER_POST_BP_HANDSHAKE.md §10 + §11"
                 ),
             }
         if recycle_info is not None:
@@ -2557,6 +2820,7 @@ _ACTIVE_SESSION_PATH = "data/debug_sessions/.active.json"
 # При каждом MCP-вызове сравниваем mtime файла с _MODULE_LOADED_AT —
 # если файл новее, MCP-процесс крутит устаревший код, нужен /mcp reconnect.
 import time as _time
+
 _MODULE_LOADED_AT = _time.time()
 
 
@@ -2567,6 +2831,7 @@ def _get_stale_hint() -> Optional[str]:
     Ненавязчивая подсказка — не блокирует, не raise.
     """
     import os
+
     try:
         mtime = os.path.getmtime(__file__)
     except OSError:
@@ -2574,13 +2839,16 @@ def _get_stale_hint() -> Optional[str]:
     if mtime <= _MODULE_LOADED_AT:
         return None
     age_sec = int(mtime - _MODULE_LOADED_AT)
-    return (f"Wrapper file modified {age_sec}s after MCP start — "
-            f"running stale code. Run /mcp reconnect to pick up changes.")
+    return (
+        f"Wrapper file modified {age_sec}s after MCP start — "
+        f"running stale code. Run /mcp reconnect to pick up changes."
+    )
 
 
 def _persist_session_summary(summary: dict) -> Optional[str]:
     """Mirror session summary to data/debug_sessions/<id>.json для cross-session diff."""
     import os
+
     try:
         os.makedirs(_SESSION_STORE_DIR, exist_ok=True)
         path = os.path.join(_SESSION_STORE_DIR, f"{summary['session_id']}.json")
@@ -2600,6 +2868,7 @@ def _persist_session_summary(summary: dict) -> Optional[str]:
 # UI+ escalation path regenerates session_id, the new id replaces the old one
 # on disk. detach() очищает файл — graceful disconnect ≠ HMR restart.
 
+
 def _persist_active_session(client: "RDBGClient") -> None:
     """Write active session state to _ACTIVE_SESSION_PATH (atomic via os.replace).
 
@@ -2611,6 +2880,7 @@ def _persist_active_session(client: "RDBGClient") -> None:
     if not (client._attached and client._registered):
         return
     import os
+
     state = {
         "session_id": client.session_id,
         "debug_url": client.debug_url,
@@ -2645,6 +2915,7 @@ def _load_active_session() -> Optional[dict]:
 def _clear_active_session() -> None:
     """Remove persisted state (graceful detach / disconnect)."""
     import os
+
     try:
         os.remove(_ACTIVE_SESSION_PATH)
     except OSError:
@@ -2654,6 +2925,7 @@ def _clear_active_session() -> None:
 def _load_session_summary(session_id: str) -> Optional[dict]:
     """Load persisted session summary by ID."""
     import os
+
     path = os.path.join(_SESSION_STORE_DIR, f"{session_id}.json")
     if not os.path.isfile(path):
         return None
@@ -2679,29 +2951,30 @@ def _diff_summaries(prev: dict, curr: dict) -> dict:
             "bp_fire_count": c_bp.get("fire_count", 0) - p_bp.get("fire_count", 0),
             "eval_count": c_ev.get("count", 0) - p_ev.get("count", 0),
             "eval_failures": c_ev.get("failures", 0) - p_ev.get("failures", 0),
-            "ui_plus_retries": (curr.get("ui_plus_retries", 0)
-                                - prev.get("ui_plus_retries", 0)),
-            "stop_events_count": (len(curr.get("stop_events", []))
-                                  - len(prev.get("stop_events", []))),
+            "ui_plus_retries": (curr.get("ui_plus_retries", 0) - prev.get("ui_plus_retries", 0)),
+            "stop_events_count": (
+                len(curr.get("stop_events", [])) - len(prev.get("stop_events", []))
+            ),
         },
     }
     if diff["deltas"]["bp_fire_count"] < 0:
         diff["regression_indicators"].append(
-            f"BP fire_count regressed: -{abs(diff['deltas']['bp_fire_count'])}")
+            f"BP fire_count regressed: -{abs(diff['deltas']['bp_fire_count'])}"
+        )
     if diff["deltas"]["eval_failures"] > 0:
         diff["regression_indicators"].append(
-            f"eval failures increased: +{diff['deltas']['eval_failures']}")
+            f"eval failures increased: +{diff['deltas']['eval_failures']}"
+        )
     if diff["deltas"]["ui_plus_retries"] > 0:
         diff["regression_indicators"].append(
-            f"UI+ retries increased: +{diff['deltas']['ui_plus_retries']}")
-    diff["verdict"] = ("REGRESSION" if diff["regression_indicators"]
-                        else "NO_REGRESSION")
+            f"UI+ retries increased: +{diff['deltas']['ui_plus_retries']}"
+        )
+    diff["verdict"] = "REGRESSION" if diff["regression_indicators"] else "NO_REGRESSION"
     return diff
 
 
 @mcp.tool()
-async def debug_session_diff(prev_session_id: str,
-                              curr_session_id: Optional[str] = None) -> str:
+async def debug_session_diff(prev_session_id: str, curr_session_id: Optional[str] = None) -> str:
     """Roadmap §12.7 Level 3 extension — cross-session diff для regression detection.
 
     Compares 2 session summaries. Returns deltas + regression_indicators list.
@@ -2712,19 +2985,22 @@ async def debug_session_diff(prev_session_id: str,
     """
     prev = _load_session_summary(prev_session_id)
     if not prev:
-        return json.dumps({"status": "error",
-                            "error": f"prev_session_id {prev_session_id} not found"})
+        return json.dumps(
+            {"status": "error", "error": f"prev_session_id {prev_session_id} not found"}
+        )
     if curr_session_id:
         curr = _load_session_summary(curr_session_id)
         if not curr:
-            return json.dumps({"status": "error",
-                                "error": f"curr_session_id {curr_session_id} not found"})
+            return json.dumps(
+                {"status": "error", "error": f"curr_session_id {curr_session_id} not found"}
+            )
     else:
         # Build summary from current _client
         global _client
         if _client is None:
-            return json.dumps({"status": "error",
-                                "error": "no current session and no curr_session_id"})
+            return json.dumps(
+                {"status": "error", "error": "no current session and no curr_session_id"}
+            )
         curr_raw = await debug_session_summary(format="json")
         curr = json.loads(curr_raw)
     diff = _diff_summaries(prev, curr)
@@ -2757,8 +3033,7 @@ async def debug_session_summary(format: str = "json") -> str:
     if _client is None:
         return json.dumps({"status": "no_session"})
 
-    cache_lines_total = sum(len(e.get("lines", []))
-                            for e in _client._set_breakpoints_cache)
+    cache_lines_total = sum(len(e.get("lines", [])) for e in _client._set_breakpoints_cache)
     summary = {
         "session_id": _client.session_id,
         "started_at": _client._session_started_at,
@@ -2768,8 +3043,9 @@ async def debug_session_summary(format: str = "json") -> str:
             "set_count": cache_lines_total,
             "fire_count": _client._bp_fire_count,
             "by_location": dict(_client._bp_by_location),
-            "fire_rate": (_client._bp_fire_count / cache_lines_total
-                          if cache_lines_total else None),
+            "fire_rate": (
+                _client._bp_fire_count / cache_lines_total if cache_lines_total else None
+            ),
         },
         "evaluations": {
             "count": _client._eval_count,
@@ -2842,6 +3118,7 @@ async def debug_health_check(mode: str = "probe", actions: Optional[list] = None
                  SDDL or env vars (security boundary, surface как manual fix).
     """
     import time
+
     t0 = time.time()
     global _client
     checks = _hc_collect_checks(_client)
@@ -2852,21 +3129,20 @@ async def debug_health_check(mode: str = "probe", actions: Optional[list] = None
     if "rphost_count_baseline" in warns:
         auto_prepare.append("kill-stale-rphosts")
     sddl_pass = checks.get("sddl_au_grant", {}).get("status") == "pass"
-    svc_env = (checks.get("env_vars", {}).get("_extras", {})
-               .get("BSL_DEBUG_ALLOW_SERVICE_RESTART"))
+    svc_env = checks.get("env_vars", {}).get("_extras", {}).get("BSL_DEBUG_ALLOW_SERVICE_RESTART")
     if sddl_pass and svc_env:
         auto_prepare.append("restart-ragent")
 
     actions_executed: list = []
     if mode == "prepare":
         if not actions:
-            return json.dumps({"status": "error",
-                               "error": "mode=prepare requires non-empty actions list"})
+            return json.dumps(
+                {"status": "error", "error": "mode=prepare requires non-empty actions list"}
+            )
         whitelist = {"kill-stale-rphosts", "restart-ragent"}
         for action in actions:
             if action not in whitelist:
-                actions_executed.append({"action": action,
-                                          "result": "rejected: not in whitelist"})
+                actions_executed.append({"action": action, "result": "rejected: not in whitelist"})
                 continue
             if action == "kill-stale-rphosts":
                 rphosts = detect_pre_existing_rphosts()
@@ -2875,8 +3151,7 @@ async def debug_health_check(mode: str = "probe", actions: Optional[list] = None
                     res = force_recycle_rphost_processes(pids)
                     actions_executed.append({"action": action, "result": res})
                 else:
-                    actions_executed.append({"action": action,
-                                              "result": "no rphosts to kill"})
+                    actions_executed.append({"action": action, "result": "no rphosts to kill"})
             elif action == "restart-ragent":
                 res = _recycle_via_service([])
                 actions_executed.append({"action": action, "result": res})
@@ -2912,11 +3187,15 @@ async def debug_targets() -> str:
     client = _get_client()
     targets = await client.get_targets()
     stopped = _find_stopped_target(targets)
-    return json.dumps({
-        "targets": targets,
-        "count": len(targets),
-        "stopped_target": stopped,
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "targets": targets,
+            "count": len(targets),
+            "stopped_target": stopped,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -2979,20 +3258,24 @@ def _build_no_fire_diagnostics(client) -> dict:
         suggestions.append(
             f"RC1: infobase_alias '{alias}' NOT in cluster. "
             f"Available: {diag['infobase_validation'].get('available', [])}. "
-            "Reconnect with valid alias.")
+            "Reconnect with valid alias."
+        )
     if diag.get("targets_attached") == 0 and diag.get("active_rphost_pids"):
         suggestions.append(
             "RC2: rphost'ы запущены но НЕ attached к debug session. "
             "Try: reconnect с recycle_strategy='all_rphosts_of_ib' или "
-            "debug_launch_thin_client после connect (Solution C).")
+            "debug_launch_thin_client после connect (Solution C)."
+        )
     if not diag.get("active_rphost_pids"):
         suggestions.append(
             "No rphosts running — trigger BSL via execute_code or "
-            "debug_launch_thin_client to spawn one.")
+            "debug_launch_thin_client to spawn one."
+        )
     if not suggestions:
         suggestions.append(
             "BPs may be on inactive code paths. Try debug_break_on_next "
-            "to catch ANY BSL operation, or set BP closer to trigger entry.")
+            "to catch ANY BSL operation, or set BP closer to trigger entry."
+        )
     diag["suggestions"] = suggestions
     return diag
 
@@ -3013,32 +3296,17 @@ async def debug_stack_trace(target_id: str = "") -> str:
     try:
         client = _get_client()
         if not (client._attached and client._registered):
-            return _error_json("Not connected. Call debug_connect first.",
-                               "not_connected")
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        target_id, scanned = await _resolve_stopped_target(client, target_id)
         if not target_id:
-            target_id = client.last_stopped_target_id or ""
-            if not target_id:
-                targets = await client.get_targets()
-                target_id = _find_stopped_target(targets) or ""
-                if not target_id:
-                    return _error_json("No stopped targets", "no_stopped_target",
-                                       targets=targets)
+            return _error_json("No stopped targets", "no_stopped_target", targets=scanned)
         stack = await client.get_call_stack(target_id)
         # P0.C roadmap 260511: enrich each frame with resolved_source (FQN + file path)
-        enriched = []
-        for frame in stack:
-            if isinstance(frame, dict):
-                mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
-                info = uuid_index.get_source_info(
-                    mod.get("objectID", ""), mod.get("propertyID", ""),
-                )
-                if info:
-                    frame = dict(frame)
-                    frame["resolved_source"] = info
-            enriched.append(frame)
+        enriched = _enrich_stack(stack)
         return json.dumps(
             {"target_id": target_id, "stack": enriched, "depth": len(enriched)},
-            ensure_ascii=False, indent=2,
+            ensure_ascii=False,
+            indent=2,
         )
     except Exception as e:
         log.exception("debug_stack_trace failed")
@@ -3046,8 +3314,9 @@ async def debug_stack_trace(target_id: str = "") -> str:
 
 
 @mcp.tool()
-async def debug_variables(target_id: str = "", stack_level: int = 0,
-                           expressions: Optional[list[str]] = None) -> str:
+async def debug_variables(
+    target_id: str = "", stack_level: int = 0, expressions: Optional[list[str]] = None
+) -> str:
     """Read local variables at current breakpoint.
 
     Two modes:
@@ -3069,43 +3338,46 @@ async def debug_variables(target_id: str = "", stack_level: int = 0,
     try:
         client = _get_client()
         if not (client._attached and client._registered):
-            return _error_json("Not connected. Call debug_connect first.",
-                               "not_connected")
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        target_id, _ = await _resolve_stopped_target(client, target_id)
         if not target_id:
-            target_id = client.last_stopped_target_id or ""
-            if not target_id:
-                targets = await client.get_targets()
-                target_id = _find_stopped_target(targets) or ""
-            if not target_id:
-                return _error_json("No stopped targets", "no_stopped_target",
-                                   target_id=target_id)
+            return _error_json("No stopped targets", "no_stopped_target", target_id=target_id)
         if expressions:
             variables = await client.eval_local_variables(
-                target_uuid=target_id, stack_level=stack_level,
+                target_uuid=target_id,
+                stack_level=stack_level,
                 expressions=expressions,
             )
             mode = "explicit"
         else:
             variables = await client.eval_locals_auto(
-                target_uuid=target_id, stack_level=stack_level,
+                target_uuid=target_id,
+                stack_level=stack_level,
             )
             mode = "auto"
-        return json.dumps({"target_id": target_id, "variables": variables,
-                           "count": len(variables), "stack_level": stack_level,
-                           "mode": mode},
-                          ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "target_id": target_id,
+                "variables": variables,
+                "count": len(variables),
+                "stack_level": stack_level,
+                "mode": mode,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     except Exception as e:
         # Graceful envelope (единый формат с debug_stack_trace/_error_json) вместо
         # opaque MCP-exception. Типичный кейс: RDBG 400 «вычисления только в
         # остановленном предмете отладки» когда target не на halt'е.
         log.exception("debug_variables failed")
-        return _error_json(_rdbg_error_text(e), type(e).__name__,
-                           target_id=target_id, stack_level=stack_level)
+        return _error_json(
+            _rdbg_error_text(e), type(e).__name__, target_id=target_id, stack_level=stack_level
+        )
 
 
 @mcp.tool()
-async def debug_evaluate(expression: str, target_id: str = "",
-                         stack_level: int = 0) -> str:
+async def debug_evaluate(expression: str, target_id: str = "", stack_level: int = 0) -> str:
     """Evaluate a BSL expression in context of a stopped target.
 
     Args:
@@ -3117,28 +3389,26 @@ async def debug_evaluate(expression: str, target_id: str = "",
     try:
         client = _get_client()
         if not (client._attached and client._registered):
-            return _error_json("Not connected. Call debug_connect first.",
-                               "not_connected")
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        target_id, _ = await _resolve_stopped_target(client, target_id)
         if not target_id:
-            target_id = client.last_stopped_target_id or ""
-            if not target_id:
-                targets = await client.get_targets()
-                target_id = _find_stopped_target(targets) or ""
-            if not target_id:
-                return _error_json("No stopped targets", "no_stopped_target",
-                                   target_id=target_id)
+            return _error_json("No stopped targets", "no_stopped_target", target_id=target_id)
         result = await client.eval_expression(
-            expression=expression, target_uuid=target_id, stack_level=stack_level,
+            expression=expression,
+            target_uuid=target_id,
+            stack_level=stack_level,
         )
-        return json.dumps({"expression": expression, "result": result},
-                          ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"expression": expression, "result": result}, ensure_ascii=False, indent=2
+        )
     except Exception as e:
         # Graceful envelope (единый формат с debug_stack_trace/_error_json) вместо
         # opaque MCP-exception — типичный кейс RDBG 400 «вычисления только в
         # остановленном предмете отладки» при target не на halt'е.
         log.exception("debug_evaluate failed")
-        return _error_json(_rdbg_error_text(e), type(e).__name__,
-                           expression=expression, target_id=target_id)
+        return _error_json(
+            _rdbg_error_text(e), type(e).__name__, expression=expression, target_id=target_id
+        )
 
 
 @mcp.tool()
@@ -3172,12 +3442,7 @@ async def debug_set_breakpoint(
     # ignores BPs with zero propertyID — see cache/dbgs-rdbg-debug-server.md §11).
     # Re-attach moved out: debug_connect handles initial attach; повторный attach
     # перед каждым set_breakpoint ломает established BP-delivery state в dbgs.exe.
-    xml_module_type = module_type
-    if not property_id or property_id == ZERO_UUID:
-        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
-        if kind_uuid:
-            property_id = kind_uuid
-            xml_module_type = "ConfigModule"
+    xml_module_type, property_id = _resolve_property_id(module_type, property_id)
     result = await client.set_breakpoints(
         module_type=xml_module_type,
         object_id=object_id,
@@ -3186,14 +3451,18 @@ async def debug_set_breakpoint(
         condition=condition,
         hit_condition=hit_condition,
     )
-    return json.dumps({
-        "status": "breakpoint_set",
-        "object_id": object_id,
-        "property_id": property_id,
-        "line": line,
-        "module_type": module_type,
-        "response": result,
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "breakpoint_set",
+            "object_id": object_id,
+            "property_id": property_id,
+            "line": line,
+            "module_type": module_type,
+            "response": result,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3225,12 +3494,7 @@ async def debug_set_logpoint(
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
-    xml_module_type = module_type
-    if not property_id or property_id == ZERO_UUID:
-        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
-        if kind_uuid:
-            property_id = kind_uuid
-            xml_module_type = "ConfigModule"
+    xml_module_type, property_id = _resolve_property_id(module_type, property_id)
     await client.set_breakpoints(
         module_type=xml_module_type,
         object_id=object_id,
@@ -3238,16 +3502,20 @@ async def debug_set_logpoint(
         lines=[line],
         logpoint_template=message_template,
     )
-    return json.dumps({
-        "status": "logpoint_set",
-        "object_id": object_id,
-        "property_id": property_id,
-        "line": line,
-        "module_type": module_type,
-        "message_template": message_template,
-        "log_path": str(client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.jsonl"),
-        "placeholders": logpoints.extract_placeholders(message_template),
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "logpoint_set",
+            "object_id": object_id,
+            "property_id": property_id,
+            "line": line,
+            "module_type": module_type,
+            "message_template": message_template,
+            "log_path": str(client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.jsonl"),
+            "placeholders": logpoints.extract_placeholders(message_template),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3260,21 +3528,19 @@ async def debug_step(action: str = "Continue", target_id: str = "") -> str:
             cached state (P1.3) или fallback на get_targets pull.
     """
     client = _get_client()
+    target_id, _ = await _resolve_stopped_target(client, target_id)
     if not target_id:
-        target_id = client.last_stopped_target_id or ""
-        if not target_id:
-            targets = await client.get_targets()
-            target_id = _find_stopped_target(targets) or ""
-        if not target_id:
-            return json.dumps({"error": "No stopped targets"})
+        return json.dumps({"error": "No stopped targets"})
     result = await client.step(action=action, target_uuid=target_id)
-    return json.dumps({"action": action, "target_id": target_id, "result": result},
-                      ensure_ascii=False, indent=2)
+    return json.dumps(
+        {"action": action, "target_id": target_id, "result": result}, ensure_ascii=False, indent=2
+    )
 
 
 # ---------------------------------------------------------------------------
 # Diagnostic tools (roadmap §4.4 P2.4)
 # ---------------------------------------------------------------------------
+
 
 @mcp.tool()
 async def debug_get_breakpoints() -> str:
@@ -3286,8 +3552,7 @@ async def debug_get_breakpoints() -> str:
     """
     client = _get_client()
     bps = await client.get_breakpoints()
-    return json.dumps({"breakpoints": bps, "count": len(bps)},
-                      ensure_ascii=False, indent=2)
+    return json.dumps({"breakpoints": bps, "count": len(bps)}, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -3311,12 +3576,16 @@ async def debug_attach_targets(target_ids: list[str], attach: bool = True) -> st
         else:
             for tid in target_ids:
                 client._known_attached_targets.discard(tid)
-        return json.dumps({
-            "status": "ok",
-            "action": "attach" if attach else "detach",
-            "target_ids": target_ids,
-            "count": len(target_ids),
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "status": "ok",
+                "action": "attach" if attach else "detach",
+                "target_ids": target_ids,
+                "count": len(target_ids),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
@@ -3369,13 +3638,17 @@ async def debug_arm_warm_rphosts(target_types: Optional[list[str]] = None) -> st
             reapplied_ok = True
         except Exception as e:
             log.warning("[P0.F] BP re-apply after arm failed: %s", e)
-    return json.dumps({
-        "status": "armed",
-        "count": len(armed),
-        "filter_types": target_types,
-        "armed_targets": armed,
-        "bp_workspace_reapplied": reapplied_ok,
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "armed",
+            "count": len(armed),
+            "filter_types": target_types,
+            "armed_targets": armed,
+            "bp_workspace_reapplied": reapplied_ok,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3397,11 +3670,15 @@ async def debug_arm_next_rphost() -> str:
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     await client.set_break_on_next_statement(silent=True)
-    return json.dumps({
-        "status": "silent_arm_armed",
-        "next_stop_will_be_drained": True,
-        "hint": "Trigger BSL (e.g. execute_code). Wrapper will attach the rphost silently; subsequent BPs/logpoints fire normally.",
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "silent_arm_armed",
+            "next_stop_will_be_drained": True,
+            "hint": "Trigger BSL (e.g. execute_code). Wrapper will attach the rphost silently; subsequent BPs/logpoints fire normally.",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3435,12 +3712,16 @@ async def debug_capture_mode(on: bool = True) -> str:
     client._capture_mode = bool(on)
     if on:
         await client.set_break_on_next_statement(silent=True)
-        return json.dumps({
-            "status": "capture_mode_on",
-            "armed": True,
-            "hint": "Every new target now halts at its first statement until BPs apply. "
-                    "Trigger your code, debug_ping, then debug_capture_mode(on=False) to stop.",
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "status": "capture_mode_on",
+                "armed": True,
+                "hint": "Every new target now halts at its first statement until BPs apply. "
+                "Trigger your code, debug_ping, then debug_capture_mode(on=False) to stop.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     client._break_on_next_silent_arm = False
     return json.dumps({"status": "capture_mode_off", "armed": False}, ensure_ascii=False, indent=2)
 
@@ -3469,20 +3750,26 @@ async def debug_coverage_register(lines: list[dict]) -> str:
             continue
         line = spec.get("line", 0)
         module_type = spec.get("module_type", "CommonModule")
-        pid = spec.get("property_id", "") or MODULE_PROPERTY_IDS.get(module_type, "")
-        xml_mt = "ConfigModule" if pid and not spec.get("property_id") else module_type
+        xml_mt, pid = _resolve_property_id(module_type, spec.get("property_id", ""))
         fp = spec.get("file_path", "")
         bsl_coverage.register_line(client, oid, pid, line, fp)
         # Register as BP via existing aggregation (no condition, no template)
         await client.set_breakpoints(
-            module_type=xml_mt, object_id=oid, property_id=pid, lines=[int(line)],
+            module_type=xml_mt,
+            object_id=oid,
+            property_id=pid,
+            lines=[int(line)],
         )
         registered.append({"object_id": oid, "line": int(line), "property_id": pid})
-    return json.dumps({
-        "status": "registered",
-        "registered_count": len(registered),
-        "sample": registered[:5],
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "registered",
+            "registered_count": len(registered),
+            "sample": registered[:5],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3537,12 +3824,7 @@ async def debug_calibrate_lines(
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
-    xml_module_type = module_type
-    if not property_id or property_id == ZERO_UUID:
-        kind_uuid = MODULE_PROPERTY_IDS.get(module_type, "")
-        if kind_uuid:
-            property_id = kind_uuid
-            xml_module_type = "ConfigModule"
+    xml_module_type, property_id = _resolve_property_id(module_type, property_id)
     line = max(1, int(line))
     radius = max(1, min(int(radius), 30))
     fan = list(range(max(1, line - radius), line + radius + 1))
@@ -3557,16 +3839,17 @@ async def debug_calibrate_lines(
         for ln in stale["lines"]:
             stale_tracked.pop((object_id, stale["property_id"], ln), None)
         for ce in list(client._set_breakpoints_cache):
-            if (ce["object_id"] == object_id
-                    and ce["property_id"] == stale["property_id"]):
+            if ce["object_id"] == object_id and ce["property_id"] == stale["property_id"]:
                 ce["lines"] = [L for L in ce["lines"] if L not in stale_set]
                 if not ce["lines"]:
                     client._set_breakpoints_cache.remove(ce)
     for ln in fan:
         bsl_coverage.register_line(client, object_id, property_id, ln)
     await client.set_breakpoints(
-        module_type=xml_module_type, object_id=object_id,
-        property_id=property_id, lines=fan,
+        module_type=xml_module_type,
+        object_id=object_id,
+        property_id=property_id,
+        lines=fan,
     )
     client._calibrations[object_id] = {
         "requested_line": int(line),
@@ -3575,18 +3858,22 @@ async def debug_calibrate_lines(
         "module_type": module_type,
         "xml_module_type": xml_module_type,
     }
-    return json.dumps({
-        "status": "calibration_armed",
-        "object_id": object_id,
-        "requested_line": int(line),
-        "range": [fan[0], fan[-1]],
-        "count": len(fan),
-        "next_steps": [
-            "Trigger: execute_code → ФоновыеЗадания.Выполнить(\"Модуль.Метод\", Параметры)",
-            "debug_ping ×2-3 (пока не увидишь callStackFormed / коду дадут пройти)",
-            "debug_calibrate_result(object_id) → реальные строки + offset",
-        ],
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "calibration_armed",
+            "object_id": object_id,
+            "requested_line": int(line),
+            "range": [fan[0], fan[-1]],
+            "count": len(fan),
+            "next_steps": [
+                'Trigger: execute_code → ФоновыеЗадания.Выполнить("Модуль.Метод", Параметры)',
+                "debug_ping ×2-3 (пока не увидишь callStackFormed / коду дадут пройти)",
+                "debug_calibrate_result(object_id) → реальные строки + offset",
+            ],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3615,18 +3902,20 @@ async def debug_calibrate_result(
     if object_id:
         calibs = {k: v for k, v in calibs.items() if k == object_id}
     if not calibs:
-        return json.dumps({
-            "error": "no active calibration",
-            "hint": "debug_calibrate_lines first",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "error": "no active calibration",
+                "hint": "debug_calibrate_lines first",
+            },
+            ensure_ascii=False,
+        )
     tracked = getattr(client, "_coverage_tracked", {}) or {}
     results = []
     for oid, meta in calibs.items():
         pid = meta["property_id"]
         requested = meta["requested_line"]
         fired = sorted(
-            ln for ln in meta["lines"]
-            if tracked.get((oid, pid, ln), {}).get("hits", 0) > 0
+            ln for ln in meta["lines"] if tracked.get((oid, pid, ln), {}).get("hits", 0) > 0
         )
         nearest = min(fired, key=lambda L: abs(L - requested)) if fired else None
         entry = {
@@ -3637,8 +3926,10 @@ async def debug_calibrate_result(
             "offset": (nearest - requested) if nearest is not None else None,
         }
         if not fired:
-            entry["hint"] = ("веер не сработал: проверь trigger (JOB, не "
-                             "HTTP-service), pre-existing rphost, radius")
+            entry["hint"] = (
+                "веер не сработал: проверь trigger (JOB, не "
+                "HTTP-service), pre-existing rphost, radius"
+            )
         results.append(entry)
         if clear:
             fan_set = set(meta["lines"])
@@ -3646,8 +3937,7 @@ async def debug_calibrate_result(
                 tracked.pop((oid, pid, ln), None)
             nearest_kept = False
             for cache_entry in list(client._set_breakpoints_cache):
-                if (cache_entry["object_id"] == oid
-                        and cache_entry["property_id"] == pid):
+                if cache_entry["object_id"] == oid and cache_entry["property_id"] == pid:
                     kept = [L for L in cache_entry["lines"] if L not in fan_set]
                     if keep_bp_on_nearest and nearest is not None:
                         kept.append(nearest)
@@ -3657,12 +3947,19 @@ async def debug_calibrate_result(
                         client._set_breakpoints_cache.remove(cache_entry)
             if keep_bp_on_nearest and nearest is not None and not nearest_kept:
                 # кэш мог не содержать веер (HMR-restart) — создаём запись явно
-                client._set_breakpoints_cache.append({
-                    "module_type": meta["xml_module_type"], "object_id": oid,
-                    "property_id": pid, "lines": [nearest],
-                    "ext_id": 0, "url": "", "extension_name": "",
-                    "version": "", "condition": "",
-                })
+                client._set_breakpoints_cache.append(
+                    {
+                        "module_type": meta["xml_module_type"],
+                        "object_id": oid,
+                        "property_id": pid,
+                        "lines": [nearest],
+                        "ext_id": 0,
+                        "url": "",
+                        "extension_name": "",
+                        "version": "",
+                        "condition": "",
+                    }
+                )
             client._calibrations.pop(oid, None)
     if clear:
         if client._set_breakpoints_cache:
@@ -3671,12 +3968,16 @@ async def debug_calibrate_result(
             # workspace REPLACES per call — пустой push снимает остатки веера
             body = _build_request(client._base_fields(), _rdbg("bpWorkspace", ""))
             await client._post("setBreakpoints", body)
-    return json.dumps({
-        "status": "calibration_result",
-        "results": results,
-        "cleared": bool(clear),
-        "bp_kept_on_nearest": bool(keep_bp_on_nearest),
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "calibration_result",
+            "results": results,
+            "cleared": bool(clear),
+            "bp_kept_on_nearest": bool(keep_bp_on_nearest),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3697,11 +3998,15 @@ async def debug_session_record(enable: bool = True) -> str:
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     client._recording_enabled = bool(enable)
-    return json.dumps({
-        "status": "recording_enabled" if enable else "recording_disabled",
-        "recording_enabled": client._recording_enabled,
-        "session_id": getattr(client, "session_id", None),
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "recording_enabled" if enable else "recording_disabled",
+            "recording_enabled": client._recording_enabled,
+            "session_id": getattr(client, "session_id", None),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3715,11 +4020,15 @@ async def debug_replay_list() -> str:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     sess = getattr(client, "session_id", None)
     snapshots = snapshot.list_snapshots(sess) if sess else []
-    return json.dumps({
-        "session_id": sess,
-        "count": len(snapshots),
-        "snapshots": snapshots,
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "session_id": sess,
+            "count": len(snapshots),
+            "snapshots": snapshots,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3735,8 +4044,11 @@ async def debug_replay_seek(index: int) -> str:
     sess = getattr(client, "session_id", None)
     entry = snapshot.seek_snapshot(sess, index) if sess else None
     if entry is None:
-        return json.dumps({"error": "out of range", "index": index, "session_id": sess},
-                          ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"error": "out of range", "index": index, "session_id": sess},
+            ensure_ascii=False,
+            indent=2,
+        )
     return json.dumps(entry, ensure_ascii=False, indent=2)
 
 
@@ -3764,11 +4076,15 @@ async def debug_set_exception_bp(message_pattern: str = "", module_pattern: str 
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     f = {"message_pattern": message_pattern, "module_pattern": module_pattern}
     client._exception_bp_filters.append(f)
-    return json.dumps({
-        "status": "filter_added",
-        "filter": f,
-        "total_filters": len(client._exception_bp_filters),
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "filter_added",
+            "filter": f,
+            "total_filters": len(client._exception_bp_filters),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3779,7 +4095,9 @@ async def debug_clear_exception_bps() -> str:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     cleared = len(client._exception_bp_filters)
     client._exception_bp_filters.clear()
-    return json.dumps({"status": "cleared", "filters_removed": cleared}, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {"status": "cleared", "filters_removed": cleared}, ensure_ascii=False, indent=2
+    )
 
 
 @mcp.tool()
@@ -3788,11 +4106,15 @@ async def debug_list_exception_bps() -> str:
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
-    return json.dumps({
-        "filters": list(client._exception_bp_filters),
-        "count": len(client._exception_bp_filters),
-        "default_behavior": "halt-all" if not client._exception_bp_filters else "filter-only",
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "filters": list(client._exception_bp_filters),
+            "count": len(client._exception_bp_filters),
+            "default_behavior": "halt-all" if not client._exception_bp_filters else "filter-only",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -3816,25 +4138,31 @@ async def debug_break_on_next() -> str:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     try:
         await client.set_break_on_next_statement()
-        return json.dumps({
-            "status": "ok",
-            "action": "break_on_next_statement_armed",
-            "next_step": (
-                "Trigger any BSL execution; then debug_targets to see "
-                "captured target; then set precise BP + debug_step Continue."
-            ),
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "status": "ok",
+                "action": "break_on_next_statement_armed",
+                "next_step": (
+                    "Trigger any BSL execution; then debug_targets to see "
+                    "captured target; then set precise BP + debug_step Continue."
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     except Exception as e:
         return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
-async def debug_launch_thin_client(infobase_alias: str = "",
-                                    user: str = "",
-                                    password: str = "",
-                                    server: str = "localhost:1541",
-                                    debugger_url: str = "http://localhost:1550",
-                                    wait_target_timeout_sec: int = 15) -> str:
+async def debug_launch_thin_client(
+    infobase_alias: str = "",
+    user: str = "",
+    password: str = "",
+    server: str = "localhost:1541",
+    debugger_url: str = "http://localhost:1550",
+    wait_target_timeout_sec: int = 15,
+) -> str:
     """Launch 1cv8c.exe (thin client) с правильными /Debug -http /DebuggerURL флагами.
 
     Roadmap 260511 §3.5 (P1). Auto-flagged thin client launch closes RC3
@@ -3854,41 +4182,60 @@ async def debug_launch_thin_client(infobase_alias: str = "",
     """
     import os
     import subprocess as sp
+
     if not infobase_alias:
-        return json.dumps({"status": "error",
-                           "reason": "infobase_alias_required"},
-                          ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"status": "error", "reason": "infobase_alias_required"}, ensure_ascii=False, indent=2
+        )
     exe = _find_1cv8c_exe()
     if not exe:
-        return json.dumps({
-            "status": "error", "reason": "1cv8c_exe_not_found",
-            "searched": list(_1CV8C_BIN_CANDIDATES),
-            "hint": "Provide explicit path via env or install 1С platform",
-        }, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "1cv8c_exe_not_found",
+                "searched": list(_1CV8C_BIN_CANDIDATES),
+                "hint": "Provide explicit path via env or install 1С platform",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
     # Validate infobase_alias unless cluster unreachable
     validation = _validate_infobase_alias(infobase_alias)
     if validation["status"] == "invalid":
-        return json.dumps({
-            "status": "error", "reason": "infobase_alias_not_found",
-            "provided": infobase_alias,
-            "available": validation["available"],
-        }, ensure_ascii=False, indent=2)
-    args = [exe, f'/S{server}\\{infobase_alias}',
-            "/Debug", "-http", f'/DebuggerURL={debugger_url}']
+        return json.dumps(
+            {
+                "status": "error",
+                "reason": "infobase_alias_not_found",
+                "provided": infobase_alias,
+                "available": validation["available"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    args = [exe, f"/S{server}\\{infobase_alias}", "/Debug", "-http", f"/DebuggerURL={debugger_url}"]
     if user:
         args.extend(["/N", user])
     if password:
         args.extend(["/P", password])
     try:
         # Detached background launch (Windows) — DETACHED_PROCESS=0x00000008
-        creationflags = getattr(sp, "DETACHED_PROCESS", 0) | \
-                        getattr(sp, "CREATE_NEW_PROCESS_GROUP", 0)
-        proc = sp.Popen(args, creationflags=creationflags,
-                        stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.DEVNULL,
-                        close_fds=True)
+        creationflags = getattr(sp, "DETACHED_PROCESS", 0) | getattr(
+            sp, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+        proc = sp.Popen(
+            args,
+            creationflags=creationflags,
+            stdin=sp.DEVNULL,
+            stdout=sp.DEVNULL,
+            stderr=sp.DEVNULL,
+            close_fds=True,
+        )
     except (OSError, sp.SubprocessError) as e:
-        return json.dumps({"status": "error", "reason": "launch_failed",
-                           "error": str(e)}, ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"status": "error", "reason": "launch_failed", "error": str(e)},
+            ensure_ascii=False,
+            indent=2,
+        )
     # Wait for target registration via existing client (if connected)
     target_registered = False
     first_target_id = None
@@ -3896,6 +4243,7 @@ async def debug_launch_thin_client(infobase_alias: str = "",
     not_connected_warning = None
     if _client and _client._attached:
         import time as _t
+
         start = _t.monotonic()
         timeout = max(1, min(60, wait_target_timeout_sec))
         while _t.monotonic() - start < timeout:
@@ -3905,19 +4253,20 @@ async def debug_launch_thin_client(infobase_alias: str = "",
                 targets = []
             if targets:
                 target_registered = True
-                first_target_id = next(
-                    (t.get("id") for t in targets if t.get("id")), None)
+                first_target_id = next((t.get("id") for t in targets if t.get("id")), None)
                 break
             await asyncio.sleep(0.5)
         elapsed_ms = int((_t.monotonic() - start) * 1000)
     else:
         not_connected_warning = (
             "Not connected to debug agent — target_registered detection "
-            "skipped. Call debug_connect first для polling.")
+            "skipped. Call debug_connect first для polling."
+        )
     # Hide password в command_line на возврате
     command_line_safe = " ".join(
         ("/P***" if arg == password and password else f'"{arg}"' if " " in arg else arg)
-        for arg in args)
+        for arg in args
+    )
     response = {
         "status": "ok" if target_registered else "launched",
         "pid": proc.pid,
@@ -3925,9 +4274,12 @@ async def debug_launch_thin_client(infobase_alias: str = "",
         "target_registered": target_registered,
         "first_target_id": first_target_id,
         "elapsed_ms": elapsed_ms,
-        "note": ("Target not yet registered — perform any action в GUI "
-                 "to trigger BSL execution, then debug_wait_for_target"
-                 if not target_registered else None),
+        "note": (
+            "Target not yet registered — perform any action в GUI "
+            "to trigger BSL execution, then debug_wait_for_target"
+            if not target_registered
+            else None
+        ),
     }
     if not_connected_warning:
         response["warning"] = not_connected_warning
@@ -3936,13 +4288,13 @@ async def debug_launch_thin_client(infobase_alias: str = "",
             "/P password передаётся через CLI argv — виден в OS process list "
             "(Get-Process | Select CommandLine). НЕ использовать в shared/"
             "production контекстах. Предпочтительно: сохранённые credentials "
-            "в Windows-storage клиента или Windows-auth.")
+            "в Windows-storage клиента или Windows-auth."
+        )
     return json.dumps(response, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
-async def debug_wait_for_target(timeout_sec: int = 10,
-                                 poll_interval_sec: float = 0.5) -> str:
+async def debug_wait_for_target(timeout_sec: int = 10, poll_interval_sec: float = 0.5) -> str:
     """Block until ≥1 target appears in debug_targets, or timeout.
 
     Roadmap 260511 §3.4 (P1). Synchronous primitive для guaranteed-attached
@@ -3958,11 +4310,13 @@ async def debug_wait_for_target(timeout_sec: int = 10,
               elapsed_ms, [suggestion if timeout]}
     """
     import time as _t
+
     timeout_sec = max(1, min(60, timeout_sec))
     client = _get_client()
     if not client._attached:
-        return json.dumps({"error": "Not connected. Call debug_connect first."},
-                          ensure_ascii=False, indent=2)
+        return json.dumps(
+            {"error": "Not connected. Call debug_connect first."}, ensure_ascii=False, indent=2
+        )
     start = _t.monotonic()
     while _t.monotonic() - start < timeout_sec:
         try:
@@ -3971,26 +4325,34 @@ async def debug_wait_for_target(timeout_sec: int = 10,
             targets = []
         if targets:
             first_id = next((t.get("id") for t in targets if t.get("id")), None)
-            return json.dumps({
-                "status": "ok",
-                "targets_count": len(targets),
-                "first_target_id": first_id,
-                "elapsed_ms": int((_t.monotonic() - start) * 1000),
-            }, ensure_ascii=False, indent=2)
+            return json.dumps(
+                {
+                    "status": "ok",
+                    "targets_count": len(targets),
+                    "first_target_id": first_id,
+                    "elapsed_ms": int((_t.monotonic() - start) * 1000),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
         await asyncio.sleep(poll_interval_sec)
-    return json.dumps({
-        "status": "timeout",
-        "targets_count": 0,
-        "first_target_id": None,
-        "elapsed_ms": int((_t.monotonic() - start) * 1000),
-        "suggestion": (
-            "No targets registered within timeout. Try: (1) launch thin "
-            "client with /Debug -http /DebuggerURL=http://localhost:1550, "
-            "(2) trigger BSL via execute_code, (3) check infobase_alias "
-            "valid via debug_health_check, (4) try recycle_strategy="
-            "all_rphosts_of_ib if pre-existing rphost gap."
-        ),
-    }, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {
+            "status": "timeout",
+            "targets_count": 0,
+            "first_target_id": None,
+            "elapsed_ms": int((_t.monotonic() - start) * 1000),
+            "suggestion": (
+                "No targets registered within timeout. Try: (1) launch thin "
+                "client with /Debug -http /DebuggerURL=http://localhost:1550, "
+                "(2) trigger BSL via execute_code, (3) check infobase_alias "
+                "valid via debug_health_check, (4) try recycle_strategy="
+                "all_rphosts_of_ib if pre-existing rphost gap."
+            ),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -4014,8 +4376,9 @@ async def debug_target_state(target_id: str = "") -> str:
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     state = await client.get_target_state(target_uuid=target_id or None)
-    return json.dumps({"target_id": target_id or None, "state": state},
-                      ensure_ascii=False, indent=2)
+    return json.dumps(
+        {"target_id": target_id or None, "state": state}, ensure_ascii=False, indent=2
+    )
 
 
 def _cli_main() -> int:
@@ -4038,6 +4401,7 @@ def _cli_main() -> int:
         python mcp_debug_server.py session-diff --prev <uuid> [--curr <uuid>]
     """
     import argparse
+
     # Force UTF-8 stdout для Windows cp1251 default (Cyrillic + math symbols)
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -4048,13 +4412,14 @@ def _cli_main() -> int:
 
     sub.add_parser("health-check", help="Run debug_health_check probe (read-only)")
 
-    p_summary = sub.add_parser("session-summary",
-                                help="Print session summary by session_id или current")
-    p_summary.add_argument("--format", default="json",
-                            choices=("json", "markdown"))
+    p_summary = sub.add_parser(
+        "session-summary", help="Print session summary by session_id или current"
+    )
+    p_summary.add_argument("--format", default="json", choices=("json", "markdown"))
 
-    p_diff = sub.add_parser("session-diff",
-                              help="Diff 2 persisted sessions для regression detection")
+    p_diff = sub.add_parser(
+        "session-diff", help="Diff 2 persisted sessions для regression detection"
+    )
     p_diff.add_argument("--prev", required=True, help="prev session UUID")
     p_diff.add_argument("--curr", default=None, help="curr session UUID (default: current)")
 
@@ -4066,8 +4431,7 @@ def _cli_main() -> int:
         result = asyncio.run(debug_session_summary(format=args.format))
     elif args.cmd == "session-diff":
         result = asyncio.run(
-            debug_session_diff(prev_session_id=args.prev,
-                                curr_session_id=args.curr)
+            debug_session_diff(prev_session_id=args.prev, curr_session_id=args.curr)
         )
     else:
         parser.print_help()
@@ -4077,7 +4441,6 @@ def _cli_main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in ("health-check", "session-summary",
-                                              "session-diff"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("health-check", "session-summary", "session-diff"):
         sys.exit(_cli_main())
     mcp.run()

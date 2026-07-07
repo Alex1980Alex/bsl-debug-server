@@ -42,6 +42,7 @@ NOT_A_UUID = "queue-id-not-a-uuid"
 # _extract_target_id — UUID-validated classmethod
 # ---------------------------------------------------------------------------
 
+
 class TestExtractTargetId:
     def test_flat_string_valid_uuid(self):
         assert RDBGClient._extract_target_id({"targetID": GOOD_UUID}) == GOOD_UUID
@@ -87,6 +88,7 @@ class TestExtractTargetId:
 # Fixtures: client with patched _post
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def client():
     """RDBGClient instance — _post patched to AsyncMock returning empty Element."""
@@ -98,6 +100,7 @@ def client():
 # ---------------------------------------------------------------------------
 # _resolve_target_uuid — fallback chain
 # ---------------------------------------------------------------------------
+
 
 class TestResolveTargetUuid:
     def test_explicit_takes_precedence(self, client):
@@ -120,6 +123,7 @@ class TestResolveTargetUuid:
 # last_stopped_target_id public property (reviewer fix 2026-05-09)
 # ---------------------------------------------------------------------------
 
+
 class TestLastStoppedTargetIdProperty:
     def test_property_exists_and_returns_state(self, client):
         client._last_stopped_target_id = GOOD_UUID
@@ -139,31 +143,39 @@ class TestLastStoppedTargetIdProperty:
 # _handle_command — 14 cmdId types
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 class TestHandleCommand:
-
     async def test_target_started_auto_attaches(self, client):
         client.attach_debug_targets = AsyncMock(return_value=True)
-        await client._handle_command({
-            "cmdId": "targetStarted",
-            "targetID": GOOD_UUID,
-        })
+        await client._handle_command(
+            {
+                "cmdId": "targetStarted",
+                "targetID": GOOD_UUID,
+            }
+        )
         client.attach_debug_targets.assert_awaited_once_with([GOOD_UUID])
         assert GOOD_UUID in client._known_attached_targets
 
     async def test_target_started_idempotent(self, client):
         client.attach_debug_targets = AsyncMock(return_value=True)
         client._known_attached_targets.add(GOOD_UUID)
-        await client._handle_command({
-            "cmdId": "targetStarted", "targetID": GOOD_UUID,
-        })
+        await client._handle_command(
+            {
+                "cmdId": "targetStarted",
+                "targetID": GOOD_UUID,
+            }
+        )
         client.attach_debug_targets.assert_not_called()
 
     async def test_target_started_attach_failure_does_not_pollute_known(self, client):
         client.attach_debug_targets = AsyncMock(side_effect=RuntimeError("RDBG 400"))
-        await client._handle_command({
-            "cmdId": "targetStarted", "targetID": GOOD_UUID,
-        })
+        await client._handle_command(
+            {
+                "cmdId": "targetStarted",
+                "targetID": GOOD_UUID,
+            }
+        )
         # Failure → target NOT added (next ping will retry)
         assert GOOD_UUID not in client._known_attached_targets
 
@@ -174,53 +186,63 @@ class TestHandleCommand:
 
     async def test_call_stack_formed_breakpoint(self, client):
         stack = [{"_tag": "frame", "line": "10"}, {"_tag": "frame", "line": "20"}]
-        await client._handle_command({
-            "cmdId": "callStackFormed",
-            "targetID": GOOD_UUID,
-            "callStack": stack,
-            "stopByBP": "true",
-        })
+        await client._handle_command(
+            {
+                "cmdId": "callStackFormed",
+                "targetID": GOOD_UUID,
+                "callStack": stack,
+                "stopByBP": "true",
+            }
+        )
         assert GOOD_UUID in client._stopped_targets
         assert client._last_stopped_target_id == GOOD_UUID
         assert client._last_stack_by_target[GOOD_UUID] == stack
         assert client._stop_reason_by_target[GOOD_UUID] == "breakpoint"
 
     async def test_call_stack_formed_step_stop(self, client):
-        await client._handle_command({
-            "cmdId": "callStackFormed",
-            "targetID": GOOD_UUID,
-            "callStack": {"_tag": "frame"},  # single-dict normalised to list
-            "stopByBP": "false",
-        })
+        await client._handle_command(
+            {
+                "cmdId": "callStackFormed",
+                "targetID": GOOD_UUID,
+                "callStack": {"_tag": "frame"},  # single-dict normalised to list
+                "stopByBP": "false",
+            }
+        )
         assert client._stop_reason_by_target[GOOD_UUID] == "step"
         assert client._last_stack_by_target[GOOD_UUID] == [{"_tag": "frame"}]
 
     async def test_call_stack_formed_no_target_skipped(self, client):
-        await client._handle_command({
-            "cmdId": "callStackFormed",
-            "callStack": [],
-        })
+        await client._handle_command(
+            {
+                "cmdId": "callStackFormed",
+                "callStack": [],
+            }
+        )
         assert client._stopped_targets == set()
         assert client._last_stopped_target_id is None
 
     async def test_rte_processing_caches_exception(self, client):
         exc = {"_tag": "exception", "code": "42", "info": "Деление на ноль"}
-        await client._handle_command({
-            "cmdId": "rteProcessing",
-            "targetID": GOOD_UUID,
-            "callStack": [{"_tag": "frame"}],
-            "exception": exc,
-        })
+        await client._handle_command(
+            {
+                "cmdId": "rteProcessing",
+                "targetID": GOOD_UUID,
+                "callStack": [{"_tag": "frame"}],
+                "exception": exc,
+            }
+        )
         assert GOOD_UUID in client._stopped_targets
         assert client._last_stopped_target_id == GOOD_UUID
         assert client._stop_reason_by_target[GOOD_UUID] == "exception"
         assert client._last_exception_by_target[GOOD_UUID] == exc
 
     async def test_rte_processing_no_target_skipped(self, client):
-        await client._handle_command({
-            "cmdId": "rteProcessing",
-            "callStack": [],
-        })
+        await client._handle_command(
+            {
+                "cmdId": "rteProcessing",
+                "callStack": [],
+            }
+        )
         assert client._stopped_targets == set()
         assert client._last_exception_by_target == {}
 
@@ -232,9 +254,12 @@ class TestHandleCommand:
         client._last_exception_by_target[GOOD_UUID] = {"code": "42"}
         client._known_attached_targets.add(GOOD_UUID)
 
-        await client._handle_command({
-            "cmdId": "targetQuit", "targetID": GOOD_UUID,
-        })
+        await client._handle_command(
+            {
+                "cmdId": "targetQuit",
+                "targetID": GOOD_UUID,
+            }
+        )
 
         assert GOOD_UUID not in client._stopped_targets
         assert GOOD_UUID not in client._last_stack_by_target
@@ -243,18 +268,30 @@ class TestHandleCommand:
         assert GOOD_UUID not in client._known_attached_targets
 
     async def test_corrected_bp_does_not_change_state(self, client):
-        await client._handle_command({
-            "cmdId": "correctedBP", "targetID": GOOD_UUID,
-        })
+        await client._handle_command(
+            {
+                "cmdId": "correctedBP",
+                "targetID": GOOD_UUID,
+            }
+        )
         # Just logged a warning, no state mutation
         assert client._stopped_targets == set()
 
-    @pytest.mark.parametrize("cmd_type", [
-        "ForegroundHelperSet", "ForegroundHelperRequest",
-        "ForegroundHelperProcess", "measureResultProcessing",
-        "errorViewInfo", "rteOnBPConditionProcessing",
-        "exprEvaluated", "valueModified", "unknown", "",
-    ])
+    @pytest.mark.parametrize(
+        "cmd_type",
+        [
+            "ForegroundHelperSet",
+            "ForegroundHelperRequest",
+            "ForegroundHelperProcess",
+            "measureResultProcessing",
+            "errorViewInfo",
+            "rteOnBPConditionProcessing",
+            "exprEvaluated",
+            "valueModified",
+            "unknown",
+            "",
+        ],
+    )
     async def test_skipped_cmd_types_no_op(self, client, cmd_type):
         await client._handle_command({"cmdId": cmd_type, "targetID": GOOD_UUID})
         assert client._stopped_targets == set()
@@ -267,37 +304,44 @@ class TestHandleCommand:
     async def test_cmdidnum_fallback_target_started(self, client):
         # Real-world finding 2026-05-09 §13.18: RDBG может emit cmdIDNum=1 без cmdId
         client.attach_debug_targets = AsyncMock(return_value=True)
-        await client._handle_command({
-            "cmdIDNum": "1",  # 1 = targetStarted per DBGUIExtCmds enum
-            "targetID": GOOD_UUID,
-        })
+        await client._handle_command(
+            {
+                "cmdIDNum": "1",  # 1 = targetStarted per DBGUIExtCmds enum
+                "targetID": GOOD_UUID,
+            }
+        )
         client.attach_debug_targets.assert_awaited_once_with([GOOD_UUID])
         assert GOOD_UUID in client._known_attached_targets
 
     async def test_cmdidnum_fallback_call_stack_formed(self, client):
-        await client._handle_command({
-            "cmdIDNum": "7",  # 7 = callStackFormed
-            "targetID": GOOD_UUID,
-            "callStack": [{"_tag": "frame"}],
-            "stopByBP": "true",
-        })
+        await client._handle_command(
+            {
+                "cmdIDNum": "7",  # 7 = callStackFormed
+                "targetID": GOOD_UUID,
+                "callStack": [{"_tag": "frame"}],
+                "stopByBP": "true",
+            }
+        )
         assert client._last_stopped_target_id == GOOD_UUID
         assert client._stop_reason_by_target[GOOD_UUID] == "breakpoint"
 
     async def test_explicit_cmdid_overrides_cmdidnum(self, client):
         # If both present, literal cmdId wins (yukon39 wire format expectation)
         client.attach_debug_targets = AsyncMock(return_value=True)
-        await client._handle_command({
-            "cmdId": "targetStarted",
-            "cmdIDNum": "999",  # bogus ordinal — must be ignored
-            "targetID": GOOD_UUID,
-        })
+        await client._handle_command(
+            {
+                "cmdId": "targetStarted",
+                "cmdIDNum": "999",  # bogus ordinal — must be ignored
+                "targetID": GOOD_UUID,
+            }
+        )
         client.attach_debug_targets.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
 # _ensure_target_attached — idempotent guard
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestEnsureTargetAttached:
@@ -328,6 +372,7 @@ class TestEnsureTargetAttached:
 # ---------------------------------------------------------------------------
 # get_call_stack — cache-hit path + pull-fallback ensure-attached
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestGetCallStack:
@@ -376,6 +421,7 @@ class TestGetCallStack:
 # ---------------------------------------------------------------------------
 # step() — Continue resume semantics + RTE cleanup
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestStepResume:
@@ -431,12 +477,15 @@ class TestStepResume:
 # eval_expression / eval_local_variables — re-attach guard
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.asyncio
 class TestEvalReattach:
     async def test_eval_expression_ensures_attached(self, client):
         client.attach_debug_targets = AsyncMock(return_value=True)
         await client.eval_expression(
-            expression="ТекущаяДата()", target_uuid=GOOD_UUID, async_wait_timeout=0,
+            expression="ТекущаяДата()",
+            target_uuid=GOOD_UUID,
+            async_wait_timeout=0,
         )
         client.attach_debug_targets.assert_awaited_once_with([GOOD_UUID])
 
@@ -476,7 +525,9 @@ class TestEvalReattach:
         client.attach_debug_targets = AsyncMock(return_value=True)
         client._last_stopped_target_id = GOOD_UUID
         await client.eval_expression(
-            expression="Контрагент.Ссылка", view_interface="context", async_wait_timeout=0,
+            expression="Контрагент.Ссылка",
+            view_interface="context",
+            async_wait_timeout=0,
         )
         body = client._post.call_args.args[1]
         assert "<debugCalculations:viewInterface>context</debugCalculations:viewInterface>" in body
@@ -492,8 +543,9 @@ class TestEvalReattach:
     async def test_eval_custom_max_text_size(self, client):
         client.attach_debug_targets = AsyncMock(return_value=True)
         client._last_stopped_target_id = GOOD_UUID
-        await client.eval_expression(expression="БольшаяТаблица", max_text_size=16384,
-                                      async_wait_timeout=0)
+        await client.eval_expression(
+            expression="БольшаяТаблица", max_text_size=16384, async_wait_timeout=0
+        )
         body = client._post.call_args.args[1]
         assert "<debugCalculations:maxTextSize>16384</debugCalculations:maxTextSize>" in body
 
@@ -514,8 +566,7 @@ class TestEvalAsyncPickup:
             return ET.Element("empty")
 
         client._post = AsyncMock(side_effect=post_capture)
-        await client.eval_expression(expression="x", target_uuid=GOOD_UUID,
-                                      async_wait_timeout=0)
+        await client.eval_expression(expression="x", target_uuid=GOOD_UUID, async_wait_timeout=0)
         assert len(captured_pending) == 1, "Future must be registered before POST"
 
     async def test_sync_result_returns_immediately(self, client):
@@ -526,8 +577,9 @@ class TestEvalAsyncPickup:
         result_elem = ET.SubElement(non_empty, "result")
         ET.SubElement(result_elem, "value").text = "42"
         client._post = AsyncMock(return_value=non_empty)
-        result = await client.eval_expression(expression="40+2", target_uuid=GOOD_UUID,
-                                               async_wait_timeout=0)
+        result = await client.eval_expression(
+            expression="40+2", target_uuid=GOOD_UUID, async_wait_timeout=0
+        )
         assert result, "Sync result should not be empty"
         # _pending_evals must be cleaned up
         assert len(client._pending_evals) == 0
@@ -554,8 +606,7 @@ class TestEvalAsyncPickup:
             await client._handle_command(event)
 
         results = await asyncio.gather(
-            client.eval_expression(expression="x", target_uuid=GOOD_UUID,
-                                    async_wait_timeout=2.0),
+            client.eval_expression(expression="x", target_uuid=GOOD_UUID, async_wait_timeout=2.0),
             eval_then_resolve(),
         )
         eval_result = results[0]
@@ -566,10 +617,12 @@ class TestEvalAsyncPickup:
     async def test_unknown_result_id_event_is_ignored(self, client):
         # exprEvaluated for a result_id that has no pending future just logs
         # a debug message — must not raise or pollute state.
-        await client._handle_command({
-            "cmdId": "exprEvaluated",
-            "evalExprResBaseData": {"expressionResultID": GOOD_UUID, "value": "ghost"},
-        })
+        await client._handle_command(
+            {
+                "cmdId": "exprEvaluated",
+                "evalExprResBaseData": {"expressionResultID": GOOD_UUID, "value": "ghost"},
+            }
+        )
         assert len(client._pending_evals) == 0  # nothing changed
 
 
@@ -581,20 +634,24 @@ class TestUiPlusRetry:
         """Fixture's `client` mocks `_post` — restore the real method so the
         UI+ retry logic runs end-to-end via `_http.post` (also mocked here)."""
         from mcp_debug_server import RDBGClient as RealClient
+
         client._post = RealClient._post.__get__(client, RealClient)
 
     async def test_retry_re_handshakes_and_succeeds(self, client):
         # First call: RDBG returns 400 UI+ revoked. Wrapper auto re-handshakes
         # (init_settings + clear_break_on_next_statement), retries once, succeeds.
         import httpx as _httpx
+
         await self._restore_real_post(client)
 
         ui_plus_400 = _httpx.Response(
-            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            400,
+            content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
             request=_httpx.Request("POST", "http://test/"),
         )
         ok_resp = _httpx.Response(
-            200, content=b"<root/>",
+            200,
+            content=b"<root/>",
             request=_httpx.Request("POST", "http://test/"),
         )
 
@@ -610,10 +667,12 @@ class TestUiPlusRetry:
         # If init_settings ITSELF returns 400 UI+, we MUST NOT recursively retry
         # (would infinite-loop). Test by calling init_settings with mocked 400.
         import httpx as _httpx
+
         await self._restore_real_post(client)
 
         ui_plus_400 = _httpx.Response(
-            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            400,
+            content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
             request=_httpx.Request("POST", "http://test/"),
         )
         client._http = MagicMock()
@@ -628,10 +687,12 @@ class TestUiPlusRetry:
         # Other 400 errors (e.g. «Не указан идентификатор предмета отладки»)
         # bubble up as HTTPStatusError without retry.
         import httpx as _httpx
+
         await self._restore_real_post(client)
 
         other_400 = _httpx.Response(
-            400, content=b"<error>Some other error</error>",
+            400,
+            content=b"<error>Some other error</error>",
             request=_httpx.Request("POST", "http://test/"),
         )
         client._http = MagicMock()
@@ -646,10 +707,12 @@ class TestUiPlusRetry:
         # message → wrapper escalates to full detachDebugUI + new attachDebugUI
         # + 4-step handshake (with fresh session_id). Verify the escalation path.
         import httpx as _httpx
+
         await self._restore_real_post(client)
 
         ui_plus_400 = _httpx.Response(
-            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            400,
+            content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
             request=_httpx.Request("POST", "http://test/"),
         )
         attach_ok = _httpx.Response(
@@ -658,7 +721,8 @@ class TestUiPlusRetry:
             request=_httpx.Request("POST", "http://test/"),
         )
         ok_resp = _httpx.Response(
-            200, content=b"<root/>",
+            200,
+            content=b"<root/>",
             request=_httpx.Request("POST", "http://test/"),
         )
 
@@ -674,12 +738,20 @@ class TestUiPlusRetry:
         #   8. clearBreakOnNextStatement → 200
         #   9. setAutoAttachSettings → 200
         #   10. setBreakOnNextStatement final retry → 200 SUCCESS
-        client._http.post = AsyncMock(side_effect=[
-            ui_plus_400, ok_resp, ok_resp,
-            ui_plus_400,
-            ok_resp, attach_ok, ok_resp, ok_resp, ok_resp,
-            ok_resp,
-        ])
+        client._http.post = AsyncMock(
+            side_effect=[
+                ui_plus_400,
+                ok_resp,
+                ok_resp,
+                ui_plus_400,
+                ok_resp,
+                attach_ok,
+                ok_resp,
+                ok_resp,
+                ok_resp,
+                ok_resp,
+            ]
+        )
 
         old_session_id = client.session_id
         await client.set_break_on_next_statement()
@@ -692,18 +764,22 @@ class TestUiPlusRetry:
         # 400 UI+ (not just the original command). Wrapper must skip directly
         # to escalation, not re-raise.
         import httpx as _httpx
+
         await self._restore_real_post(client)
 
         ui_plus_400 = _httpx.Response(
-            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            400,
+            content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
             request=_httpx.Request("POST", "http://test/"),
         )
         attach_ok = _httpx.Response(
-            200, content=b"<root><result>registered</result></root>",
+            200,
+            content=b"<root><result>registered</result></root>",
             request=_httpx.Request("POST", "http://test/"),
         )
         ok_resp = _httpx.Response(
-            200, content=b"<root/>",
+            200,
+            content=b"<root/>",
             request=_httpx.Request("POST", "http://test/"),
         )
 
@@ -717,11 +793,18 @@ class TestUiPlusRetry:
         #   6. clearBreakOnNextStatement → 200
         #   7. setAutoAttachSettings → 200
         #   8. setBreakOnNextStatement final retry → 200 SUCCESS
-        client._http.post = AsyncMock(side_effect=[
-            ui_plus_400, ui_plus_400,
-            ok_resp, attach_ok, ok_resp, ok_resp, ok_resp,
-            ok_resp,
-        ])
+        client._http.post = AsyncMock(
+            side_effect=[
+                ui_plus_400,
+                ui_plus_400,
+                ok_resp,
+                attach_ok,
+                ok_resp,
+                ok_resp,
+                ok_resp,
+                ok_resp,
+            ]
+        )
 
         old_session_id = client.session_id
         await client.set_break_on_next_statement()
@@ -731,28 +814,40 @@ class TestUiPlusRetry:
     async def test_escalation_url_includes_attachDebugUI(self, client):
         # Verify the 6th call (after light handshake fail) uses attachDebugUI.
         import httpx as _httpx
+
         await self._restore_real_post(client)
 
         ui_plus_400 = _httpx.Response(
-            400, content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
+            400,
+            content="UI+ - часть отладки не зарегистрирована".encode("utf-8"),
             request=_httpx.Request("POST", "http://test/"),
         )
         attach_ok = _httpx.Response(
-            200, content=b"<root><result>registered</result></root>",
+            200,
+            content=b"<root><result>registered</result></root>",
             request=_httpx.Request("POST", "http://test/"),
         )
         ok_resp = _httpx.Response(
-            200, content=b"<root/>",
+            200,
+            content=b"<root/>",
             request=_httpx.Request("POST", "http://test/"),
         )
 
         client._http = MagicMock()
-        client._http.post = AsyncMock(side_effect=[
-            ui_plus_400, ok_resp, ok_resp,
-            ui_plus_400,
-            ok_resp, attach_ok, ok_resp, ok_resp, ok_resp,
-            ok_resp,
-        ])
+        client._http.post = AsyncMock(
+            side_effect=[
+                ui_plus_400,
+                ok_resp,
+                ok_resp,
+                ui_plus_400,
+                ok_resp,
+                attach_ok,
+                ok_resp,
+                ok_resp,
+                ok_resp,
+                ok_resp,
+            ]
+        )
         await client.set_break_on_next_statement()
         # Call #6 (index 5) must hit attachDebugUI — signals escalation reached re-attach.
         attach_call_url = client._http.post.await_args_list[5].args[0]
@@ -762,6 +857,7 @@ class TestUiPlusRetry:
 # ---------------------------------------------------------------------------
 # P2.4 Diagnostic methods (get_breakpoints, get_target_state)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestGetBreakpointsCache:
@@ -800,7 +896,9 @@ class TestGetBreakpointsCache:
     async def test_cache_returns_copy_not_reference(self, client):
         await client.set_breakpoints(
             module_type="CommonModule",
-            object_id=GOOD_UUID, property_id=ANOTHER_UUID, lines=[1],
+            object_id=GOOD_UUID,
+            property_id=ANOTHER_UUID,
+            lines=[1],
         )
         bps = await client.get_breakpoints()
         bps.clear()  # mutate returned list
@@ -811,7 +909,9 @@ class TestGetBreakpointsCache:
         # §6.1: version field propagates to XML body when non-empty
         await client.set_breakpoints(
             module_type="ConfigModule",
-            object_id=GOOD_UUID, property_id=ANOTHER_UUID, lines=[1],
+            object_id=GOOD_UUID,
+            property_id=ANOTHER_UUID,
+            lines=[1],
             version="1.0.42",
         )
         body = client._post.call_args.args[1]
@@ -822,7 +922,9 @@ class TestGetBreakpointsCache:
     async def test_set_breakpoints_empty_version_omits_xml(self, client):
         await client.set_breakpoints(
             module_type="CommonModule",
-            object_id=GOOD_UUID, property_id=ANOTHER_UUID, lines=[1],
+            object_id=GOOD_UUID,
+            property_id=ANOTHER_UUID,
+            lines=[1],
         )
         body = client._post.call_args.args[1]
         # Namespaced tag absent (note: XML declaration `<?xml version=...?>`
@@ -864,18 +966,22 @@ class TestGetTargetState:
 
     async def test_per_target_via_get_targets_filter(self, client):
         # When target_uuid given → filter through get_targets()
-        client.get_targets = AsyncMock(return_value=[
-            {"id": GOOD_UUID, "state": "StopOnNextLine", "userName": "Admin"},
-            {"id": ANOTHER_UUID, "state": "Worked"},
-        ])
+        client.get_targets = AsyncMock(
+            return_value=[
+                {"id": GOOD_UUID, "state": "StopOnNextLine", "userName": "Admin"},
+                {"id": ANOTHER_UUID, "state": "Worked"},
+            ]
+        )
         result = await client.get_target_state(target_uuid=GOOD_UUID)
         assert result["state"] == "StopOnNextLine"
         assert result["userName"] == "Admin"
 
     async def test_per_target_not_found(self, client):
-        client.get_targets = AsyncMock(return_value=[
-            {"id": ANOTHER_UUID, "state": "Worked"},
-        ])
+        client.get_targets = AsyncMock(
+            return_value=[
+                {"id": ANOTHER_UUID, "state": "Worked"},
+            ]
+        )
         result = await client.get_target_state(target_uuid=GOOD_UUID)
         assert result["_tag"] == "not_found"
         assert result["target_uuid"] == GOOD_UUID
@@ -889,6 +995,7 @@ class TestGetTargetState:
 # eval/step to fail post-BP-fire with HTTP 400 «UI+ - часть отладки не
 # зарегистрирована». Tests lock in the correct yukon39-spec body shapes.
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestInitSettingsHandshake:
@@ -938,10 +1045,19 @@ class TestSetAutoAttachSettings:
         cmd, body = client._post.await_args.args
         assert cmd == "setAutoAttachSettings"
         # Must include all 8 default types from P0.5 expansion
-        for t in ("Server", "ManagedClient", "HTTPService", "WEBService",
-                  "JOB", "JobFileMode", "COMConnector", "OData"):
-            assert f"<debugAutoAttach:targetType>{t}</debugAutoAttach:targetType>" in body, \
+        for t in (
+            "Server",
+            "ManagedClient",
+            "HTTPService",
+            "WEBService",
+            "JOB",
+            "JobFileMode",
+            "COMConnector",
+            "OData",
+        ):
+            assert f"<debugAutoAttach:targetType>{t}</debugAutoAttach:targetType>" in body, (
                 f"Missing targetType: {t}"
+            )
         # Anti-regression: must NOT route через cmd=initSettings (pre-fix bug)
         assert "breakOnNextLine" not in body
 
@@ -967,14 +1083,26 @@ class TestReapplyBPWorkspace:
     async def test_replays_cached_bps_as_single_setbreakpoints(self, client):
         # Seed cache with 2 BP entries (different modules)
         client._set_breakpoints_cache = [
-            {"module_type": "ManagerModule",
-             "object_id": "obj-1", "property_id": "prop-1",
-             "lines": [80], "ext_id": 0, "url": "",
-             "extension_name": "", "version": ""},
-            {"module_type": "CommonModule",
-             "object_id": "obj-2", "property_id": "prop-2",
-             "lines": [10, 20], "ext_id": 0, "url": "",
-             "extension_name": "", "version": ""},
+            {
+                "module_type": "ManagerModule",
+                "object_id": "obj-1",
+                "property_id": "prop-1",
+                "lines": [80],
+                "ext_id": 0,
+                "url": "",
+                "extension_name": "",
+                "version": "",
+            },
+            {
+                "module_type": "CommonModule",
+                "object_id": "obj-2",
+                "property_id": "prop-2",
+                "lines": [10, 20],
+                "ext_id": 0,
+                "url": "",
+                "extension_name": "",
+                "version": "",
+            },
         ]
         await client._reapply_bp_workspace()
         cmd, body = client._post.await_args.args
@@ -992,6 +1120,7 @@ class TestReapplyBPWorkspace:
 # ---------------------------------------------------------------------------
 # §6.3 Stale Debug UI session cleanup
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestCleanupStaleSession:
@@ -1012,7 +1141,8 @@ class TestCleanupStaleSession:
 
         # Verify detachDebugUI was called for the stale id
         detach_calls = [
-            call for call in client._post.call_args_list
+            call
+            for call in client._post.call_args_list
             if call.args and call.args[0] == "detachDebugUI"
         ]
         assert len(detach_calls) == 1
@@ -1024,7 +1154,8 @@ class TestCleanupStaleSession:
         client.get_debug_id = AsyncMock(return_value=client.session_id)
         await client._cleanup_stale_session()
         detach_calls = [
-            call for call in client._post.call_args_list
+            call
+            for call in client._post.call_args_list
             if call.args and call.args[0] == "detachDebugUI"
         ]
         assert len(detach_calls) == 0
@@ -1035,7 +1166,8 @@ class TestCleanupStaleSession:
         client.get_debug_id = AsyncMock(return_value=mds.ZERO_UUID)
         await client._cleanup_stale_session()
         detach_calls = [
-            call for call in client._post.call_args_list
+            call
+            for call in client._post.call_args_list
             if call.args and call.args[0] == "detachDebugUI"
         ]
         assert len(detach_calls) == 0
@@ -1061,21 +1193,22 @@ class TestCleanupStaleSession:
 # §12.7 — cluster_load probe + session_diff + scenario validation
 # ---------------------------------------------------------------------------
 
+
 class TestStaleDetection:
     """Fix A+D §12.9 — wrapper file mtime vs MCP startup timestamp."""
 
     def test_no_stale_when_file_unchanged(self, monkeypatch):
         # mtime <= _MODULE_LOADED_AT → no warning
         import os
-        monkeypatch.setattr(os.path, "getmtime",
-                             lambda p: mds._MODULE_LOADED_AT - 100)
+
+        monkeypatch.setattr(os.path, "getmtime", lambda p: mds._MODULE_LOADED_AT - 100)
         assert mds._get_stale_hint() is None
 
     def test_stale_detected_when_file_newer(self, monkeypatch):
         import os
+
         # Симулируем что файл был изменён ПОСЛЕ MCP startup
-        monkeypatch.setattr(os.path, "getmtime",
-                             lambda p: mds._MODULE_LOADED_AT + 60)
+        monkeypatch.setattr(os.path, "getmtime", lambda p: mds._MODULE_LOADED_AT + 60)
         hint = mds._get_stale_hint()
         assert hint is not None
         assert "/mcp reconnect" in hint
@@ -1083,7 +1216,10 @@ class TestStaleDetection:
 
     def test_oserror_returns_none_safe(self, monkeypatch):
         import os
-        def _boom(p): raise OSError("file gone")
+
+        def _boom(p):
+            raise OSError("file gone")
+
         monkeypatch.setattr(os.path, "getmtime", _boom)
         # Не raise, не блокирует — graceful None
         assert mds._get_stale_hint() is None
@@ -1102,8 +1238,7 @@ class TestStaleHintInResponses:
         assert "stale_warning" not in result
 
     async def test_health_check_includes_stale_warning(self, monkeypatch):
-        monkeypatch.setattr(mds, "_get_stale_hint",
-                             lambda: "Wrapper modified — reconnect please")
+        monkeypatch.setattr(mds, "_get_stale_hint", lambda: "Wrapper modified — reconnect please")
         monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
         mds._client = None
         raw = await mds.debug_health_check()
@@ -1113,6 +1248,7 @@ class TestStaleHintInResponses:
     async def test_session_summary_includes_stale_hint(self, monkeypatch):
         monkeypatch.setattr(mds, "_get_stale_hint", lambda: "stale-msg")
         from mcp_debug_server import RDBGClient
+
         c = RDBGClient(debug_url="http://test", infobase_alias="X")
         mds._client = c
         raw = await mds.debug_session_summary()
@@ -1121,15 +1257,23 @@ class TestStaleHintInResponses:
 
     async def test_session_diff_includes_stale_hint(self, monkeypatch):
         monkeypatch.setattr(mds, "_get_stale_hint", lambda: "stale-msg")
-        prev = {"session_id": "p1", "breakpoints": {}, "evaluations": {},
-                "ui_plus_retries": 0, "stop_events": []}
-        curr = {"session_id": "c1", "breakpoints": {}, "evaluations": {},
-                "ui_plus_retries": 0, "stop_events": []}
+        prev = {
+            "session_id": "p1",
+            "breakpoints": {},
+            "evaluations": {},
+            "ui_plus_retries": 0,
+            "stop_events": [],
+        }
+        curr = {
+            "session_id": "c1",
+            "breakpoints": {},
+            "evaluations": {},
+            "ui_plus_retries": 0,
+            "stop_events": [],
+        }
         store = {"p1": prev, "c1": curr}
-        monkeypatch.setattr(mds, "_load_session_summary",
-                             lambda sid: store.get(sid))
-        raw = await mds.debug_session_diff(prev_session_id="p1",
-                                            curr_session_id="c1")
+        monkeypatch.setattr(mds, "_load_session_summary", lambda sid: store.get(sid))
+        raw = await mds.debug_session_diff(prev_session_id="p1", curr_session_id="c1")
         result = json.loads(raw)
         assert result["_stale_hint"] == "stale-msg"
 
@@ -1146,10 +1290,13 @@ class TestClusterLoadProbe:
     def test_low_load_returns_pass(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda *a: "cuuid")
-        fake = MagicMock(returncode=0, stdout=(
-            "process : aaa\npid : 100\nconnections : 3\n"
-            "process : bbb\npid : 200\nconnections : 5\n"
-        ))
+        fake = MagicMock(
+            returncode=0,
+            stdout=(
+                "process : aaa\npid : 100\nconnections : 3\n"
+                "process : bbb\npid : 200\nconnections : 5\n"
+            ),
+        )
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         monkeypatch.delenv("BSL_DEBUG_CONN_THRESHOLD", raising=False)
         result = mds._hc_probe_cluster_load()
@@ -1159,10 +1306,13 @@ class TestClusterLoadProbe:
     def test_high_load_returns_warn_with_pids(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda *a: "cuuid")
-        fake = MagicMock(returncode=0, stdout=(
-            "process : aaa\npid : 100\nconnections : 25\n"
-            "process : bbb\npid : 200\nconnections : 3\n"
-        ))
+        fake = MagicMock(
+            returncode=0,
+            stdout=(
+                "process : aaa\npid : 100\nconnections : 25\n"
+                "process : bbb\npid : 200\nconnections : 3\n"
+            ),
+        )
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._hc_probe_cluster_load()
         assert result["status"] == "warn"
@@ -1173,9 +1323,7 @@ class TestClusterLoadProbe:
     def test_threshold_via_env_var(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda *a: "cuuid")
-        fake = MagicMock(returncode=0, stdout=(
-            "process : aaa\npid : 100\nconnections : 5\n"
-        ))
+        fake = MagicMock(returncode=0, stdout=("process : aaa\npid : 100\nconnections : 5\n"))
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         monkeypatch.setenv("BSL_DEBUG_CONN_THRESHOLD", "3")  # threshold ниже 5
         result = mds._hc_probe_cluster_load()
@@ -1186,14 +1334,19 @@ class TestClusterLoadProbe:
 class TestSessionDiff:
     """L3 §12.7 — cross-session diff для regression detection."""
 
-    def _summary(self, sid: str, fired: int, evals: int = 0,
-                 failures: int = 0, ui_retries: int = 0) -> dict:
+    def _summary(
+        self, sid: str, fired: int, evals: int = 0, failures: int = 0, ui_retries: int = 0
+    ) -> dict:
         return {
             "session_id": sid,
             "started_at": "2026-05-10T10:00:00",
             "infobase_alias": "X",
-            "breakpoints": {"set_count": 3, "fire_count": fired,
-                             "by_location": {}, "fire_rate": fired / 3},
+            "breakpoints": {
+                "set_count": 3,
+                "fire_count": fired,
+                "by_location": {},
+                "fire_rate": fired / 3,
+            },
             "evaluations": {"count": evals, "failures": failures, "errors": []},
             "ui_plus_retries": ui_retries,
             "recycle": {"force_invoked": False, "method_used": None},
@@ -1243,10 +1396,8 @@ class TestSessionDiff:
         prev = self._summary("p1", fired=3)
         curr = self._summary("c1", fired=2)
         store = {"p1": prev, "c1": curr}
-        monkeypatch.setattr(mds, "_load_session_summary",
-                            lambda sid: store.get(sid))
-        raw = await mds.debug_session_diff(prev_session_id="p1",
-                                            curr_session_id="c1")
+        monkeypatch.setattr(mds, "_load_session_summary", lambda sid: store.get(sid))
+        raw = await mds.debug_session_diff(prev_session_id="p1", curr_session_id="c1")
         result = json.loads(raw)
         assert result["verdict"] == "REGRESSION"
         assert result["prev_session"] == "p1"
@@ -1257,19 +1408,28 @@ class TestSessionDiff:
 # §12 Level 1 — debug_health_check probes + tool
 # ---------------------------------------------------------------------------
 
+
 class TestHealthCheckProbes:
     """Pure probe helpers — mocked subprocess + socket layers."""
 
     def test_dbgs_port_probe_pass_when_listening(self, monkeypatch):
         # Mock socket.connect → success (no exception)
         import socket
+
         captured = {}
 
         class FakeSocket:
-            def __init__(self, family, type_): captured["init"] = True
-            def settimeout(self, t): pass
-            def connect(self, addr): captured["addr"] = addr
-            def close(self): pass
+            def __init__(self, family, type_):
+                captured["init"] = True
+
+            def settimeout(self, t):
+                pass
+
+            def connect(self, addr):
+                captured["addr"] = addr
+
+            def close(self):
+                pass
 
         monkeypatch.setattr(socket, "socket", FakeSocket)
         result = mds._hc_probe_dbgs_port("localhost", 1550)
@@ -1280,10 +1440,17 @@ class TestHealthCheckProbes:
         import socket
 
         class FakeSocket:
-            def __init__(self, *a): pass
-            def settimeout(self, t): pass
-            def connect(self, addr): raise ConnectionRefusedError("nope")
-            def close(self): pass
+            def __init__(self, *a):
+                pass
+
+            def settimeout(self, t):
+                pass
+
+            def connect(self, addr):
+                raise ConnectionRefusedError("nope")
+
+            def close(self):
+                pass
 
         monkeypatch.setattr(socket, "socket", FakeSocket)
         result = mds._hc_probe_dbgs_port()
@@ -1292,17 +1459,18 @@ class TestHealthCheckProbes:
 
     def test_ragent_debug_flag_pass_when_both_present(self, monkeypatch):
         monkeypatch.setattr(mds.sys, "platform", "win32")
-        fake = MagicMock(returncode=0,
-                         stdout='"path\\to\\ragent.exe" -srvc -agent -debug -http -d "..."',
-                         stderr="")
+        fake = MagicMock(
+            returncode=0,
+            stdout='"path\\to\\ragent.exe" -srvc -agent -debug -http -d "..."',
+            stderr="",
+        )
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._hc_probe_ragent_debug_flag()
         assert result["status"] == "pass"
 
     def test_ragent_debug_flag_fail_when_missing(self, monkeypatch):
         monkeypatch.setattr(mds.sys, "platform", "win32")
-        fake = MagicMock(returncode=0,
-                         stdout='"path\\to\\ragent.exe" -srvc -agent', stderr="")
+        fake = MagicMock(returncode=0, stdout='"path\\to\\ragent.exe" -srvc -agent', stderr="")
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._hc_probe_ragent_debug_flag()
         assert result["status"] == "fail"
@@ -1320,9 +1488,11 @@ class TestHealthCheckProbes:
         assert result["status"] == "pass"
 
     def test_rphost_baseline_warn_when_pre_existing(self, monkeypatch):
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 100, "name": "rphost.exe"},
-                                     {"pid": 200, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds,
+            "detect_pre_existing_rphosts",
+            lambda: [{"pid": 100, "name": "rphost.exe"}, {"pid": 200, "name": "rphost.exe"}],
+        )
         result = mds._hc_probe_rphost_baseline()
         assert result["status"] == "warn"
         assert "100" in result["detail"] and "200" in result["detail"]
@@ -1330,8 +1500,9 @@ class TestHealthCheckProbes:
 
     def test_rac_available_pass_with_cluster(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "C:/fake/rac.exe")
-        monkeypatch.setattr(mds, "_rac_get_cluster_uuid",
-                            lambda *a: "11111111-2222-3333-4444-555555555555")
+        monkeypatch.setattr(
+            mds, "_rac_get_cluster_uuid", lambda *a: "11111111-2222-3333-4444-555555555555"
+        )
         result = mds._hc_probe_rac_available()
         assert result["status"] == "pass"
         assert "11111111" in result["detail"]
@@ -1353,18 +1524,14 @@ class TestHealthCheckProbes:
 
     def test_sddl_au_grant_pass_when_present(self, monkeypatch):
         monkeypatch.setattr(mds.sys, "platform", "win32")
-        fake = MagicMock(returncode=0,
-                         stdout="D:(A;;LCSWRPWPCR;;;AU)(A;;CCDC;;;BA)",
-                         stderr="")
+        fake = MagicMock(returncode=0, stdout="D:(A;;LCSWRPWPCR;;;AU)(A;;CCDC;;;BA)", stderr="")
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._hc_probe_sddl_au_grant()
         assert result["status"] == "pass"
 
     def test_sddl_au_grant_warn_without_au(self, monkeypatch):
         monkeypatch.setattr(mds.sys, "platform", "win32")
-        fake = MagicMock(returncode=0,
-                         stdout="D:(A;;CCDC;;;BA)(A;;CCDC;;;SY)",
-                         stderr="")
+        fake = MagicMock(returncode=0, stdout="D:(A;;CCDC;;;BA)(A;;CCDC;;;SY)", stderr="")
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._hc_probe_sddl_au_grant()
         assert result["status"] == "warn"
@@ -1416,11 +1583,15 @@ class TestDebugHealthCheckTool:
 
     async def test_probe_mode_returns_structured_json(self, monkeypatch):
         # Mock all probes to known-good
-        monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {
-            "dbgs_port_1550": {"status": "pass", "detail": "ok"},
-            "rphost_count_baseline": {"status": "pass", "detail": "no rphost"},
-            "env_vars": {"_extras": {"BSL_DEBUG_ALLOW_SERVICE_RESTART": False}},
-        })
+        monkeypatch.setattr(
+            mds,
+            "_hc_collect_checks",
+            lambda c: {
+                "dbgs_port_1550": {"status": "pass", "detail": "ok"},
+                "rphost_count_baseline": {"status": "pass", "detail": "no rphost"},
+                "env_vars": {"_extras": {"BSL_DEBUG_ALLOW_SERVICE_RESTART": False}},
+            },
+        )
         mds._client = None
         raw = await mds.debug_health_check()
         result = json.loads(raw)
@@ -1441,24 +1612,26 @@ class TestDebugHealthCheckTool:
     async def test_prepare_rejects_non_whitelisted_actions(self, monkeypatch):
         monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
         mds._client = None
-        raw = await mds.debug_health_check(mode="prepare",
-                                            actions=["modify-sddl"])
+        raw = await mds.debug_health_check(mode="prepare", actions=["modify-sddl"])
         result = json.loads(raw)
         # action rejected, not in whitelist
-        assert any("rejected" in a.get("result", "")
-                   for a in result["actions_executed"])
+        assert any("rejected" in a.get("result", "") for a in result["actions_executed"])
 
     async def test_prepare_kill_stale_calls_recycle(self, monkeypatch):
         monkeypatch.setattr(mds, "_hc_collect_checks", lambda c: {})
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 999, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds, "detect_pre_existing_rphosts", lambda: [{"pid": 999, "name": "rphost.exe"}]
+        )
         called = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids: called.append(pids) or
-                            {"killed": pids, "failed": [], "method": "rac.turn_off"})
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids: (
+                called.append(pids) or {"killed": pids, "failed": [], "method": "rac.turn_off"}
+            ),
+        )
         mds._client = None
-        raw = await mds.debug_health_check(mode="prepare",
-                                            actions=["kill-stale-rphosts"])
+        raw = await mds.debug_health_check(mode="prepare", actions=["kill-stale-rphosts"])
         result = json.loads(raw)
         assert called == [[999]]
         assert result["actions_executed"][0]["action"] == "kill-stale-rphosts"
@@ -1467,6 +1640,7 @@ class TestDebugHealthCheckTool:
 # ---------------------------------------------------------------------------
 # §12.3 Level 3 — debug_session_summary metrics
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestSessionSummary:
@@ -1480,6 +1654,7 @@ class TestSessionSummary:
 
     async def test_summary_returns_structure(self, monkeypatch):
         from mcp_debug_server import RDBGClient
+
         c = RDBGClient(debug_url="http://test", infobase_alias="X")
         mds._client = c
         raw = await mds.debug_session_summary()
@@ -1495,6 +1670,7 @@ class TestSessionSummary:
 
     async def test_summary_counts_set_breakpoints(self, monkeypatch):
         from mcp_debug_server import RDBGClient
+
         c = RDBGClient(debug_url="http://test", infobase_alias="X")
 
         async def _fake_post(cmd, body, **kw):
@@ -1511,6 +1687,7 @@ class TestSessionSummary:
 
     async def test_markdown_format_renders(self, monkeypatch):
         from mcp_debug_server import RDBGClient
+
         c = RDBGClient(debug_url="http://test", infobase_alias="X")
         mds._client = c
         raw = await mds.debug_session_summary(format="markdown")
@@ -1521,6 +1698,7 @@ class TestSessionSummary:
 
     async def test_eval_count_increments(self, monkeypatch):
         from mcp_debug_server import RDBGClient
+
         c = RDBGClient(debug_url="http://test", infobase_alias="X")
         c._stopped_targets.add("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         c._last_stopped_target_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -1543,14 +1721,20 @@ class TestSessionSummary:
 # Fix #5 (live finding 2026-05-10) — BP aggregation across modules
 # ---------------------------------------------------------------------------
 
+
 class TestAggregateBreakpoints:
     """Pure helper: merge cached BPs + new entry into per-module groups."""
 
     def _entry(self, oid, pid, lines, mt="ConfigModule"):
         return {
-            "module_type": mt, "object_id": oid, "property_id": pid,
+            "module_type": mt,
+            "object_id": oid,
+            "property_id": pid,
             "lines": list(lines),
-            "ext_id": 0, "url": "", "extension_name": "", "version": "",
+            "ext_id": 0,
+            "url": "",
+            "extension_name": "",
+            "version": "",
         }
 
     def test_empty_cache_single_entry(self):
@@ -1600,6 +1784,7 @@ class TestSetBreakpointsAggregation:
     @pytest.fixture
     def client_mock_post(self, monkeypatch):
         from mcp_debug_server import RDBGClient
+
         c = RDBGClient(debug_url="http://test", infobase_alias="X")
         captured = []
 
@@ -1650,6 +1835,7 @@ class TestSetBreakpointsAggregation:
 # ---------------------------------------------------------------------------
 # §11 Roadmap Solutions A/B — pre-existing rphost detection + force-recycle
 # ---------------------------------------------------------------------------
+
 
 class TestDetectPreExistingRphosts:
     """Solution B preflight detection (module-level helper, no client)."""
@@ -1718,7 +1904,8 @@ class TestForceRecycleRphost:
         # Should NOT call subprocess at all
         called = []
         monkeypatch.setattr(
-            mds.subprocess, "run",
+            mds.subprocess,
+            "run",
             lambda *a, **kw: called.append(a) or MagicMock(returncode=0),
         )
         result = mds.force_recycle_rphost_processes([])
@@ -1744,8 +1931,7 @@ class TestForceRecycleRphost:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 return MagicMock(returncode=0, stdout="ok", stderr="")
-            return MagicMock(returncode=128,
-                             stdout="", stderr="ERROR: not found")
+            return MagicMock(returncode=128, stdout="", stderr="ERROR: not found")
 
         monkeypatch.setattr(mds.subprocess, "run", _run)
         result = mds.force_recycle_rphost_processes([100, 200])
@@ -1770,9 +1956,9 @@ class TestForceRecycleRphost:
         # Fix #4 §12.8: dry_run mode для preview без destructive ops
         monkeypatch.setattr(mds.sys, "platform", "win32")
         called = []
-        monkeypatch.setattr(mds.subprocess, "run",
-                            lambda *a, **kw: called.append(a) or
-                            MagicMock(returncode=0))
+        monkeypatch.setattr(
+            mds.subprocess, "run", lambda *a, **kw: called.append(a) or MagicMock(returncode=0)
+        )
         result = mds.force_recycle_rphost_processes([100, 200], dry_run=True)
         assert result["method"] == "dry_run"
         assert result["would_kill"] == [100, 200]
@@ -1803,17 +1989,20 @@ class TestRacRecycle:
             call_log.append(args)
             cmd = args[1] if len(args) > 1 else ""
             if cmd == "cluster":
-                return MagicMock(returncode=0, stdout=(
-                    "cluster : 11111111-2222-3333-4444-555555555555\n"
-                    "host : LAB\n"
-                ))
+                return MagicMock(
+                    returncode=0,
+                    stdout=("cluster : 11111111-2222-3333-4444-555555555555\nhost : LAB\n"),
+                )
             if cmd == "process" and "list" in args:
-                return MagicMock(returncode=0, stdout=(
-                    "process : aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee\n"
-                    "pid : 100\n"
-                    "process : ffff2222-bbbb-cccc-dddd-eeeeeeeeeeee\n"
-                    "pid : 200\n"
-                ))
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        "process : aaaa1111-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+                        "pid : 100\n"
+                        "process : ffff2222-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+                        "pid : 200\n"
+                    ),
+                )
             # turn-off
             return MagicMock(returncode=0, stdout="", stderr="")
 
@@ -1828,10 +2017,10 @@ class TestRacRecycle:
     def test_rac_unknown_pid_recorded_as_failed(self, monkeypatch):
         monkeypatch.setattr(mds.sys, "platform", "win32")
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "C:/fake/rac.exe")
-        monkeypatch.setattr(mds, "_rac_get_cluster_uuid",
-                            lambda *a: "11111111-2222-3333-4444-555555555555")
-        monkeypatch.setattr(mds, "_rac_list_processes_by_pid",
-                            lambda *a: {})  # no PIDs found
+        monkeypatch.setattr(
+            mds, "_rac_get_cluster_uuid", lambda *a: "11111111-2222-3333-4444-555555555555"
+        )
+        monkeypatch.setattr(mds, "_rac_list_processes_by_pid", lambda *a: {})  # no PIDs found
         result = mds.force_recycle_rphost_processes([999])
         assert result["killed"] == []
         assert result["method"] == "rac.turn_off"
@@ -1854,11 +2043,14 @@ class TestRacRecycle:
         assert mds._find_rac_exe() is None
 
     def test_rac_get_cluster_uuid_parses_first_uuid(self, monkeypatch):
-        fake = MagicMock(returncode=0, stdout=(
-            "cluster                                   : abcd1234-5678-90ab-cdef-1234567890ab\n"
-            "host                                      : LAB\n"
-            "port                                      : 1541\n"
-        ))
+        fake = MagicMock(
+            returncode=0,
+            stdout=(
+                "cluster                                   : abcd1234-5678-90ab-cdef-1234567890ab\n"
+                "host                                      : LAB\n"
+                "port                                      : 1541\n"
+            ),
+        )
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._rac_get_cluster_uuid("/fake/rac")
         assert result == "abcd1234-5678-90ab-cdef-1234567890ab"
@@ -1877,7 +2069,8 @@ class TestRacRecycle:
         monkeypatch.setenv("RAC_CLUSTER_USER", "Admin")
         monkeypatch.setenv("RAC_CLUSTER_PWD", "secret123")
         assert mds._rac_auth_args() == [
-            "--cluster-user=Admin", "--cluster-pwd=secret123",
+            "--cluster-user=Admin",
+            "--cluster-pwd=secret123",
         ]
 
     def test_rac_auth_args_user_only(self, monkeypatch):
@@ -1906,8 +2099,7 @@ class TestRacRecycle:
     def test_service_restart_failure_records_per_pid_error(self, monkeypatch):
         monkeypatch.setattr(mds.sys, "platform", "win32")
         monkeypatch.setenv("BSL_DEBUG_ALLOW_SERVICE_RESTART", "true")
-        fake = MagicMock(returncode=1, stdout="",
-                         stderr="Cannot open service. Access denied.")
+        fake = MagicMock(returncode=1, stdout="", stderr="Cannot open service. Access denied.")
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._recycle_via_service([42, 99])
         assert result["killed"] == []
@@ -1936,8 +2128,7 @@ class TestRacRecycle:
             return MagicMock(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(mds.subprocess, "run", _run)
-        mds._recycle_via_rac("/fake/rac", "C-UUID", [42],
-                             {42: "P-UUID"})
+        mds._recycle_via_rac("/fake/rac", "C-UUID", [42], {42: "P-UUID"})
         assert captured, "subprocess.run was not called"
         cmd = captured[0]
         assert "--cluster-user=Admin" in cmd
@@ -1945,14 +2136,17 @@ class TestRacRecycle:
         assert "turn-off" in cmd
 
     def test_rac_list_processes_by_pid_parses_blocks(self, monkeypatch):
-        fake = MagicMock(returncode=0, stdout=(
-            "process              : aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n"
-            "host                 : LAB\n"
-            "pid                  : 12345\n"
-            "use                  : used\n"
-            "process              : ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee\n"
-            "pid                  : 67890\n"
-        ))
+        fake = MagicMock(
+            returncode=0,
+            stdout=(
+                "process              : aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+                "host                 : LAB\n"
+                "pid                  : 12345\n"
+                "use                  : used\n"
+                "process              : ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee\n"
+                "pid                  : 67890\n"
+            ),
+        )
         monkeypatch.setattr(mds.subprocess, "run", lambda *a, **kw: fake)
         result = mds._rac_list_processes_by_pid("/fake/rac", "cluster-uuid")
         assert result == {
@@ -1969,20 +2163,38 @@ class TestDebugConnectPreflight:
         """Wire RDBGClient methods to in-memory fakes; return captured kills."""
         from mcp_debug_server import RDBGClient
 
-        async def _api_version(self): return "8.3.27"
-        async def _debug_id(self): return mds.ZERO_UUID
+        async def _api_version(self):
+            return "8.3.27"
+
+        async def _debug_id(self):
+            return mds.ZERO_UUID
+
         async def _attach(self, cleanup_stale=True):
             self._attached = True
             self._registered = registered
-            return {"result": "registered" if registered else "ibInDebug",
-                    "session_id": self.session_id,
-                    "fully_registered": registered}
-        async def _init_settings(self): return None
-        async def _clear_bons(self): return None
-        async def _set_aas(self, **kw): return None
-        async def _targets(self): return []
-        async def _attach_targets(self, ids, attach=True): return True
-        async def _close(self): pass
+            return {
+                "result": "registered" if registered else "ibInDebug",
+                "session_id": self.session_id,
+                "fully_registered": registered,
+            }
+
+        async def _init_settings(self):
+            return None
+
+        async def _clear_bons(self):
+            return None
+
+        async def _set_aas(self, **kw):
+            return None
+
+        async def _targets(self):
+            return []
+
+        async def _attach_targets(self, ids, attach=True):
+            return True
+
+        async def _close(self):
+            pass
 
         monkeypatch.setattr(RDBGClient, "get_api_version", _api_version)
         monkeypatch.setattr(RDBGClient, "get_debug_id", _debug_id)
@@ -1996,9 +2208,11 @@ class TestDebugConnectPreflight:
 
         # Roadmap 260511 §3.1: mock alias validation → skipped (rac unreachable
         # in unit-test env) so tests using arbitrary aliases like "X" proceed.
-        monkeypatch.setattr(mds, "_validate_infobase_alias",
-                            lambda alias: {"status": "skipped",
-                                           "reason": "rac_exe_not_found"})
+        monkeypatch.setattr(
+            mds,
+            "_validate_infobase_alias",
+            lambda alias: {"status": "skipped", "reason": "rac_exe_not_found"},
+        )
 
         # Reset the module-level singleton so every test starts cold
         mds._client = None
@@ -2007,11 +2221,16 @@ class TestDebugConnectPreflight:
         await self._setup_client_mocks(monkeypatch)
         monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
         kill_calls = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids: kill_calls.append(pids) or
-                            {"killed": [], "failed": []})
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids: kill_calls.append(pids) or {"killed": [], "failed": []},
+        )
+
         # Skip the 3-second sleep
-        async def _no_sleep(_): return None
+        async def _no_sleep(_):
+            return None
+
         monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
 
         raw = await mds.debug_connect(infobase_alias="X")
@@ -2023,13 +2242,19 @@ class TestDebugConnectPreflight:
 
     async def test_pre_existing_no_force_emits_warning(self, monkeypatch):
         await self._setup_client_mocks(monkeypatch)
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 999, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds, "detect_pre_existing_rphosts", lambda: [{"pid": 999, "name": "rphost.exe"}]
+        )
         kill_calls = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids: kill_calls.append(pids) or
-                            {"killed": [], "failed": []})
-        async def _no_sleep(_): return None
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids: kill_calls.append(pids) or {"killed": [], "failed": []},
+        )
+
+        async def _no_sleep(_):
+            return None
+
         monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
 
         raw = await mds.debug_connect(infobase_alias="X")
@@ -2045,9 +2270,11 @@ class TestDebugConnectPreflight:
 
     async def test_force_recycle_invokes_kill(self, monkeypatch):
         await self._setup_client_mocks(monkeypatch)
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 111, "name": "rphost.exe"},
-                                     {"pid": 222, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds,
+            "detect_pre_existing_rphosts",
+            lambda: [{"pid": 111, "name": "rphost.exe"}, {"pid": 222, "name": "rphost.exe"}],
+        )
         kill_calls = []
 
         def _kill(pids, **kw):
@@ -2056,13 +2283,13 @@ class TestDebugConnectPreflight:
 
         monkeypatch.setattr(mds, "force_recycle_rphost_processes", _kill)
         slept = []
+
         async def _record_sleep(secs):
             slept.append(secs)
 
         monkeypatch.setattr(mds.asyncio, "sleep", _record_sleep)
 
-        raw = await mds.debug_connect(infobase_alias="X",
-                                         force_recycle_rphost=True)
+        raw = await mds.debug_connect(infobase_alias="X", force_recycle_rphost=True)
         result = json.loads(raw)
         assert kill_calls == [[111, 222]]
         # Wait happened (should be ~3s for ragent to spawn fresh worker)
@@ -2078,17 +2305,22 @@ class TestDebugConnectPreflight:
     async def test_force_recycle_skipped_when_not_registered(self, monkeypatch):
         # ibInDebug → _registered=False → recycle MUST NOT happen (filter not pushed)
         await self._setup_client_mocks(monkeypatch, registered=False)
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 333, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds, "detect_pre_existing_rphosts", lambda: [{"pid": 333, "name": "rphost.exe"}]
+        )
         kill_calls = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids: kill_calls.append(pids) or
-                            {"killed": [], "failed": []})
-        async def _no_sleep(_): return None
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids: kill_calls.append(pids) or {"killed": [], "failed": []},
+        )
+
+        async def _no_sleep(_):
+            return None
+
         monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
 
-        raw = await mds.debug_connect(infobase_alias="X",
-                                         force_recycle_rphost=True)
+        raw = await mds.debug_connect(infobase_alias="X", force_recycle_rphost=True)
         result = json.loads(raw)
         assert kill_calls == []  # registered=False guard works
         assert "force_recycle" not in result
@@ -2097,6 +2329,7 @@ class TestDebugConnectPreflight:
 # ---------------------------------------------------------------------------
 # Roadmap 260511 §3.1 + §3.2: infobase alias validation + recycle_strategy
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestInfobaseAliasValidation:
@@ -2107,20 +2340,38 @@ class TestInfobaseAliasValidation:
         дефолтного alias-validation mock — каждый тест ставит свой."""
         from mcp_debug_server import RDBGClient
 
-        async def _api_version(self): return "8.3.27"
-        async def _debug_id(self): return mds.ZERO_UUID
+        async def _api_version(self):
+            return "8.3.27"
+
+        async def _debug_id(self):
+            return mds.ZERO_UUID
+
         async def _attach(self, cleanup_stale=True):
             self._attached = True
             self._registered = registered
-            return {"result": "registered" if registered else "ibInDebug",
-                    "session_id": self.session_id,
-                    "fully_registered": registered}
-        async def _init_settings(self): return None
-        async def _clear_bons(self): return None
-        async def _set_aas(self, **kw): return None
-        async def _targets(self): return []
-        async def _attach_targets(self, ids, attach=True): return True
-        async def _close(self): pass
+            return {
+                "result": "registered" if registered else "ibInDebug",
+                "session_id": self.session_id,
+                "fully_registered": registered,
+            }
+
+        async def _init_settings(self):
+            return None
+
+        async def _clear_bons(self):
+            return None
+
+        async def _set_aas(self, **kw):
+            return None
+
+        async def _targets(self):
+            return []
+
+        async def _attach_targets(self, ids, attach=True):
+            return True
+
+        async def _close(self):
+            pass
 
         monkeypatch.setattr(RDBGClient, "get_api_version", _api_version)
         monkeypatch.setattr(RDBGClient, "get_debug_id", _debug_id)
@@ -2132,15 +2383,20 @@ class TestInfobaseAliasValidation:
         monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach_targets)
         monkeypatch.setattr(RDBGClient, "close", _close)
         monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
-        async def _no_sleep(_): return None
+
+        async def _no_sleep(_):
+            return None
+
         monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
         mds._client = None
 
     async def test_alias_valid_proceeds_to_connect(self, monkeypatch):
         await self._setup(monkeypatch)
-        monkeypatch.setattr(mds, "_validate_infobase_alias",
-                            lambda a: {"status": "valid", "uuid": "uuid-1",
-                                       "name": a})
+        monkeypatch.setattr(
+            mds,
+            "_validate_infobase_alias",
+            lambda a: {"status": "valid", "uuid": "uuid-1", "name": a},
+        )
         raw = await mds.debug_connect(infobase_alias="ИБTransport")
         result = json.loads(raw)
         assert result["status"] == "connected"
@@ -2148,9 +2404,11 @@ class TestInfobaseAliasValidation:
 
     async def test_alias_invalid_blocks_with_available_list(self, monkeypatch):
         await self._setup(monkeypatch)
-        monkeypatch.setattr(mds, "_validate_infobase_alias",
-                            lambda a: {"status": "invalid",
-                                       "available": ["ИБReal", "DevBase"]})
+        monkeypatch.setattr(
+            mds,
+            "_validate_infobase_alias",
+            lambda a: {"status": "invalid", "available": ["ИБReal", "DevBase"]},
+        )
         raw = await mds.debug_connect(infobase_alias="WrongAlias")
         result = json.loads(raw)
         assert result["status"] == "error"
@@ -2162,9 +2420,11 @@ class TestInfobaseAliasValidation:
     async def test_alias_skipped_proceeds_to_connect(self, monkeypatch):
         # rac.exe not found / cluster unreachable → skipped, не блокирует
         await self._setup(monkeypatch)
-        monkeypatch.setattr(mds, "_validate_infobase_alias",
-                            lambda a: {"status": "skipped",
-                                       "reason": "rac_exe_not_found"})
+        monkeypatch.setattr(
+            mds,
+            "_validate_infobase_alias",
+            lambda a: {"status": "skipped", "reason": "rac_exe_not_found"},
+        )
         raw = await mds.debug_connect(infobase_alias="X")
         result = json.loads(raw)
         assert result["status"] == "connected"
@@ -2177,48 +2437,73 @@ class TestRecycleStrategy:
 
     async def _setup(self, monkeypatch, alias_validation=None, registered=True):
         from mcp_debug_server import RDBGClient
-        async def _api_version(self): return "8.3.27"
-        async def _debug_id(self): return mds.ZERO_UUID
+
+        async def _api_version(self):
+            return "8.3.27"
+
+        async def _debug_id(self):
+            return mds.ZERO_UUID
+
         async def _attach(self, cleanup_stale=True):
             self._attached = True
             self._registered = registered
-            return {"result": "registered" if registered else "ibInDebug",
-                    "session_id": self.session_id,
-                    "fully_registered": registered}
-        async def _init_settings(self): return None
-        async def _clear_bons(self): return None
-        async def _set_aas(self, **kw): return None
-        async def _targets(self): return []
-        async def _attach_targets(self, ids, attach=True): return True
-        async def _close(self): pass
-        for name, fn in (("get_api_version", _api_version),
-                         ("get_debug_id", _debug_id),
-                         ("attach", _attach),
-                         ("init_settings", _init_settings),
-                         ("clear_break_on_next_statement", _clear_bons),
-                         ("set_auto_attach_settings", _set_aas),
-                         ("get_targets", _targets),
-                         ("attach_debug_targets", _attach_targets),
-                         ("close", _close)):
+            return {
+                "result": "registered" if registered else "ibInDebug",
+                "session_id": self.session_id,
+                "fully_registered": registered,
+            }
+
+        async def _init_settings(self):
+            return None
+
+        async def _clear_bons(self):
+            return None
+
+        async def _set_aas(self, **kw):
+            return None
+
+        async def _targets(self):
+            return []
+
+        async def _attach_targets(self, ids, attach=True):
+            return True
+
+        async def _close(self):
+            pass
+
+        for name, fn in (
+            ("get_api_version", _api_version),
+            ("get_debug_id", _debug_id),
+            ("attach", _attach),
+            ("init_settings", _init_settings),
+            ("clear_break_on_next_statement", _clear_bons),
+            ("set_auto_attach_settings", _set_aas),
+            ("get_targets", _targets),
+            ("attach_debug_targets", _attach_targets),
+            ("close", _close),
+        ):
             monkeypatch.setattr(RDBGClient, name, fn)
-        async def _no_sleep(_): return None
+
+        async def _no_sleep(_):
+            return None
+
         monkeypatch.setattr(mds.asyncio, "sleep", _no_sleep)
-        validation = alias_validation or {"status": "skipped",
-                                          "reason": "rac_exe_not_found"}
-        monkeypatch.setattr(mds, "_validate_infobase_alias",
-                            lambda a: validation)
+        validation = alias_validation or {"status": "skipped", "reason": "rac_exe_not_found"}
+        monkeypatch.setattr(mds, "_validate_infobase_alias", lambda a: validation)
         mds._client = None
 
     async def test_default_auto_no_force_means_none(self, monkeypatch):
         # auto + force_recycle_rphost=False → recycle_strategy resolved to "none"
         await self._setup(monkeypatch)
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 100, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds, "detect_pre_existing_rphosts", lambda: [{"pid": 100, "name": "rphost.exe"}]
+        )
         kill_calls = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids, dry_run=False:
-                            kill_calls.append(pids) or
-                            {"killed": [], "failed": []})
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids, dry_run=False: kill_calls.append(pids) or {"killed": [], "failed": []},
+        )
         raw = await mds.debug_connect(infobase_alias="X")
         result = json.loads(raw)
         assert kill_calls == []  # "none" → no kill
@@ -2228,50 +2513,54 @@ class TestRecycleStrategy:
     async def test_backward_compat_force_recycle_true(self, monkeypatch):
         # auto + force_recycle_rphost=True → resolves to "pre_existing"
         await self._setup(monkeypatch)
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 100, "name": "rphost.exe"},
-                                     {"pid": 200, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds,
+            "detect_pre_existing_rphosts",
+            lambda: [{"pid": 100, "name": "rphost.exe"}, {"pid": 200, "name": "rphost.exe"}],
+        )
         kill_calls = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids, dry_run=False:
-                            kill_calls.append(pids) or
-                            {"killed": list(pids), "failed": []})
-        raw = await mds.debug_connect(infobase_alias="X",
-                                       force_recycle_rphost=True)
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids, dry_run=False: (
+                kill_calls.append(pids) or {"killed": list(pids), "failed": []}
+            ),
+        )
+        raw = await mds.debug_connect(infobase_alias="X", force_recycle_rphost=True)
         result = json.loads(raw)
         assert kill_calls == [[100, 200]]
         assert result["force_recycle"]["strategy"] == "pre_existing"
 
     async def test_all_rphosts_of_ib_requires_valid_alias(self, monkeypatch):
         # strategy=all_rphosts_of_ib + alias=skipped → returns error
-        await self._setup(monkeypatch,
-                          alias_validation={"status": "skipped",
-                                            "reason": "rac_exe_not_found"})
-        raw = await mds.debug_connect(infobase_alias="X",
-                                       recycle_strategy="all_rphosts_of_ib")
+        await self._setup(
+            monkeypatch, alias_validation={"status": "skipped", "reason": "rac_exe_not_found"}
+        )
+        raw = await mds.debug_connect(infobase_alias="X", recycle_strategy="all_rphosts_of_ib")
         result = json.loads(raw)
         assert result["status"] == "error"
         assert result["reason"] == "recycle_strategy_requires_valid_alias"
 
     async def test_all_rphosts_of_ib_resolves_via_rac(self, monkeypatch):
         # strategy=all_rphosts_of_ib + valid alias → kills via _rac_list_rphosts_of_infobase
-        await self._setup(monkeypatch,
-                          alias_validation={"status": "valid",
-                                            "uuid": "ib-uuid-1",
-                                            "name": "ИБReal"})
+        await self._setup(
+            monkeypatch, alias_validation={"status": "valid", "uuid": "ib-uuid-1", "name": "ИБReal"}
+        )
         monkeypatch.setattr(mds, "detect_pre_existing_rphosts", lambda: [])
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
-        monkeypatch.setattr(mds, "_rac_get_cluster_uuid",
-                            lambda exe: "cluster-uuid")
-        monkeypatch.setattr(mds, "_rac_list_rphosts_of_infobase",
-                            lambda exe, cluster, ib_uuid: [555, 666])
+        monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "cluster-uuid")
+        monkeypatch.setattr(
+            mds, "_rac_list_rphosts_of_infobase", lambda exe, cluster, ib_uuid: [555, 666]
+        )
         kill_calls = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids, dry_run=False:
-                            kill_calls.append(list(pids)) or
-                            {"killed": list(pids), "failed": []})
-        raw = await mds.debug_connect(infobase_alias="ИБReal",
-                                       recycle_strategy="all_rphosts_of_ib")
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids, dry_run=False: (
+                kill_calls.append(list(pids)) or {"killed": list(pids), "failed": []}
+            ),
+        )
+        raw = await mds.debug_connect(infobase_alias="ИБReal", recycle_strategy="all_rphosts_of_ib")
         result = json.loads(raw)
         assert result["status"] == "connected"
         assert kill_calls == [[555, 666]]
@@ -2280,38 +2569,40 @@ class TestRecycleStrategy:
 
     async def test_invalid_strategy_value_blocks(self, monkeypatch):
         await self._setup(monkeypatch)
-        raw = await mds.debug_connect(infobase_alias="X",
-                                       recycle_strategy="bogus")
+        raw = await mds.debug_connect(infobase_alias="X", recycle_strategy="bogus")
         result = json.loads(raw)
         assert result["status"] == "error"
         assert result["reason"] == "invalid_recycle_strategy"
         assert "all_rphosts_of_ib" in result["allowed"]
 
-    async def test_all_rphosts_of_cluster_combines_snapshot_and_rac(
-            self, monkeypatch):
+    async def test_all_rphosts_of_cluster_combines_snapshot_and_rac(self, monkeypatch):
         """HIGH RISK strategy — kills snapshot + cluster-wide rac process list,
         dedup'ит pids между источниками. Smoke coverage для критичной ветки
         (review feedback от code-verify quality-review)."""
         await self._setup(monkeypatch)
         # Snapshot returns pids [100, 200]
-        monkeypatch.setattr(mds, "detect_pre_existing_rphosts",
-                            lambda: [{"pid": 100, "name": "rphost.exe"},
-                                     {"pid": 200, "name": "rphost.exe"}])
+        monkeypatch.setattr(
+            mds,
+            "detect_pre_existing_rphosts",
+            lambda: [{"pid": 100, "name": "rphost.exe"}, {"pid": 200, "name": "rphost.exe"}],
+        )
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c-uuid")
         # rac returns pids [200 (dup), 300, 400] — 200 уже в snapshot
-        monkeypatch.setattr(mds, "_rac_list_processes_by_pid",
-                            lambda exe, cl: {200: "p2-uuid",
-                                             300: "p3-uuid",
-                                             400: "p4-uuid"})
+        monkeypatch.setattr(
+            mds,
+            "_rac_list_processes_by_pid",
+            lambda exe, cl: {200: "p2-uuid", 300: "p3-uuid", 400: "p4-uuid"},
+        )
         kill_calls = []
-        monkeypatch.setattr(mds, "force_recycle_rphost_processes",
-                            lambda pids, dry_run=False:
-                            kill_calls.append(list(pids)) or
-                            {"killed": list(pids), "failed": []})
-        raw = await mds.debug_connect(
-            infobase_alias="X",
-            recycle_strategy="all_rphosts_of_cluster")
+        monkeypatch.setattr(
+            mds,
+            "force_recycle_rphost_processes",
+            lambda pids, dry_run=False: (
+                kill_calls.append(list(pids)) or {"killed": list(pids), "failed": []}
+            ),
+        )
+        raw = await mds.debug_connect(infobase_alias="X", recycle_strategy="all_rphosts_of_cluster")
         result = json.loads(raw)
         assert result["status"] == "connected"
         # 100, 200 from snapshot + 300, 400 from rac (200 dedup'ed)
@@ -2322,6 +2613,7 @@ class TestRecycleStrategy:
 # ---------------------------------------------------------------------------
 # Roadmap 260511 §3.1: _validate_infobase_alias helper unit tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestPostSpawnAutoAttach:
@@ -2341,15 +2633,18 @@ class TestPostSpawnAutoAttach:
     async def test_post_spawn_attaches_new_targets(self, monkeypatch):
         c = self._make_client()
         c._known_attached_targets.add("already-attached-id")
+
         # get_targets returns 2: один уже attached, один новый
         async def _get_targets(self):
-            return [{"id": "already-attached-id"},
-                    {"id": "new-spawn-id"}]
+            return [{"id": "already-attached-id"}, {"id": "new-spawn-id"}]
+
         # attach_debug_targets captures call
         attach_calls = []
+
         async def _attach(self, uuids, attach=True):
             attach_calls.append((list(uuids), attach))
             return True
+
         monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
         monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
 
@@ -2361,12 +2656,16 @@ class TestPostSpawnAutoAttach:
     async def test_post_spawn_noop_when_all_attached(self, monkeypatch):
         c = self._make_client()
         c._known_attached_targets.update({"t1", "t2"})
+
         async def _get_targets(self):
             return [{"id": "t1"}, {"id": "t2"}]
+
         attach_calls = []
+
         async def _attach(self, uuids, attach=True):
             attach_calls.append(uuids)
             return True
+
         monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
         monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
 
@@ -2376,8 +2675,10 @@ class TestPostSpawnAutoAttach:
 
     async def test_post_spawn_handles_get_targets_failure(self, monkeypatch):
         c = self._make_client()
+
         async def _get_targets(self):
             raise RuntimeError("connection refused")
+
         monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
 
         attached_count = await c._post_spawn_auto_attach()
@@ -2385,10 +2686,13 @@ class TestPostSpawnAutoAttach:
 
     async def test_post_spawn_handles_attach_failure(self, monkeypatch):
         c = self._make_client()
+
         async def _get_targets(self):
             return [{"id": "new-id"}]
+
         async def _attach(self, uuids, attach=True):
             raise RuntimeError("RDBG 500")
+
         monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
         monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
 
@@ -2399,12 +2703,16 @@ class TestPostSpawnAutoAttach:
 
     async def test_post_spawn_skips_targets_without_id(self, monkeypatch):
         c = self._make_client()
+
         async def _get_targets(self):
             return [{"id": ""}, {"name": "no-id-field"}, {"id": "real-id"}]
+
         attach_calls = []
+
         async def _attach(self, uuids, attach=True):
             attach_calls.append(list(uuids))
             return True
+
         monkeypatch.setattr(RDBGClient, "get_targets", _get_targets)
         monkeypatch.setattr(RDBGClient, "attach_debug_targets", _attach)
 
@@ -2441,9 +2749,11 @@ class TestValidateInfobaseAlias:
     def test_valid_when_alias_matches(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
-        monkeypatch.setattr(mds, "_rac_list_infobases",
-                            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
-                                             {"uuid": "u2", "name": "Other"}])
+        monkeypatch.setattr(
+            mds,
+            "_rac_list_infobases",
+            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"}, {"uuid": "u2", "name": "Other"}],
+        )
         monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
         result = mds._validate_infobase_alias("ИБOne")
         assert result["status"] == "valid"
@@ -2453,9 +2763,11 @@ class TestValidateInfobaseAlias:
     def test_invalid_when_alias_not_in_list(self, monkeypatch):
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
-        monkeypatch.setattr(mds, "_rac_list_infobases",
-                            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"},
-                                             {"uuid": "u2", "name": "Other"}])
+        monkeypatch.setattr(
+            mds,
+            "_rac_list_infobases",
+            lambda exe, cl: [{"uuid": "u1", "name": "ИБOne"}, {"uuid": "u2", "name": "Other"}],
+        )
         monkeypatch.delenv("DEBUG_INFOBASE_ALIASES", raising=False)
         result = mds._validate_infobase_alias("Wrong")
         assert result["status"] == "invalid"
@@ -2465,11 +2777,12 @@ class TestValidateInfobaseAlias:
         """§3.7 P2: DEBUG_INFOBASE_ALIASES env translates short → long."""
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
-        monkeypatch.setattr(mds, "_rac_list_infobases",
-                            lambda exe, cl: [{"uuid": "u1",
-                                              "name": "ИБLongCyrillicName"}])
-        monkeypatch.setenv("DEBUG_INFOBASE_ALIASES",
-                           "Short:ИБLongCyrillicName;Other:OtherLong")
+        monkeypatch.setattr(
+            mds,
+            "_rac_list_infobases",
+            lambda exe, cl: [{"uuid": "u1", "name": "ИБLongCyrillicName"}],
+        )
+        monkeypatch.setenv("DEBUG_INFOBASE_ALIASES", "Short:ИБLongCyrillicName;Other:OtherLong")
         result = mds._validate_infobase_alias("Short")
         assert result["status"] == "valid"
         assert result["name"] == "ИБLongCyrillicName"
@@ -2479,9 +2792,9 @@ class TestValidateInfobaseAlias:
         """Если alias не в env mapping — используется как есть."""
         monkeypatch.setattr(mds, "_find_rac_exe", lambda: "/fake/rac.exe")
         monkeypatch.setattr(mds, "_rac_get_cluster_uuid", lambda exe: "c1")
-        monkeypatch.setattr(mds, "_rac_list_infobases",
-                            lambda exe, cl: [{"uuid": "u1",
-                                              "name": "ИБDirect"}])
+        monkeypatch.setattr(
+            mds, "_rac_list_infobases", lambda exe, cl: [{"uuid": "u1", "name": "ИБDirect"}]
+        )
         monkeypatch.setenv("DEBUG_INFOBASE_ALIASES", "Other:OtherLong")
         result = mds._validate_infobase_alias("ИБDirect")
         assert result["status"] == "valid"
@@ -2491,6 +2804,7 @@ class TestValidateInfobaseAlias:
 # ---------------------------------------------------------------------------
 # §13.x HMR-restart recovery: active session persistence
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def isolated_active_path(tmp_path, monkeypatch):
@@ -2585,8 +2899,8 @@ class TestAttachDetachLifecyclePersistence:
         c = RDBGClient(debug_url="http://h:1550", infobase_alias="X")
         attach_xml = ET.fromstring(
             f'<root xmlns:r="http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse">'
-            f'<r:result>{result_text}</r:result>'
-            f'</root>'
+            f"<r:result>{result_text}</r:result>"
+            f"</root>"
         )
         c._post = AsyncMock(return_value=attach_xml)
         c._cleanup_stale_session = AsyncMock()
@@ -2639,12 +2953,17 @@ class TestGetClientHmrRestore:
         assert c._registered is False
 
     def test_cold_start_with_state_restores_session(self, isolated_active_path):
-        isolated_active_path.write_text(json.dumps({
-            "session_id": "restored-uuid",
-            "debug_url": "http://restored:1550",
-            "infobase_alias": "RESTORED",
-            "persisted_at": 0,
-        }), encoding="utf-8")
+        isolated_active_path.write_text(
+            json.dumps(
+                {
+                    "session_id": "restored-uuid",
+                    "debug_url": "http://restored:1550",
+                    "infobase_alias": "RESTORED",
+                    "persisted_at": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
         c = mds._get_client()
         assert c.session_id == "restored-uuid"
         assert c.debug_url == "http://restored:1550"
@@ -2654,9 +2973,14 @@ class TestGetClientHmrRestore:
 
     def test_cold_start_with_partial_state_falls_back(self, isolated_active_path):
         # state file exists но без session_id → treated as no state
-        isolated_active_path.write_text(json.dumps({
-            "debug_url": "http://x:1550",
-        }), encoding="utf-8")
+        isolated_active_path.write_text(
+            json.dumps(
+                {
+                    "debug_url": "http://x:1550",
+                }
+            ),
+            encoding="utf-8",
+        )
         c = mds._get_client()
         assert c._attached is False
         assert c._registered is False
@@ -2670,6 +2994,7 @@ class TestGetClientHmrRestore:
 # ---------------------------------------------------------------------------
 # §13.x ping() dispatches to _handle_command (root-cause fix 2026-05-10)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestPingDispatch:
@@ -2687,16 +3012,20 @@ class TestPingDispatch:
     """
 
     async def test_populates_last_stopped_via_handle_command(
-        self, client, monkeypatch,
+        self,
+        client,
+        monkeypatch,
     ):
         client._post = AsyncMock(return_value=ET.Element("root"))
         stack_dict = {"_tag": "frame", "lineNo": "10"}
-        events = [{
-            "cmdId": "callStackFormed",
-            "targetID": GOOD_UUID,
-            "callStack": stack_dict,
-            "stopByBP": "true",
-        }]
+        events = [
+            {
+                "cmdId": "callStackFormed",
+                "targetID": GOOD_UUID,
+                "callStack": stack_dict,
+                "stopByBP": "true",
+            }
+        ]
         monkeypatch.setattr(mds, "_parse_response", lambda root: events)
         result = await client.ping()
         # Cache populated via dispatched _handle_command
@@ -2758,13 +3087,12 @@ class TestEvalErrorEnvelope:
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<exception xmlns="http://v8.1c.ru/8.2/virtual-resource-system" reason="400">'
         '<descr xmlns="http://v8.1c.ru/8.1/data/core">Выполнение вычислений возможно '
-        'только в остановленном предмете отладки</descr></exception>'
+        "только в остановленном предмете отладки</descr></exception>"
     )
 
     def test_rdbg_error_text_extracts_descr(self):
         msg = mds._rdbg_error_text(RuntimeError("RDBG evalExpr 400: " + self.RDBG_XML))
-        assert msg == ("Выполнение вычислений возможно только "
-                       "в остановленном предмете отладки")
+        assert msg == ("Выполнение вычислений возможно только в остановленном предмете отладки")
 
     def test_rdbg_error_text_collapses_whitespace(self):
         xml = "<descr>line1\n   line2\t  line3</descr>"
@@ -2811,6 +3139,7 @@ class TestEvalErrorEnvelope:
     @pytest.mark.asyncio
     async def test_evaluate_not_connected_envelope(self, monkeypatch):
         """Рек.#1: не-подключённая сессия → явный not_connected, не маскируется."""
+
         class FakeClient:
             _attached = False
             _registered = False
@@ -2823,6 +3152,7 @@ class TestEvalErrorEnvelope:
     @pytest.mark.asyncio
     async def test_no_stopped_target_envelope(self, monkeypatch):
         """Рек.#2: единый envelope для 'No stopped targets' (error_type + target_id)."""
+
         class FakeClient:
             _attached = True
             _registered = True
@@ -2835,3 +3165,87 @@ class TestEvalErrorEnvelope:
         data = json.loads(await mds.debug_evaluate("1 + 1"))
         assert data["error_type"] == "no_stopped_target"
         assert data["error"] == "No stopped targets"
+
+
+# ---------------------------------------------------------------------------
+# W1.0 refactor helpers (2026-07-08): _resolve_property_id /
+# _resolve_stopped_target / _enrich_stack — dedup foundation for A0/A1
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePropertyId:
+    def test_empty_resolves_and_switches_to_config_module(self):
+        xml_mt, pid = mds._resolve_property_id("ManagerModule", "")
+        assert xml_mt == "ConfigModule"
+        assert pid == mds.MODULE_PROPERTY_IDS["ManagerModule"]
+
+    def test_zero_uuid_treated_as_unset(self):
+        xml_mt, pid = mds._resolve_property_id("CommonModule", mds.ZERO_UUID)
+        assert xml_mt == "ConfigModule"
+        assert pid == mds.MODULE_PROPERTY_IDS["CommonModule"]
+
+    def test_explicit_property_id_preserved(self):
+        xml_mt, pid = mds._resolve_property_id("ManagerModule", GOOD_UUID)
+        assert xml_mt == "ManagerModule"
+        assert pid == GOOD_UUID
+
+    def test_unknown_module_type_falls_through(self):
+        xml_mt, pid = mds._resolve_property_id("NoSuchModule", "")
+        assert xml_mt == "NoSuchModule"
+        assert pid == ""
+
+
+class TestResolveStoppedTarget:
+    @pytest.mark.asyncio
+    async def test_explicit_target_short_circuits(self, client):
+        client.get_targets = AsyncMock(return_value=[])
+        tid, scanned = await mds._resolve_stopped_target(client, GOOD_UUID)
+        assert tid == GOOD_UUID
+        assert scanned is None
+        client.get_targets.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_last_stopped_no_scan(self, client):
+        client._last_stopped_target_id = GOOD_UUID
+        client.get_targets = AsyncMock(return_value=[])
+        tid, scanned = await mds._resolve_stopped_target(client, "")
+        assert tid == GOOD_UUID
+        assert scanned is None
+        client.get_targets.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scans_targets_when_nothing_cached(self, client):
+        targets = [{"id": ANOTHER_UUID, "state": "StopOnNextLine"}]
+        client.get_targets = AsyncMock(return_value=targets)
+        tid, scanned = await mds._resolve_stopped_target(client, "")
+        assert tid == ANOTHER_UUID
+        assert scanned == targets
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_and_scanned_when_none_stopped(self, client):
+        targets = [{"id": ANOTHER_UUID, "state": "Worked"}]
+        client.get_targets = AsyncMock(return_value=targets)
+        tid, scanned = await mds._resolve_stopped_target(client, "")
+        assert tid == ""
+        assert scanned == targets
+
+
+class TestEnrichStack:
+    def test_pass_through_when_no_resolution(self, monkeypatch):
+        monkeypatch.setattr(mds.uuid_index, "get_source_info", lambda o, p: None)
+        stack = [{"moduleID": {"objectID": "x", "propertyID": "y"}, "lineNo": 5}]
+        out = mds._enrich_stack(stack)
+        assert "resolved_source" not in out[0]
+
+    def test_enriches_when_resolved(self, monkeypatch):
+        info = {"fqn": "Документ.X.МодульМенеджера", "file_path": "X/Mgr.bsl", "exists": True}
+        monkeypatch.setattr(mds.uuid_index, "get_source_info", lambda o, p: info)
+        stack = [{"moduleID": {"objectID": "x", "propertyID": "y"}, "lineNo": 5}]
+        out = mds._enrich_stack(stack)
+        assert out[0]["resolved_source"] == info
+        assert "resolved_source" not in stack[0]  # original not mutated
+
+    def test_non_dict_frame_passes_through(self, monkeypatch):
+        monkeypatch.setattr(mds.uuid_index, "get_source_info", lambda o, p: {"fqn": "z"})
+        out = mds._enrich_stack(["not-a-dict"])
+        assert out == ["not-a-dict"]
