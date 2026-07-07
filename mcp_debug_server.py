@@ -3599,6 +3599,97 @@ async def debug_autotrace(
 
 
 @mcp.tool()
+async def debug_collection_info(expression: str, target_id: str = "", stack_level: int = 0) -> str:
+    """C0 (roadmap 260708 §7.4): тип + размер коллекции для paging.
+
+    Eval `ТипЗнч(<expression>)` + `<expression>.Количество()` в остановленном
+    фрейме. Первый шаг перед debug_collection_page для больших
+    ТаблицаЗначений / Массив / РезультатЗапроса.
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        target_id, scanned = await _resolve_stopped_target(client, target_id)
+        if not target_id:
+            return _error_json("No stopped targets", "no_stopped_target", targets=scanned)
+        type_res = await client.eval_expression(
+            expression=f"ТипЗнч({expression})",
+            target_uuid=target_id,
+            stack_level=stack_level,
+        )
+        count_res = await client.eval_expression(
+            expression=f"{expression}.Количество()",
+            target_uuid=target_id,
+            stack_level=stack_level,
+        )
+        return json.dumps(
+            {
+                "expression": expression,
+                "type": autonomy._extract_eval_value(type_res),
+                "count": autonomy._extract_eval_value(count_res),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_collection_info failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, expression=expression)
+
+
+@mcp.tool()
+async def debug_collection_page(
+    expression: str,
+    start: int = 0,
+    count: int = 20,
+    columns: Optional[list] = None,
+    target_id: str = "",
+    stack_level: int = 0,
+) -> str:
+    """C0 (roadmap 260708 §7.4): страница индексируемой коллекции.
+
+    Ленивый доступ к большим `ТаблицаЗначений` / `Массив` / выгрузке
+    `РезультатЗапроса` без обрезки или взрыва контекста: batch `<expression>[i]`
+    (+ `.<column>` на строку при `columns`) одним evalLocalVariables POST.
+
+    Args:
+        expression: BSL-выражение коллекции (напр. `ТаблицаДанных`).
+        start: индекс первого элемента (0-based).
+        count: размер страницы (cap 200).
+        columns: колонки ТаблицаЗначений для чтения по строке (None = элемент целиком).
+        target_id / stack_level: как в debug_evaluate.
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        target_id, scanned = await _resolve_stopped_target(client, target_id)
+        if not target_id:
+            return _error_json("No stopped targets", "no_stopped_target", targets=scanned)
+        count = max(1, min(int(count), 200))
+        exprs = autonomy.build_page_expressions(expression, int(start), count, columns)
+        values = await client.eval_local_variables(
+            target_uuid=target_id,
+            stack_level=stack_level,
+            expressions=exprs,
+        )
+        return json.dumps(
+            {
+                "expression": expression,
+                "start": int(start),
+                "count": count,
+                "columns": columns or None,
+                "values": values,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_collection_page failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, expression=expression)
+
+
+@mcp.tool()
 async def debug_set_breakpoint(
     object_id: str,
     line: int,

@@ -48,6 +48,32 @@ def read_source_context(
     return {"file_path": str(path), "start": lo, "end": hi, "lines": lines}
 
 
+def build_page_expressions(
+    expression: str,
+    start: int,
+    count: int,
+    columns: list | None = None,
+) -> list[str]:
+    """Build batch index-access BSL expressions for a page of an indexable
+    collection (Массив / ТаблицаЗначений / выгрузка РезультатЗапроса).
+
+    C0 roadmap 260708 §7.4 — RDBG has no "expand" call; paging is emulated as a
+    batch of `<expr>[i]` reads (+ `.<column>` per row when `columns` given) sent
+    in one evalLocalVariables POST. Lazy access to huge collections без обрезки /
+    взрыва контекста.
+
+    Returns a flat list of expression strings.
+    """
+    exprs: list[str] = []
+    for i in range(start, start + count):
+        base = f"{expression}[{i}]"
+        if columns:
+            exprs.extend(f"{base}.{col}" for col in columns)
+        else:
+            exprs.append(base)
+    return exprs
+
+
 def _extract_eval_value(result) -> str:
     """Best-effort string presentation of an eval_expression result.
 

@@ -3410,3 +3410,52 @@ class TestDebugAutotrace:
         monkeypatch.setattr(mds, "_get_client", lambda: client)
         out = json.loads(await mds.debug_autotrace(phase="bogus"))
         assert out["error_type"] == "bad_phase"
+
+
+# ---------------------------------------------------------------------------
+# C0 variable paging — debug_collection_info / debug_collection_page (§7.4)
+# ---------------------------------------------------------------------------
+
+
+class _CollectionClient:
+    _attached = True
+    _registered = True
+    last_stopped_target_id = "tgt"
+
+    async def get_targets(self):
+        return []
+
+    async def eval_expression(self, expression, target_uuid=None, stack_level=0):
+        vals = {"ТипЗнч(Т)": "ТаблицаЗначений", "Т.Количество()": "3"}
+        return [{"presentation": vals.get(expression, "")}]
+
+    async def eval_local_variables(self, target_uuid=None, stack_level=0, expressions=None):
+        return [{"name": e, "presentation": "v"} for e in (expressions or [])]
+
+
+class TestDebugCollection:
+    @pytest.mark.asyncio
+    async def test_info_returns_type_and_count(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_client", lambda: _CollectionClient())
+        out = json.loads(await mds.debug_collection_info("Т"))
+        assert out["type"] == "ТаблицаЗначений"
+        assert out["count"] == "3"
+
+    @pytest.mark.asyncio
+    async def test_page_batches(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_client", lambda: _CollectionClient())
+        out = json.loads(await mds.debug_collection_page("Т", start=0, count=2))
+        assert out["start"] == 0 and out["count"] == 2
+        assert [v["name"] for v in out["values"]] == ["Т[0]", "Т[1]"]
+
+    @pytest.mark.asyncio
+    async def test_page_columns_expand(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_client", lambda: _CollectionClient())
+        out = json.loads(await mds.debug_collection_page("Т", start=0, count=1, columns=["Ном"]))
+        assert out["values"][0]["name"] == "Т[0].Ном"
+
+    @pytest.mark.asyncio
+    async def test_page_caps_at_200(self, monkeypatch):
+        monkeypatch.setattr(mds, "_get_client", lambda: _CollectionClient())
+        out = json.loads(await mds.debug_collection_page("Т", start=0, count=9999))
+        assert out["count"] == 200

@@ -212,3 +212,25 @@ class TestEvaluateExpect:
         client = _EvalClient({"Кол": "3"})
         v = await autonomy.evaluate_expect(client, "tgt", {"Кол": 3})
         assert v["status"] == "PASS"
+
+
+class TestBuildPageExpressions:
+    def test_plain_index_page(self):
+        exprs = autonomy.build_page_expressions("Массив", 0, 3)
+        assert exprs == ["Массив[0]", "Массив[1]", "Массив[2]"]
+
+    def test_offset_start(self):
+        exprs = autonomy.build_page_expressions("Т", 10, 2)
+        assert exprs == ["Т[10]", "Т[11]"]
+
+    def test_columns_expand_per_row(self):
+        exprs = autonomy.build_page_expressions("ТЗ", 0, 2, columns=["Номер", "Сумма"])
+        assert exprs == [
+            "ТЗ[0].Номер",
+            "ТЗ[0].Сумма",
+            "ТЗ[1].Номер",
+            "ТЗ[1].Сумма",
+        ]
+
+    def test_zero_count_empty(self):
+        assert autonomy.build_page_expressions("X", 0, 0) == []
