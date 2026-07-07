@@ -1391,7 +1391,11 @@ class RDBGClient:
         cached_stack = self._last_stack_by_target.get(target_uuid)
         if not cached_stack or stack_level >= len(cached_stack):
             return []
-        frame = cached_stack[stack_level]
+        # Ф-2 (live 2026-07-08): callStack array outermost-first, а stackLevel
+        # eval-семантики innermost-first (0 = текущий фрейм BP). До фикса
+        # auto-discovery на глубоких стеках парсил ИСХОДНИК ВНЕШНЕГО фрейма
+        # (напр. HTTP-вход mcp_APIBackend) вместо модуля точки останова.
+        frame = cached_stack[len(cached_stack) - 1 - stack_level]
         module_id = frame.get("moduleID") or {}
         if not isinstance(module_id, dict):
             return []
@@ -3546,14 +3550,31 @@ async def debug_autotrace(
         if phase != "collect":
             return _error_json(f"unknown phase '{phase}'", "bad_phase")
 
-        # collect: poll for a stop (background ping_loop populates last_stopped).
+        # collect: poll for a USER-VISIBLE BP stop. Live-баг 2026-07-08: сырой
+        # _resolve_stopped_target ловил транзиентный СИСТЕМНЫЙ halt (spawn-halt
+        # свежего rphost, reason="step"), который system_stops дренирует и
+        # Continue'ит — collect возвращал hit=true до всякого триггера, а target
+        # умирал до bundle. Handler добавляет target в _stopped_targets ДО
+        # фильтра system_stops (:747), поэтому фильтруем по reason="breakpoint"
+        # + debounce 0.15s (silent-пути drain+Continue снимают target из
+        # _stopped_targets через step()).
         poll = 0.3
         waited = 0.0
         target_id = ""
         while waited < timeout_sec:
-            target_id, _ = await _resolve_stopped_target(client, "")
-            if target_id:
-                break
+            candidate = next(
+                (
+                    t
+                    for t in getattr(client, "_stopped_targets", set())
+                    if client._stop_reason_by_target.get(t) == "breakpoint"
+                ),
+                "",
+            )
+            if candidate:
+                await asyncio.sleep(0.15)  # debounce: пережить drain-Continue
+                if candidate in client._stopped_targets:
+                    target_id = candidate
+                    break
             await asyncio.sleep(poll)
             waited += poll
         if not target_id:
@@ -3568,12 +3589,10 @@ async def debug_autotrace(
                 indent=2,
             )
         try:
-            bundle = await autonomy.build_frame_bundle(
-                client,
-                target_id,
-                stack_level=stack_level,
-                context_radius=context_radius,
-            )
+            # Live 2026-07-08: окно halt server-контекста ~1-2с (платформа
+            # force-resume'ит) — verdict-eval'ы считаем ПЕРВЫМИ (2-3 быстрых
+            # выражения), bundle с batch-локалями вторым (при закрытии окна
+            # он деградирует gracefully, verdict уже получен).
             verdict = None
             if expect:
                 verdict = await autonomy.evaluate_expect(
@@ -3582,6 +3601,12 @@ async def debug_autotrace(
                     expect,
                     stack_level=stack_level,
                 )
+            bundle = await autonomy.build_frame_bundle(
+                client,
+                target_id,
+                stack_level=stack_level,
+                context_radius=context_radius,
+            )
             return json.dumps(
                 {"verdict": verdict, "raw": {"hit": True, **bundle}},
                 ensure_ascii=False,

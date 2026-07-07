@@ -3308,11 +3308,13 @@ class TestLineOffsetsPersistence:
 
 
 class _AutotraceClient:
-    def __init__(self, stopped_target="", stack=None, line_offsets=None):
+    def __init__(self, stopped_target="", stack=None, line_offsets=None, stop_reason="breakpoint"):
         self._attached = True
         self._registered = True
         self._last_stopped_target_id = stopped_target
         self._last_stack_by_target = {}
+        self._stopped_targets = {stopped_target} if stopped_target else set()
+        self._stop_reason_by_target = {stopped_target: stop_reason} if stopped_target else {}
         if stopped_target and stack is not None:
             self._last_stack_by_target[stopped_target] = stack
         self._line_offsets = line_offsets or {}
@@ -3410,6 +3412,35 @@ class TestDebugAutotrace:
         monkeypatch.setattr(mds, "_get_client", lambda: client)
         out = json.loads(await mds.debug_autotrace(phase="bogus"))
         assert out["error_type"] == "bad_phase"
+
+    @pytest.mark.asyncio
+    async def test_collect_ignores_system_stop(self, monkeypatch):
+        """Live-баг 2026-07-08: транзиентный системный halt (reason=step,
+        spawn-halt свежего rphost) НЕ должен приниматься за user-hit."""
+        frame = {"moduleID": {"objectID": "o", "propertyID": "p"}, "lineNo": 5}
+        client = _AutotraceClient(stopped_target="tgt", stack=[frame], stop_reason="step")
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        out = json.loads(await mds.debug_autotrace(phase="collect", timeout_sec=0.0))
+        assert out["raw"]["hit"] is False
+        assert client.step_calls == []  # ничего не released — нечего
+
+    @pytest.mark.asyncio
+    async def test_collect_debounce_drained_target_not_hit(self, monkeypatch):
+        """Кандидат, снятый drain-Continue во время debounce, не принимается."""
+        frame = {"moduleID": {"objectID": "o", "propertyID": "p"}, "lineNo": 5}
+        client = _AutotraceClient(stopped_target="tgt", stack=[frame])
+
+        orig_sleep = asyncio.sleep
+
+        async def draining_sleep(sec):
+            # первый (debounce) sleep симулирует drain: target уходит из stopped
+            client._stopped_targets.discard("tgt")
+            await orig_sleep(0)
+
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        monkeypatch.setattr(mds.asyncio, "sleep", draining_sleep)
+        out = json.loads(await mds.debug_autotrace(phase="collect", timeout_sec=0.2))
+        assert out["raw"]["hit"] is False
 
 
 # ---------------------------------------------------------------------------

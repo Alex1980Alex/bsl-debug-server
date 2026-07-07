@@ -151,6 +151,20 @@ class TestBuildFrameBundle:
         b = await autonomy.build_frame_bundle(client, "tgt")
         assert "error" in b and b["depth"] == 0
 
+    @pytest.mark.asyncio
+    async def test_stack_level_zero_is_innermost(self, monkeypatch):
+        """Ф-2 (live 2026-07-08): callStack outermost-first; stack_level=0
+        должен дать ПОСЛЕДНИЙ (innermost, BP) фрейм — как eval-семантика."""
+        monkeypatch.setattr(uuid_index, "resolve_uuid", lambda o, p: None)
+        monkeypatch.setattr(uuid_index, "get_source_info", lambda o, p: None)
+        outer = {"moduleID": {"objectID": "OUTER", "propertyID": "p"}, "lineNo": 1}
+        inner = {"moduleID": {"objectID": "INNER", "propertyID": "p"}, "lineNo": 2333}
+        client = FakeClient(cached_stack=[outer, inner])
+        b0 = await autonomy.build_frame_bundle(client, "tgt", stack_level=0)
+        assert b0["frame"]["moduleID"]["objectID"] == "INNER"
+        b1 = await autonomy.build_frame_bundle(client, "tgt", stack_level=1)
+        assert b1["frame"]["moduleID"]["objectID"] == "OUTER"
+
 
 # ---------------------------------------------------------------------------
 # A1 verdict engine: _extract_eval_value + evaluate_expect
@@ -164,6 +178,37 @@ class TestExtractEvalValue:
     def test_nested_result_value_info(self):
         res = [{"resultValueInfo": {"value": "42"}}]
         assert autonomy._extract_eval_value(res) == "42"
+
+    def test_live_rdbg_shape_value_decimal(self):
+        # Live-verified 2026-07-08 (RDBG 8.3.27.1936): гкс_ВходнойКонтрольКачества
+        res = [
+            {
+                "_tag": "result",
+                "evalResultState": "correctly",
+                "expressionResultID": "4be641ab",
+                "resultValueInfo": {
+                    "_tag": "resultValueInfo",
+                    "typeCode": "3",
+                    "typeName": "Число",
+                    "valueDecimal": "0",
+                    "pres": "MA==",
+                },
+            }
+        ]
+        assert autonomy._extract_eval_value(res) == "0"
+
+    def test_live_rdbg_shape_pres_base64_only(self):
+        res = [{"resultValueInfo": {"typeName": "Строка", "pres": "NA=="}}]
+        assert autonomy._extract_eval_value(res) == "4"
+
+    def test_pres_multiline_base64(self):
+        # RDBG переносит длинный base64 с \n
+        import base64
+
+        payload = base64.b64encode("Истина".encode()).decode()
+        wrapped = payload[:4] + "\n" + payload[4:]
+        res = [{"resultValueInfo": {"pres": wrapped}}]
+        assert autonomy._extract_eval_value(res) == "Истина"
 
     def test_empty_list_falls_back(self):
         assert autonomy._extract_eval_value([]) == "[]"

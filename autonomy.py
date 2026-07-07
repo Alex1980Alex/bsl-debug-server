@@ -79,21 +79,48 @@ def build_page_expressions(
     return exprs
 
 
+def _decode_pres_b64(raw: str) -> str | None:
+    """Decode RDBG base64 `pres` presentation ('MA==' → '0'). None on failure."""
+    try:
+        import base64
+
+        cleaned = "".join(str(raw).split())  # multi-line base64 with \n
+        return base64.b64decode(cleaned).decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+
+
 def _extract_eval_value(result) -> str:
     """Best-effort string presentation of an eval_expression result.
 
-    eval_expression returns a list of RDBG calc dicts; the human-readable value
-    lives under presentation-ish keys whose exact shape varies by RDBG build.
-    Walk the common ones, fall back to str(). Never raises.
+    Live-verified shape (RDBG 8.3.27.1936, 2026-07-08):
+    `[{evalResultState, expressionResultID, resultValueInfo: {typeCode,
+    typeName, valueDecimal|valueStr|valueBoolean, pres: <base64>}}]` — the
+    human presentation is base64 in `pres`; typed value in `value*` keys.
+    Walk those plus legacy presentation-ish keys, fall back to str().
+    Never raises.
     """
     item = result
     if isinstance(item, list):
         item = item[0] if item else None
     seen = 0
     while isinstance(item, dict) and seen < 6:
-        for key in ("presentation", "value", "_value", "text", "resultValue"):
+        for key in (
+            "presentation",
+            "value",
+            "_value",
+            "text",
+            "resultValue",
+            "valueDecimal",
+            "valueStr",
+            "valueBoolean",
+        ):
             if key in item and not isinstance(item[key], (dict, list)):
                 return str(item[key]).strip()
+        if "pres" in item and not isinstance(item["pres"], (dict, list)):
+            decoded = _decode_pres_b64(item["pres"])
+            if decoded is not None:
+                return decoded
         # descend into a nested value container
         nxt = item.get("resultValueInfo") or item.get("calcResult") or item.get("result")
         if nxt is None or nxt is item:
@@ -182,7 +209,11 @@ async def build_frame_bundle(
             "depth": depth,
         }
 
-    frame = stack[stack_level]
+    # Ф-2 (live-verified 2026-07-08): RDBG callStack array is OUTERMOST-first
+    # (BP frame is the LAST element), while evalExpr/evalLocalVariables
+    # stackLevel is INNERMOST-first (0 = current frame). Index frames
+    # innermost-first so the bundle frame matches what stack_level evaluates in.
+    frame = stack[depth - 1 - stack_level]
     frame = dict(frame) if isinstance(frame, dict) else {"raw": frame}
     mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
     object_id = mod.get("objectID", "")
