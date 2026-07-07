@@ -3471,6 +3471,134 @@ async def debug_inspect_frame(
 
 
 @mcp.tool()
+async def debug_autotrace(
+    object_id: str = "",
+    line: int = 0,
+    module_type: str = "CommonModule",
+    property_id: str = "",
+    phase: str = "collect",
+    expect: Optional[dict] = None,
+    timeout_sec: float = 20.0,
+    stack_level: int = 0,
+    context_radius: int = 3,
+) -> str:
+    """A1 (roadmap 260708 §7.3): автономный trace — BP → ждать fire → inspect →
+    verdict → release, в минимуме ручной оркестрации.
+
+    **Two-phase** (Ф-1 §7.0: trigger исполняется ВЫЗЫВАЮЩИМ через другой
+    MCP-сервер `1c-mcp-crud`, поэтому wrapper не триггерит код сам):
+
+    1. `phase="arm"` (нужны `object_id` + `line`): ставит BP (с авто-offset B2)
+       + silent break-on-next → `{status:"armed", bp}`. Затем ВЫ триггерите код
+       (execute_code / UI / JOB).
+    2. `phase="collect"` (default): ждёт остановки до `timeout_sec`, собирает
+       frame-bundle (A0), сверяет `expect`, делает Continue (release rphost).
+
+    `expect`: `{"<BSL-выражение>": "<ожидаемое представление значения>", ...}` —
+    verdict сравнивает строковое представление (как `debug_evaluate`, stack_level).
+
+    **Контракт возврата (решение §5.2):** `{verdict, raw}`. `raw` — ВСЕГДА
+    источник истины (`hit`, frame-bundle, stack). `verdict` — машинное суждение
+    по `expect` (PASS/FAIL/NO_HIT/INCONCLUSIVE) или `null`, если `expect` не дан.
+    ⚠ Ф-2: порядок фреймов (stack[0] vs stack[-1]) для многофреймовых стеков —
+    смотри `raw.stack`; verdict/locals используют stack_level (как debug_evaluate).
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+
+        if phase == "arm":
+            if not object_id or line <= 0:
+                return _error_json(
+                    "arm requires object_id and line>0",
+                    "bad_args",
+                    object_id=object_id,
+                    line=line,
+                )
+            xml_mt, pid = _resolve_property_id(module_type, property_id)
+            adj_line, applied_offset = _apply_line_offset(client, object_id, line)
+            await client.set_breakpoints(
+                module_type=xml_mt,
+                object_id=object_id,
+                property_id=pid,
+                lines=[adj_line],
+            )
+            await client.set_break_on_next_statement(silent=True)
+            return json.dumps(
+                {
+                    "status": "armed",
+                    "bp": {
+                        "object_id": object_id,
+                        "line": adj_line,
+                        "applied_offset": applied_offset,
+                        "module_type": module_type,
+                    },
+                    "next": (
+                        "trigger the code (execute_code / UI / JOB), then call "
+                        "debug_autotrace(phase='collect', expect=...)"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if phase != "collect":
+            return _error_json(f"unknown phase '{phase}'", "bad_phase")
+
+        # collect: poll for a stop (background ping_loop populates last_stopped).
+        poll = 0.3
+        waited = 0.0
+        target_id = ""
+        while waited < timeout_sec:
+            target_id, _ = await _resolve_stopped_target(client, "")
+            if target_id:
+                break
+            await asyncio.sleep(poll)
+            waited += poll
+        if not target_id:
+            verdict = (
+                {"status": "NO_HIT", "reason": f"no stop within {timeout_sec}s", "checked": []}
+                if expect
+                else None
+            )
+            return json.dumps(
+                {"verdict": verdict, "raw": {"hit": False, "waited_sec": round(waited, 1)}},
+                ensure_ascii=False,
+                indent=2,
+            )
+        try:
+            bundle = await autonomy.build_frame_bundle(
+                client,
+                target_id,
+                stack_level=stack_level,
+                context_radius=context_radius,
+            )
+            verdict = None
+            if expect:
+                verdict = await autonomy.evaluate_expect(
+                    client,
+                    target_id,
+                    expect,
+                    stack_level=stack_level,
+                )
+            return json.dumps(
+                {"verdict": verdict, "raw": {"hit": True, **bundle}},
+                ensure_ascii=False,
+                indent=2,
+            )
+        finally:
+            # Release rphost even on FAIL/exception (Шаблон 5 шаг 8).
+            try:
+                await client.step("Continue", target_uuid=target_id)
+            except Exception:
+                log.warning("autotrace collect: Continue failed", exc_info=True)
+    except Exception as e:
+        log.exception("debug_autotrace failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, phase=phase)
+
+
+@mcp.tool()
 async def debug_set_breakpoint(
     object_id: str,
     line: int,

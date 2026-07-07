@@ -150,3 +150,65 @@ class TestBuildFrameBundle:
         client = FakeClient(cached_stack=None, pull_stack=[])
         b = await autonomy.build_frame_bundle(client, "tgt")
         assert "error" in b and b["depth"] == 0
+
+
+# ---------------------------------------------------------------------------
+# A1 verdict engine: _extract_eval_value + evaluate_expect
+# ---------------------------------------------------------------------------
+
+
+class TestExtractEvalValue:
+    def test_list_with_presentation(self):
+        assert autonomy._extract_eval_value([{"presentation": "Ложь"}]) == "Ложь"
+
+    def test_nested_result_value_info(self):
+        res = [{"resultValueInfo": {"value": "42"}}]
+        assert autonomy._extract_eval_value(res) == "42"
+
+    def test_empty_list_falls_back(self):
+        assert autonomy._extract_eval_value([]) == "[]"
+
+    def test_strips_whitespace(self):
+        assert autonomy._extract_eval_value([{"presentation": "  Да  "}]) == "Да"
+
+
+class _EvalClient:
+    def __init__(self, values=None, raises_on=None):
+        self._values = values or {}
+        self._raises_on = raises_on or set()
+
+    async def eval_expression(self, expression, target_uuid=None, stack_level=0):
+        if expression in self._raises_on:
+            raise RuntimeError("RDBG 400: not stopped")
+        return [{"presentation": self._values.get(expression, "")}]
+
+
+class TestEvaluateExpect:
+    @pytest.mark.asyncio
+    async def test_all_match_pass(self):
+        client = _EvalClient({"Итог": "Истина", "Н": "5"})
+        v = await autonomy.evaluate_expect(client, "tgt", {"Итог": "Истина", "Н": "5"})
+        assert v["status"] == "PASS"
+        assert all(c["ok"] for c in v["checked"])
+
+    @pytest.mark.asyncio
+    async def test_mismatch_fail(self):
+        client = _EvalClient({"Итог": "Ложь"})
+        v = await autonomy.evaluate_expect(client, "tgt", {"Итог": "Истина"})
+        assert v["status"] == "FAIL"
+        assert v["checked"][0]["actual"] == "Ложь"
+        assert v["checked"][0]["expected"] == "Истина"
+        assert " ≠ " in v["reason"]
+
+    @pytest.mark.asyncio
+    async def test_eval_error_inconclusive(self):
+        client = _EvalClient(raises_on={"BadExpr"})
+        v = await autonomy.evaluate_expect(client, "tgt", {"BadExpr": "x"})
+        assert v["status"] == "INCONCLUSIVE"
+        assert "eval-error" in v["checked"][0]["actual"]
+
+    @pytest.mark.asyncio
+    async def test_numeric_expected_coerced_to_string(self):
+        client = _EvalClient({"Кол": "3"})
+        v = await autonomy.evaluate_expect(client, "tgt", {"Кол": 3})
+        assert v["status"] == "PASS"

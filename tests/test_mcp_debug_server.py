@@ -3300,3 +3300,113 @@ class TestLineOffsetsPersistence:
         mds._persist_active_session(client)
         loaded = mds._load_active_session()
         assert loaded["line_offsets"] == {}
+
+
+# ---------------------------------------------------------------------------
+# A1 debug_autotrace — arm / collect (roadmap 260708 §7.3)
+# ---------------------------------------------------------------------------
+
+
+class _AutotraceClient:
+    def __init__(self, stopped_target="", stack=None, line_offsets=None):
+        self._attached = True
+        self._registered = True
+        self._last_stopped_target_id = stopped_target
+        self._last_stack_by_target = {}
+        if stopped_target and stack is not None:
+            self._last_stack_by_target[stopped_target] = stack
+        self._line_offsets = line_offsets or {}
+        self.set_bp_calls = []
+        self.arm_calls = 0
+        self.step_calls = []
+
+    @property
+    def last_stopped_target_id(self):
+        return self._last_stopped_target_id or None
+
+    async def get_targets(self):
+        return []
+
+    async def set_breakpoints(self, **kw):
+        self.set_bp_calls.append(kw)
+        return {"ok": True}
+
+    async def set_break_on_next_statement(self, silent=False):
+        self.arm_calls += 1
+        return True
+
+    async def get_call_stack(self, target_uuid=None):
+        return self._last_stack_by_target.get(target_uuid, [])
+
+    async def eval_locals_auto(self, target_uuid=None, stack_level=0):
+        return []
+
+    async def eval_expression(self, expression, target_uuid=None, stack_level=0):
+        return [{"presentation": "Истина"}]
+
+    async def step(self, action="Continue", target_uuid=None):
+        self.step_calls.append((action, target_uuid))
+        return {"state": "Worked"}
+
+
+class TestDebugAutotrace:
+    @pytest.mark.asyncio
+    async def test_arm_sets_bp_with_offset_and_arms(self, monkeypatch):
+        client = _AutotraceClient(line_offsets={"obj": 3})
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        out = json.loads(
+            await mds.debug_autotrace(
+                object_id="obj", line=67, module_type="ManagerModule", phase="arm"
+            )
+        )
+        assert out["status"] == "armed"
+        assert out["bp"]["line"] == 70  # 67 + offset 3
+        assert out["bp"]["applied_offset"] == 3
+        assert client.set_bp_calls[0]["lines"] == [70]
+        assert client.arm_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_arm_rejects_missing_args(self, monkeypatch):
+        client = _AutotraceClient()
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        out = json.loads(await mds.debug_autotrace(phase="arm"))
+        assert out["error_type"] == "bad_args"
+
+    @pytest.mark.asyncio
+    async def test_collect_no_hit_returns_verdict_and_raw(self, monkeypatch):
+        client = _AutotraceClient(stopped_target="")
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        out = json.loads(
+            await mds.debug_autotrace(phase="collect", expect={"X": "1"}, timeout_sec=0.0)
+        )
+        assert out["verdict"]["status"] == "NO_HIT"
+        assert out["raw"]["hit"] is False
+
+    @pytest.mark.asyncio
+    async def test_collect_no_hit_without_expect_null_verdict(self, monkeypatch):
+        client = _AutotraceClient(stopped_target="")
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        out = json.loads(await mds.debug_autotrace(phase="collect", timeout_sec=0.0))
+        assert out["verdict"] is None
+        assert out["raw"]["hit"] is False
+
+    @pytest.mark.asyncio
+    async def test_collect_hit_pass_and_releases(self, monkeypatch):
+        frame = {"moduleID": {"objectID": "o", "propertyID": "p"}, "lineNo": 5}
+        client = _AutotraceClient(stopped_target="tgt", stack=[frame])
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        monkeypatch.setattr(mds.uuid_index, "get_source_info", lambda o, p: None)
+        monkeypatch.setattr(mds.uuid_index, "resolve_uuid", lambda o, p: None)
+        out = json.loads(
+            await mds.debug_autotrace(phase="collect", expect={"Итог": "Истина"}, timeout_sec=5.0)
+        )
+        assert out["verdict"]["status"] == "PASS"
+        assert out["raw"]["hit"] is True
+        assert client.step_calls == [("Continue", "tgt")]  # released
+
+    @pytest.mark.asyncio
+    async def test_unknown_phase(self, monkeypatch):
+        client = _AutotraceClient()
+        monkeypatch.setattr(mds, "_get_client", lambda: client)
+        out = json.loads(await mds.debug_autotrace(phase="bogus"))
+        assert out["error_type"] == "bad_phase"

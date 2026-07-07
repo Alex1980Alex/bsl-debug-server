@@ -48,6 +48,71 @@ def read_source_context(
     return {"file_path": str(path), "start": lo, "end": hi, "lines": lines}
 
 
+def _extract_eval_value(result) -> str:
+    """Best-effort string presentation of an eval_expression result.
+
+    eval_expression returns a list of RDBG calc dicts; the human-readable value
+    lives under presentation-ish keys whose exact shape varies by RDBG build.
+    Walk the common ones, fall back to str(). Never raises.
+    """
+    item = result
+    if isinstance(item, list):
+        item = item[0] if item else None
+    seen = 0
+    while isinstance(item, dict) and seen < 6:
+        for key in ("presentation", "value", "_value", "text", "resultValue"):
+            if key in item and not isinstance(item[key], (dict, list)):
+                return str(item[key]).strip()
+        # descend into a nested value container
+        nxt = item.get("resultValueInfo") or item.get("calcResult") or item.get("result")
+        if nxt is None or nxt is item:
+            break
+        item = nxt
+        seen += 1
+    return str(result).strip()
+
+
+async def evaluate_expect(client, target_id: str, expect: dict, stack_level: int = 0) -> dict:
+    """Verdict engine (A1.4 roadmap 260708 §7.3).
+
+    Evaluates each `expect` expression against the stopped frame (same eval path
+    as debug_evaluate — stack_level, default 0) and compares its string
+    presentation to the expected value.
+
+    Args:
+        expect: {"<BSL expr>": "<expected presentation>", ...}.
+
+    Returns {status, reason, checked:[{expr, expected, actual, ok}]}.
+        status: PASS (all match) / FAIL (some mismatch) / INCONCLUSIVE (an
+        eval raised). Comparison is trimmed-string equality — the caller sets
+        `expected` to match the platform's value presentation.
+    """
+    checked: list = []
+    any_error = False
+    all_ok = True
+    for expr, expected in expect.items():
+        expected_s = str(expected).strip()
+        try:
+            res = await client.eval_expression(
+                expression=expr,
+                target_uuid=target_id,
+                stack_level=stack_level,
+            )
+            actual = _extract_eval_value(res)
+            ok = actual == expected_s
+        except Exception as e:
+            actual = f"<eval-error: {e}>"
+            ok = False
+            any_error = True
+        all_ok = all_ok and ok
+        checked.append({"expr": expr, "expected": expected_s, "actual": actual, "ok": ok})
+    status = "INCONCLUSIVE" if any_error else ("PASS" if all_ok else "FAIL")
+    reason = "; ".join(
+        f"{c['expr']}={c['actual']}" + ("" if c["ok"] else f" ≠ {c['expected']}") for c in checked
+    )
+    return {"status": status, "reason": reason, "checked": checked}
+
+
 async def build_frame_bundle(
     client,
     target_id: str,
