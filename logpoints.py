@@ -24,16 +24,29 @@ def extract_placeholders(template: str) -> list[str]:
     return _PLACEHOLDER_RE.findall(template or "")
 
 
+def _frame_keys(stack):
+    """(oid, pid, line) по фреймам innermost-first.
+
+    RDBG callStackFormed присылает стек outermost-first: фрейм остановки —
+    ПОСЛЕДНИЙ элемент, поэтому итерируем с конца.
+    """
+    if not isinstance(stack, list):
+        return
+    for frame in reversed(stack):
+        if not isinstance(frame, dict):
+            continue
+        mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
+        try:
+            line = int(frame.get("lineNo", 0))
+        except (TypeError, ValueError):
+            continue
+        yield (mod.get("objectID", ""), mod.get("propertyID", ""), line)
+
+
 def _top_key(stack):
-    top = stack[0] if isinstance(stack, list) and stack else None
-    if not isinstance(top, dict):
-        return None
-    mod = top.get("moduleID") if isinstance(top.get("moduleID"), dict) else {}
-    try:
-        line = int(top.get("lineNo", 0))
-    except (TypeError, ValueError):
-        return None
-    return (mod.get("objectID", ""), mod.get("propertyID", ""), line)
+    for key in _frame_keys(stack):
+        return key
+    return None
 
 
 def _b64(s):
@@ -146,8 +159,9 @@ async def fire_logpoint(client, target_id: str, stack: list, log_dir: Path) -> b
     eval_expression awaits `exprEvaluated` delivered by ping_loop's _handle_command,
     which cannot run while we are inside it. (Fix 2026-06-04.)
     """
-    key = _top_key(stack)
-    if key is None or key not in client._logpoints:
+    key = next(
+        (k for k in _frame_keys(stack) if k in client._logpoints), None)
+    if key is None:
         return False
     template = client._logpoints[key]
     task = asyncio.create_task(

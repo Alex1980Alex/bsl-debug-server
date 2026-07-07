@@ -25,23 +25,33 @@ def register_line(client, object_id, property_id, line, file_path=""):
 
 
 async def record_hit_and_continue(client, target_id, stack) -> bool:
-    """If top frame matches a tracked line — increment hit + auto-Continue.
+    """If a stack frame matches a tracked line — increment hit + auto-Continue.
+
+    RDBG callStackFormed присылает стек outermost-first: фрейм остановки —
+    ПОСЛЕДНИЙ элемент, поэтому фреймы сканируются с конца (innermost-first);
+    первый же match считается точкой останова.
 
     Returns True iff suppressed (counted + Continue'd). False if not tracked.
     """
     tracked = getattr(client, "_coverage_tracked", None)
     if not tracked:
         return False
-    top = stack[0] if isinstance(stack, list) and stack else None
-    if not isinstance(top, dict):
+    if not isinstance(stack, list) or not stack:
         return False
-    mod = top.get("moduleID") if isinstance(top.get("moduleID"), dict) else {}
-    try:
-        line = int(top.get("lineNo", 0))
-    except (TypeError, ValueError):
-        return False
-    key = (mod.get("objectID", ""), mod.get("propertyID", ""), line)
-    if key not in tracked:
+    key = None
+    for frame in reversed(stack):
+        if not isinstance(frame, dict):
+            continue
+        mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
+        try:
+            line = int(frame.get("lineNo", 0))
+        except (TypeError, ValueError):
+            continue
+        cand = (mod.get("objectID", ""), mod.get("propertyID", ""), line)
+        if cand in tracked:
+            key = cand
+            break
+    if key is None:
         return False
     tracked[key]["hits"] += 1
     try:

@@ -22,15 +22,25 @@ def eval_hit_condition(cond: str, n: int) -> bool:
 
 
 async def auto_continue_if_unsatisfied(client, target_id, stack):
-    """Returns True iff BP suppressed (counter advanced + auto-Continue done)."""
-    top = stack[0] if isinstance(stack, list) and stack else None
-    if not isinstance(top, dict): return False
-    mod = top.get("moduleID") if isinstance(top.get("moduleID"), dict) else {}
-    try:
-        line = int(top.get("lineNo", 0))
-    except (TypeError, ValueError):
+    """Returns True iff BP suppressed (counter advanced + auto-Continue done).
+
+    RDBG callStackFormed присылает стек outermost-first: фрейм остановки —
+    ПОСЛЕДНИЙ элемент, поэтому фреймы сканируются с конца (innermost-first).
+    """
+    if not isinstance(stack, list):
         return False
-    return await _do_check(client, target_id, mod, line)
+    for frame in reversed(stack):
+        if not isinstance(frame, dict):
+            continue
+        mod = frame.get("moduleID") if isinstance(frame.get("moduleID"), dict) else {}
+        try:
+            line = int(frame.get("lineNo", 0))
+        except (TypeError, ValueError):
+            continue
+        key = (mod.get("objectID", ""), mod.get("propertyID", ""), line)
+        if key in client._hit_conditions:
+            return await _do_check(client, target_id, mod, line)
+    return False
 
 
 async def _do_check(client, target_id, mod, line):
