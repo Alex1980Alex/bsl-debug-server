@@ -11,6 +11,7 @@ receives `client`, never imports mcp_debug_server (avoids circular import).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -61,6 +62,10 @@ def build_page_expressions(
     batch of `<expr>[i]` reads (+ `.<column>` per row when `columns` given) sent
     in one evalLocalVariables POST. Lazy access to huge collections без обрезки /
     взрыва контекста.
+
+    SECURITY: `expression` и `columns` подставляются в BSL-выражения и
+    исполняются в running rphost через evalLocalVariables (как logpoints/eval) —
+    не передавай untrusted значения.
 
     Returns a flat list of expression strings.
     """
@@ -194,7 +199,9 @@ async def build_frame_bundle(
 
     source_context = None
     if object_id and property_id and line_no > 0:
-        source_context = read_source_context(
+        # Offload the sync resolve+read to a thread (async-first hygiene).
+        source_context = await asyncio.to_thread(
+            read_source_context,
             object_id,
             property_id,
             line_no,

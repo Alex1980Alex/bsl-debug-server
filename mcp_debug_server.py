@@ -3652,6 +3652,9 @@ async def debug_collection_page(
     `РезультатЗапроса` без обрезки или взрыва контекста: batch `<expression>[i]`
     (+ `.<column>` на строку при `columns`) одним evalLocalVariables POST.
 
+    SECURITY: `expression`/`columns` исполняются как BSL в running rphost
+    (как debug_set_logpoint / debug_evaluate) — не передавай untrusted значения.
+
     Args:
         expression: BSL-выражение коллекции (напр. `ТаблицаДанных`).
         start: индекс первого элемента (0-based).
