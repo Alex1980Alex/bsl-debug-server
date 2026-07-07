@@ -89,6 +89,23 @@ def _resolve_property_id(module_type: str, property_id: str = "") -> tuple[str, 
     return module_type, property_id
 
 
+def _apply_line_offset(client, object_id: str, line: int) -> tuple[int, int]:
+    """Apply cached per-module line offset (B2 roadmap 260708 §7.5).
+
+    Deployed-config line numbers systematically drift from git/EDT source; a BP
+    on the git line silently doesn't fire. `debug_calibrate_result` records the
+    measured offset per object_id (offset = nearest_fired − requested). This
+    applies it so a git-line BP lands on the deployed line without manual
+    calibration each time.
+
+    Returns (adjusted_line, applied_offset). No cached offset → line unchanged,
+    offset 0.
+    """
+    offsets = getattr(client, "_line_offsets", None) or {}
+    off = offsets.get(object_id, 0)
+    return (line + off if off else line), off
+
+
 def _build_request(*children_xml: str) -> str:
     """Build a JAXB-compatible RDBG XML request string.
 
@@ -1704,6 +1721,10 @@ def _get_client() -> RDBGClient:
             _client.session_id = state["session_id"]
             _client._attached = True
             _client._registered = True
+            # B2 §7.5: restore per-module line offsets (measured by calibrate).
+            lo = state.get("line_offsets")
+            if isinstance(lo, dict):
+                _client._line_offsets = {k: int(v) for k, v in lo.items()}
             try:
                 # FastMCP tool handlers run inside an active event loop, so
                 # asyncio.get_running_loop() succeeds here. RuntimeError only
@@ -2887,6 +2908,8 @@ def _persist_active_session(client: "RDBGClient") -> None:
         "debug_url": client.debug_url,
         "infobase_alias": client.infobase_alias,
         "persisted_at": _time.time(),
+        # B2 roadmap 260708 §7.5: per-module line offsets survive HMR restart.
+        "line_offsets": getattr(client, "_line_offsets", {}) or {},
     }
     try:
         os.makedirs(os.path.dirname(_ACTIVE_SESSION_PATH) or ".", exist_ok=True)
@@ -3479,6 +3502,8 @@ async def debug_set_breakpoint(
     # Re-attach moved out: debug_connect handles initial attach; повторный attach
     # перед каждым set_breakpoint ломает established BP-delivery state в dbgs.exe.
     xml_module_type, property_id = _resolve_property_id(module_type, property_id)
+    # B2 §7.5: auto-apply measured deployed↔src offset (calibrate_result).
+    line, applied_offset = _apply_line_offset(client, object_id, line)
     result = await client.set_breakpoints(
         module_type=xml_module_type,
         object_id=object_id,
@@ -3493,6 +3518,7 @@ async def debug_set_breakpoint(
             "object_id": object_id,
             "property_id": property_id,
             "line": line,
+            "applied_offset": applied_offset,
             "module_type": module_type,
             "response": result,
         },
@@ -3531,6 +3557,8 @@ async def debug_set_logpoint(
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     xml_module_type, property_id = _resolve_property_id(module_type, property_id)
+    # B2 §7.5: auto-apply measured deployed↔src offset (calibrate_result).
+    line, applied_offset = _apply_line_offset(client, object_id, line)
     await client.set_breakpoints(
         module_type=xml_module_type,
         object_id=object_id,
@@ -3544,6 +3572,7 @@ async def debug_set_logpoint(
             "object_id": object_id,
             "property_id": property_id,
             "line": line,
+            "applied_offset": applied_offset,
             "module_type": module_type,
             "message_template": message_template,
             "log_path": str(client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.jsonl"),
@@ -3967,6 +3996,12 @@ async def debug_calibrate_result(
                 "HTTP-service), pre-existing rphost, radius"
             )
         results.append(entry)
+        # B2 §7.5: record measured offset so future BPs on git lines auto-shift.
+        if entry["offset"]:
+            if not hasattr(client, "_line_offsets"):
+                client._line_offsets = {}
+            client._line_offsets[oid] = int(entry["offset"])
+            _persist_active_session(client)
         if clear:
             fan_set = set(meta["lines"])
             for ln in meta["lines"]:

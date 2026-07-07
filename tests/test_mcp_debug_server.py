@@ -3249,3 +3249,54 @@ class TestEnrichStack:
         monkeypatch.setattr(mds.uuid_index, "get_source_info", lambda o, p: {"fqn": "z"})
         out = mds._enrich_stack(["not-a-dict"])
         assert out == ["not-a-dict"]
+
+
+# ---------------------------------------------------------------------------
+# B2 (2026-07-08 §7.5): _apply_line_offset + line_offsets persist/restore
+# ---------------------------------------------------------------------------
+
+
+class TestApplyLineOffset:
+    def test_no_offsets_attr_returns_unchanged(self, client):
+        assert not hasattr(client, "_line_offsets") or not client._line_offsets
+        line, off = mds._apply_line_offset(client, "obj", 42)
+        assert (line, off) == (42, 0)
+
+    def test_offset_applied(self, client):
+        client._line_offsets = {"obj": 3}
+        line, off = mds._apply_line_offset(client, "obj", 67)
+        assert (line, off) == (70, 3)
+
+    def test_offset_for_other_object_not_applied(self, client):
+        client._line_offsets = {"other": 5}
+        line, off = mds._apply_line_offset(client, "obj", 42)
+        assert (line, off) == (42, 0)
+
+    def test_negative_offset(self, client):
+        client._line_offsets = {"obj": -2}
+        line, off = mds._apply_line_offset(client, "obj", 10)
+        assert (line, off) == (8, -2)
+
+
+class TestLineOffsetsPersistence:
+    def test_persist_includes_offsets_and_load_restores(self, client, tmp_path, monkeypatch):
+        path = str(tmp_path / ".active.json")
+        monkeypatch.setattr(mds, "_ACTIVE_SESSION_PATH", path)
+        client._attached = True
+        client._registered = True
+        client.session_id = "sess-1"
+        client._line_offsets = {"objA": 3, "objB": -1}
+        mds._persist_active_session(client)
+        loaded = mds._load_active_session()
+        assert loaded["line_offsets"] == {"objA": 3, "objB": -1}
+        assert loaded["session_id"] == "sess-1"
+
+    def test_persist_empty_offsets_when_absent(self, client, tmp_path, monkeypatch):
+        path = str(tmp_path / ".active.json")
+        monkeypatch.setattr(mds, "_ACTIVE_SESSION_PATH", path)
+        client._attached = True
+        client._registered = True
+        client.session_id = "sess-2"
+        mds._persist_active_session(client)
+        loaded = mds._load_active_session()
+        assert loaded["line_offsets"] == {}
