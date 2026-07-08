@@ -255,6 +255,11 @@ class RDBGClient:
     def __init__(self, debug_url: str = "http://localhost:1550", infobase_alias: str = "DefAlias"):
         self.debug_url = debug_url.rstrip("/")
         self.infobase_alias = infobase_alias
+        # B5 (roadmap 260708 W2): tell uuid_index which infobase's EDT export to
+        # use for UUID->source resolution on this connection (portability across
+        # Transport / SVETLY / MFM). No-op unless BSL_DEBUG_CONFIG_SRC_MAP maps
+        # the alias. One live connection at a time -> module-global is exact.
+        uuid_index.set_active_config(infobase_alias)
         self.session_id = str(uuid.uuid4())
         self._http = httpx.AsyncClient(timeout=30.0, headers=self.HEADERS)
         self._attached = False
@@ -1408,7 +1413,7 @@ class RDBGClient:
             line_no = int(line_no_raw)
         except (TypeError, ValueError):
             return []
-        path = uuid_index.resolve_uuid(object_id, property_id)
+        path = uuid_index.resolve_uuid(object_id, property_id, alias=self.infobase_alias)
         if path is None or not path.exists():
             log.info(
                 "eval_locals_auto: UUID %s + %s -> no source path", object_id[:8], property_id[:8]

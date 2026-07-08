@@ -15,6 +15,7 @@ Lazy-build at first call, optional disk cache by `src/` mtime.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -90,34 +91,56 @@ class UUIDIndex:
         self._lock = threading.Lock()
         # uuid (lowercase) → {"mdo": str, "name": str, "kind": str, "child_kind": str|None}
         self._index: Optional[dict[str, dict]] = None
-        self._index_mtime: Optional[float] = None
 
-    def _src_mtime(self) -> Optional[float]:
-        """Coarse mtime fingerprint — top-level src/ dir change time."""
+    def _src_fingerprint(self) -> Optional[dict]:
+        """Recursive fingerprint of the .mdo tree for cache invalidation.
+
+        B5 (roadmap 260708 W2): the old coarse top-level dir mtime missed edits
+        to NESTED .mdo files (editing a module never bumps the src/ dir mtime)
+        → a stale cache was served. This walks every *.mdo and aggregates
+        {max_mtime, count, total_size}: max_mtime catches content edits, count
+        catches add/remove, total_size catches a same-mtime content swap.
+        Stat-only (no file reads) — cheaper than the full _scan(), and it runs
+        at most once per process (the result is memoised in self._index).
+        """
         try:
-            return self.config_src.stat().st_mtime
+            if not self.config_src.exists():
+                return None
+            max_mtime = 0.0
+            count = 0
+            total_size = 0
+            for mdo in self.config_src.rglob("*.mdo"):
+                try:
+                    st = mdo.stat()
+                except OSError:
+                    continue
+                count += 1
+                total_size += st.st_size
+                if st.st_mtime > max_mtime:
+                    max_mtime = st.st_mtime
+            return {"max_mtime": max_mtime, "count": count, "total_size": total_size}
         except OSError:
             return None
 
-    def _load_cache(self) -> Optional[dict[str, dict]]:
+    def _load_cache(self, fingerprint: Optional[dict]) -> Optional[dict[str, dict]]:
         if not self.cache_path.exists():
             return None
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            if data.get("src_mtime") != self._src_mtime():
-                log.debug("UUID cache stale (mtime mismatch), rebuilding")
+            if data.get("src_fingerprint") != fingerprint:
+                log.debug("UUID cache stale (fingerprint mismatch), rebuilding")
                 return None
             return data.get("entries")
         except (OSError, json.JSONDecodeError, KeyError) as e:
             log.debug("UUID cache load failed (%s), rebuilding", e)
             return None
 
-    def _save_cache(self, entries: dict[str, dict]) -> None:
+    def _save_cache(self, entries: dict[str, dict], fingerprint: Optional[dict]) -> None:
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             self.cache_path.write_text(
                 json.dumps(
-                    {"src_mtime": self._src_mtime(), "entries": entries},
+                    {"src_fingerprint": fingerprint, "entries": entries},
                     ensure_ascii=False,
                 ),
                 encoding="utf-8",
@@ -170,14 +193,15 @@ class UUIDIndex:
         with self._lock:
             if self._index is not None:
                 return self._index
-            cached = self._load_cache()
+            fingerprint = self._src_fingerprint()
+            cached = self._load_cache(fingerprint)
             if cached is not None:
                 self._index = cached
                 log.debug("UUID index loaded from cache (%d entries)", len(cached))
                 return self._index
             entries = self._scan()
             self._index = entries
-            self._save_cache(entries)
+            self._save_cache(entries, fingerprint)
             return self._index
 
     def reset(self) -> None:
@@ -265,11 +289,77 @@ def get_default_index() -> UUIDIndex:
     return _default
 
 
-def resolve_uuid(object_id: str, property_id: str) -> Optional[Path]:
-    """Module-level convenience — uses default singleton index."""
-    return get_default_index().resolve(object_id, property_id)
+# --- B5 (roadmap 260708 W2): per-infobase config_src for portability ---
+# One debug server can target different infobases (Transport / SVETLY / MFM),
+# each with its own EDT export. Map infobase alias -> config src via env
+# BSL_DEBUG_CONFIG_SRC_MAP="Alias1=C:\\path1;Alias2=D:\\path2" ('=' separates
+# alias from path because Windows paths contain ':'). Unmapped aliases fall back
+# to BSL_DEBUG_CONFIG_SRC / DEFAULT_CONFIG_SRC, so behaviour is unchanged when
+# the env var is absent.
+_indexes_by_alias: dict[str, UUIDIndex] = {}
+_alias_lock = threading.Lock()
+_active_alias: Optional[str] = None
 
 
-def get_source_info(object_id: str, property_id: str) -> Optional[dict]:
-    """P0.C roadmap 260511: convenience wrapper around UUIDIndex.get_source_info."""
-    return get_default_index().get_source_info(object_id, property_id)
+def _parse_config_src_map() -> dict[str, Path]:
+    """Parse BSL_DEBUG_CONFIG_SRC_MAP ('Alias=path;Alias=path')."""
+    raw = os.environ.get("BSL_DEBUG_CONFIG_SRC_MAP", "").strip()
+    mapping: dict[str, Path] = {}
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        alias, _, path = entry.partition("=")
+        alias, path = alias.strip(), path.strip()
+        if alias and path:
+            mapping[alias] = Path(path)
+    return mapping
+
+
+def _cache_path_for(config_src: Path) -> Path:
+    """Distinct cache file per config_src so infobases don't clobber each other."""
+    h = hashlib.sha1(str(config_src).encode("utf-8")).hexdigest()[:12]
+    return CACHE_PATH.with_name(f"{CACHE_PATH.stem}_{h}{CACHE_PATH.suffix}")
+
+
+def set_active_config(alias: Optional[str]) -> None:
+    """Select which infobase's config_src the module-level resolve_uuid /
+    get_source_info use by default. Called on connect / session restore -- there
+    is one live RDBG connection at a time, so a module-global active alias is
+    exact, not a heuristic."""
+    global _active_alias
+    _active_alias = alias
+
+
+def get_index_for_alias(alias: Optional[str]) -> UUIDIndex:
+    """UUIDIndex for infobase `alias`. A mapped alias gets a dedicated index
+    (its own cache file); everything else reuses the default singleton, so
+    behaviour is unchanged when BSL_DEBUG_CONFIG_SRC_MAP is unset."""
+    if not alias:
+        return get_default_index()
+    config_src = _parse_config_src_map().get(alias)
+    if config_src is None:
+        return get_default_index()
+    key = str(config_src)
+    with _alias_lock:
+        idx = _indexes_by_alias.get(key)
+        if idx is None:
+            idx = UUIDIndex(config_src=config_src, cache_path=_cache_path_for(config_src))
+            _indexes_by_alias[key] = idx
+        return idx
+
+
+def resolve_uuid(object_id: str, property_id: str,
+                 alias: Optional[str] = None) -> Optional[Path]:
+    """Module-level convenience -- routes to the active/aliased config index."""
+    return get_index_for_alias(
+        alias if alias is not None else _active_alias
+    ).resolve(object_id, property_id)
+
+
+def get_source_info(object_id: str, property_id: str,
+                    alias: Optional[str] = None) -> Optional[dict]:
+    """P0.C roadmap 260511: convenience wrapper (alias-aware since B5)."""
+    return get_index_for_alias(
+        alias if alias is not None else _active_alias
+    ).get_source_info(object_id, property_id)

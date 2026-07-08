@@ -9,7 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from uuid_index import UUIDIndex, MODULE_PROPERTY_FILES
+import uuid_index
+from uuid_index import MODULE_PROPERTY_FILES, UUIDIndex
 
 
 COMMON_MODULE_PROP = "d5963243-262e-4398-b4d7-fb16d06484f6"
@@ -161,3 +162,151 @@ class TestUUIDIndexEdgeCases:
         assert len(MODULE_PROPERTY_FILES) == 6
         for prop_id, (filename, _) in MODULE_PROPERTY_FILES.items():
             assert filename.endswith(".bsl")
+
+
+# --- B5 (roadmap 260708 W2): portability + recursive cache-invalidation ---
+
+
+@pytest.fixture
+def reset_uuid_globals(monkeypatch):
+    """Isolate module-level singletons / env between tests (B5)."""
+    monkeypatch.delenv("BSL_DEBUG_CONFIG_SRC", raising=False)
+    monkeypatch.delenv("BSL_DEBUG_CONFIG_SRC_MAP", raising=False)
+    uuid_index._default = None
+    uuid_index._indexes_by_alias = {}
+    uuid_index._active_alias = None
+    yield
+    uuid_index._default = None
+    uuid_index._indexes_by_alias = {}
+    uuid_index._active_alias = None
+
+
+class TestConfigSrcMap:
+    """B5.a: BSL_DEBUG_CONFIG_SRC_MAP parsing + alias routing."""
+
+    def test_parse_empty(self, reset_uuid_globals):
+        assert uuid_index._parse_config_src_map() == {}
+
+    def test_parse_windows_paths_with_colon(self, reset_uuid_globals, monkeypatch):
+        monkeypatch.setenv(
+            "BSL_DEBUG_CONFIG_SRC_MAP",
+            r"SVETLY=C:\repo\SVETLY\src; MFM=D:\repo\MFM\src",
+        )
+        assert uuid_index._parse_config_src_map() == {
+            "SVETLY": Path(r"C:\repo\SVETLY\src"),
+            "MFM": Path(r"D:\repo\MFM\src"),
+        }
+
+    def test_parse_ignores_malformed(self, reset_uuid_globals, monkeypatch):
+        monkeypatch.setenv("BSL_DEBUG_CONFIG_SRC_MAP", "noeq; =nopath; A=; B=C:\\ok")
+        assert uuid_index._parse_config_src_map() == {"B": Path(r"C:\ok")}
+
+    def test_unmapped_alias_falls_back_to_default(self, reset_uuid_globals):
+        assert uuid_index.get_index_for_alias("nope") is uuid_index.get_default_index()
+
+    def test_none_alias_returns_default(self, reset_uuid_globals):
+        assert uuid_index.get_index_for_alias(None) is uuid_index.get_default_index()
+
+    def test_mapped_alias_gets_dedicated_cached_index(
+        self, reset_uuid_globals, monkeypatch, synthetic_src
+    ):
+        monkeypatch.setenv("BSL_DEBUG_CONFIG_SRC_MAP", f"SVETLY={synthetic_src}")
+        idx = uuid_index.get_index_for_alias("SVETLY")
+        assert idx is not uuid_index.get_default_index()
+        assert idx.config_src == synthetic_src
+        assert uuid_index.get_index_for_alias("SVETLY") is idx  # cached
+
+    def test_explicit_alias_resolves_against_its_own_src(
+        self, reset_uuid_globals, monkeypatch, synthetic_src
+    ):
+        monkeypatch.setenv("BSL_DEBUG_CONFIG_SRC_MAP", f"SVETLY={synthetic_src}")
+        path = uuid_index.resolve_uuid(
+            "aaaa1111-aaaa-1111-aaaa-111111111111", COMMON_MODULE_PROP, alias="SVETLY"
+        )
+        assert path is not None and path.exists()
+        assert str(synthetic_src) in str(path)
+
+    def test_cache_path_per_config_is_distinct(self, reset_uuid_globals):
+        a = uuid_index._cache_path_for(Path(r"C:\a\src"))
+        b = uuid_index._cache_path_for(Path(r"C:\b\src"))
+        assert a != b
+        assert a.suffix == ".json"
+
+
+class TestActiveConfig:
+    """B5.a: set_active_config routes the module-level resolve_uuid."""
+
+    def test_active_alias_routes_resolve(
+        self, reset_uuid_globals, monkeypatch, synthetic_src
+    ):
+        monkeypatch.setenv("BSL_DEBUG_CONFIG_SRC_MAP", f"SVETLY={synthetic_src}")
+        uuid_index.set_active_config("SVETLY")
+        path = uuid_index.resolve_uuid(  # no explicit alias -> uses active
+            "bbbb2222-bbbb-2222-bbbb-222222222222", OBJECT_MODULE_PROP
+        )
+        assert path is not None
+        assert str(synthetic_src) in str(path)
+
+    def test_active_none_uses_default_env(
+        self, reset_uuid_globals, monkeypatch, synthetic_src
+    ):
+        monkeypatch.setenv("BSL_DEBUG_CONFIG_SRC", str(synthetic_src))
+        uuid_index.set_active_config(None)
+        path = uuid_index.resolve_uuid(
+            "aaaa1111-aaaa-1111-aaaa-111111111111", COMMON_MODULE_PROP
+        )
+        assert path is not None and path.exists()
+
+
+class TestSrcFingerprint:
+    """B5.b: recursive fingerprint invalidates cache on nested edit/add/remove."""
+
+    def test_fingerprint_shape(self, synthetic_src, tmp_path):
+        idx = UUIDIndex(config_src=synthetic_src, cache_path=tmp_path / "c.json")
+        fp = idx._src_fingerprint()
+        assert set(fp) == {"max_mtime", "count", "total_size"}
+        assert fp["count"] >= 2
+        assert fp["total_size"] > 0
+
+    def test_fingerprint_none_when_src_missing(self, tmp_path):
+        idx = UUIDIndex(config_src=tmp_path / "nope", cache_path=tmp_path / "c.json")
+        assert idx._src_fingerprint() is None
+
+    def test_nested_mdo_edit_invalidates_cache(self, synthetic_src, tmp_path):
+        # Regression: old coarse top-level dir mtime missed NESTED .mdo edits.
+        cache_file = tmp_path / "c.json"
+        idx1 = UUIDIndex(config_src=synthetic_src, cache_path=cache_file)
+        idx1.resolve("bbbb2222-bbbb-2222-bbbb-222222222222", OBJECT_MODULE_PROP)
+        assert cache_file.exists()
+        fp_before = idx1._src_fingerprint()
+        mdo = synthetic_src / "Documents" / "ТестовыйДокумент" / "ТестовыйДокумент.mdo"
+        text = mdo.read_text(encoding="utf-8").replace(
+            "</mdclass:Document>",
+            '<forms uuid="ffff6666-ffff-6666-ffff-666666666666">'
+            "<name>ФормаНовая</name></forms></mdclass:Document>",
+        )
+        mdo.write_text(text, encoding="utf-8")
+        assert idx1._src_fingerprint() != fp_before  # total_size changed -> detected
+        # Fresh instance sharing the cache must rebuild and see the new child UUID.
+        idx2 = UUIDIndex(config_src=synthetic_src, cache_path=cache_file)
+        assert idx2.lookup("ffff6666-ffff-6666-ffff-666666666666") is not None
+
+    def test_added_mdo_bumps_count(self, synthetic_src, tmp_path):
+        idx = UUIDIndex(config_src=synthetic_src, cache_path=tmp_path / "c.json")
+        fp = idx._src_fingerprint()
+        new_dir = synthetic_src / "Catalogs" / "Новый"
+        new_dir.mkdir(parents=True)
+        (new_dir / "Новый.mdo").write_text(
+            '<mdclass:Catalog uuid="99999999-9999-9999-9999-999999999999">'
+            "<name>Новый</name></mdclass:Catalog>",
+            encoding="utf-8",
+        )
+        assert idx._src_fingerprint()["count"] == fp["count"] + 1
+
+    def test_removed_mdo_drops_count(self, synthetic_src, tmp_path):
+        idx = UUIDIndex(config_src=synthetic_src, cache_path=tmp_path / "c.json")
+        fp = idx._src_fingerprint()
+        (
+            synthetic_src / "CommonModules" / "ОбщегоНазначения" / "ОбщегоНазначения.mdo"
+        ).unlink()
+        assert idx._src_fingerprint()["count"] == fp["count"] - 1
