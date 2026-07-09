@@ -16,6 +16,9 @@ test_full*.sh
 test_full*.log
 test_quick*.sh
 
+# Archived dev-scratch (B5.c roadmap 260708 W2 — ad-hoc RDBG exploration scripts/logs)
+archive/
+
 # VS Code extension builds
 *.vsix
 
