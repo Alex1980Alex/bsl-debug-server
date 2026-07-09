@@ -264,3 +264,115 @@ async def build_frame_bundle(
         "locals": locals_list,
         "locals_mode": locals_mode,
     }
+
+
+def extract_exception_symptom(exc) -> dict:
+    """Best-effort {code, message} from an RDBG exception dict (shape varies).
+
+    Live shape (rteProcessing): `{code, info}`; exception_bps also probes
+    `messageText/message/text/description`. Walk a superset, never raise.
+    """
+    if not isinstance(exc, dict):
+        return {"code": "", "message": ""}
+    code = ""
+    for k in ("code", "_code", "errorCode"):
+        v = exc.get(k)
+        if v not in (None, "", {}, []):
+            code = str(v).strip()
+            break
+    message = ""
+    for k in ("messageText", "message", "info", "text", "description", "descr"):
+        v = exc.get(k)
+        if isinstance(v, str) and v:
+            message = v.strip()
+            break
+    return {"code": code, "message": message}
+
+
+async def build_diagnosis_record(
+    client,
+    target_id: str,
+    max_frames: int = 3,
+    context_radius: int = 2,
+) -> dict:
+    """A2 (roadmap 260708 §7.6 / SWE-Doctor): structured diagnosis-record from an
+    exception stop — fault location, runtime symptom, propagation path, observed
+    values.
+
+    Args:
+        client: RDBGClient with an exception-stopped target (reason="exception").
+        target_id: concrete target UUID.
+        max_frames: how many innermost frames to inspect WITH locals (bounded —
+            deep-frame eval is costly and the ephemeral-JOB halt window is 1-2s).
+        context_radius: source lines above/below per inspected frame.
+
+    Returns {fault_location, runtime_symptom, propagation_path, frames_inspected,
+    frames_total, frames_bounded}. The full stack is always in
+    `propagation_path`; `frames_bounded`/`frames_total` surface any truncation
+    (no silent cap — roadmap §3 op-note 4). Never raises for "no source"/"no
+    locals" — degrades via build_frame_bundle's own graceful modes.
+    """
+    # Prefer cached stack (populated by rteProcessing/callStackFormed); pull on miss.
+    stack = client._last_stack_by_target.get(target_id)
+    if not stack:
+        try:
+            stack = await client.get_call_stack(target_id)
+        except Exception as e:
+            log.warning("build_diagnosis_record stack pull failed: %s", e)
+            stack = []
+        if stack:
+            client._last_stack_by_target[target_id] = stack
+    stack = stack or []
+    depth = len(stack)
+
+    exc = getattr(client, "_last_exception_by_target", {}).get(target_id) or {}
+    symptom = extract_exception_symptom(exc)
+
+    # Propagation path — lightweight per-frame (RDBG callStack = OUTERMOST-first,
+    # so index 0 = outermost caller, last = fault frame; cheap resolve, no eval).
+    propagation_path: list = []
+    for i, fr in enumerate(stack):
+        frd = fr if isinstance(fr, dict) else {}
+        mod = frd.get("moduleID") if isinstance(frd.get("moduleID"), dict) else {}
+        info = uuid_index.get_source_info(mod.get("objectID", ""), mod.get("propertyID", "")) or {}
+        propagation_path.append(
+            {
+                "index": i,
+                "fqn": info.get("fqn"),
+                "file_path": info.get("file_path"),
+                "line": frd.get("lineNo"),
+            }
+        )
+
+    # Observed values — top-N innermost frames (stack_level 0..n-1) WITH locals +
+    # source context. stack_level indexing is innermost-first (Ф-2), matching
+    # build_frame_bundle, so level 0 = the fault frame.
+    n = max(0, min(max_frames, depth))
+    frames_inspected: list = []
+    for lvl in range(n):
+        frames_inspected.append(
+            await build_frame_bundle(
+                client, target_id, stack_level=lvl, context_radius=context_radius
+            )
+        )
+
+    # Fault location = innermost frame (stack_level 0).
+    fault_location = None
+    if frames_inspected:
+        fb = frames_inspected[0]
+        rs = fb.get("resolved_source") or {}
+        frame = fb.get("frame") or {}
+        fault_location = {
+            "fqn": rs.get("fqn"),
+            "file_path": rs.get("file_path"),
+            "line": frame.get("lineNo"),
+        }
+
+    return {
+        "fault_location": fault_location,
+        "runtime_symptom": symptom,
+        "propagation_path": propagation_path,
+        "frames_inspected": frames_inspected,
+        "frames_total": depth,
+        "frames_bounded": n < depth,
+    }

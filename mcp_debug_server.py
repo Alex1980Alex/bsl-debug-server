@@ -916,6 +916,10 @@ class RDBGClient:
             snapshot.record(
                 self, target_id, "exception", stack, exc if isinstance(exc, dict) else None
             )
+            # A2 (roadmap 260708 §7.6): wake event-driven waiters
+            # (debug_root_cause collect) — non-suppressed exception stop only
+            # (filtered ones already returned above), matching reasons=("exception",).
+            self._signal_bp_stop()
 
         elif cmd_type == "targetQuit":
             if target_id:
@@ -1854,12 +1858,19 @@ def _enrich_stack(stack: list) -> list:
     return enriched
 
 
-async def _await_bp_stop(client: "RDBGClient", timeout_sec: float) -> str:
-    """B3 (roadmap 260708 §7.6): event-driven wait for a USER-VISIBLE breakpoint
-    stop — replaces the fixed 0.3s poll-loop that debug_autotrace collect used.
+async def _await_bp_stop(
+    client: "RDBGClient", timeout_sec: float, reasons: tuple = ("breakpoint",)
+) -> str:
+    """B3 (roadmap 260708 §7.6): event-driven wait for a USER-VISIBLE stop —
+    replaces the fixed 0.3s poll-loop that debug_autotrace collect used.
+
+    `reasons` selects which stop kinds count (default `("breakpoint",)` for A1;
+    A2 `debug_root_cause` passes `("exception",)`). The Event is signalled
+    (`_signal_bp_stop`) on both user-visible breakpoint AND exception stops, so
+    either waiter wakes event-driven.
 
     Predicate (source of truth, identical to the prior poll-loop): a target in
-    `client._stopped_targets` whose reason is "breakpoint", surviving a 0.15s
+    `client._stopped_targets` whose reason is in `reasons`, surviving a 0.15s
     debounce. Live-баг 2026-07-08: сырой resolve ловил транзиентный СИСТЕМНЫЙ
     halt (spawn-halt свежего rphost, reason="step"), который system_stops
     дренирует и Continue'ит — handler добавляет target в `_stopped_targets`
@@ -1882,7 +1893,7 @@ async def _await_bp_stop(client: "RDBGClient", timeout_sec: float) -> str:
             (
                 t
                 for t in getattr(client, "_stopped_targets", set())
-                if client._stop_reason_by_target.get(t) == "breakpoint"
+                if client._stop_reason_by_target.get(t) in reasons
             ),
             "",
         )
@@ -3692,6 +3703,107 @@ async def debug_autotrace(
                 log.warning("autotrace collect: Continue failed", exc_info=True)
     except Exception as e:
         log.exception("debug_autotrace failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, phase=phase)
+
+
+@mcp.tool()
+async def debug_root_cause(
+    exception_message: str = "",
+    exception_module: str = "",
+    phase: str = "collect",
+    timeout_sec: float = 20.0,
+    max_frames: int = 3,
+    context_radius: int = 2,
+) -> str:
+    """A2 (roadmap 260708 §7.6): автономный root-cause на необработанном
+    исключении → structured diagnosis-record (SWE-Doctor: fault location, runtime
+    symptom, propagation path, observed values) в минимуме ручной оркестрации.
+
+    **Two-phase** (Ф-1 §7.0: `trigger` исполняет ВЫЗЫВАЮЩИЙ через другой
+    MCP-сервер `1c-mcp-crud`, поэтому wrapper не бросает исключение сам):
+
+    1. `phase="arm"`: (опц.) фильтр исключений `exception_message` /
+       `exception_module` (substring, как `debug_set_exception_bp` — не-совпавшие
+       исключения авто-Continue'ятся) + silent break-on-next → `{status:"armed"}`.
+       Затем ВЫ триггерите код, бросающий исключение (execute_code / UI / JOB).
+    2. `phase="collect"` (default): ждёт `rteProcessing`-стоп до `timeout_sec`,
+       собирает diagnosis-record, делает Continue (release rphost).
+
+    **Контракт возврата:** `{diagnosis, raw}`. `raw.hit` — было ли исключение;
+    `diagnosis` — структурированная запись (или `null` при NO_HIT). Фильтр из
+    `arm` остаётся в сессии (как `debug_set_exception_bp`) — сбрасывается
+    `debug_clear_exception_bps`.
+
+    **Bounded** (roadmap A2): локали собираются только для top-`max_frames`
+    innermost фреймов (глубокий eval дорог, halt-окно эфемерного JOB 1-2с);
+    полный стек всегда в `propagation_path`, усечение видно в
+    `frames_bounded`/`frames_total`. До B1 (persistent JOB-контекст) полный обход
+    может не влезть в окно → дефолт top-3.
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+
+        if phase == "arm":
+            added = None
+            if exception_message or exception_module:
+                added = {
+                    "message_pattern": exception_message,
+                    "module_pattern": exception_module,
+                }
+                client._exception_bp_filters.append(added)
+            await client.set_break_on_next_statement(silent=True)
+            return json.dumps(
+                {
+                    "status": "armed",
+                    "exception_filter": added,
+                    "exception_filters_total": len(client._exception_bp_filters),
+                    "next": (
+                        "trigger code that raises an unhandled exception "
+                        "(execute_code / UI / JOB), then call "
+                        "debug_root_cause(phase='collect')"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if phase != "collect":
+            return _error_json(f"unknown phase '{phase}'", "bad_phase")
+
+        # collect: wait for a USER-VISIBLE exception stop (B3 event-driven waiter,
+        # reasons=("exception",) — _handle_command signals on non-suppressed
+        # rteProcessing). Filtered exceptions were auto-Continue'd upstream.
+        _t0 = asyncio.get_running_loop().time()
+        target_id = await _await_bp_stop(client, timeout_sec, reasons=("exception",))
+        if not target_id:
+            waited = asyncio.get_running_loop().time() - _t0
+            return json.dumps(
+                {"diagnosis": None, "raw": {"hit": False, "waited_sec": round(waited, 1)}},
+                ensure_ascii=False,
+                indent=2,
+            )
+        try:
+            record = await autonomy.build_diagnosis_record(
+                client,
+                target_id,
+                max_frames=max_frames,
+                context_radius=context_radius,
+            )
+            return json.dumps(
+                {"diagnosis": record, "raw": {"hit": True, "target_id": target_id}},
+                ensure_ascii=False,
+                indent=2,
+            )
+        finally:
+            # Release rphost even on exception/collect-error (Шаблон 5 шаг 8).
+            try:
+                await client.step("Continue", target_uuid=target_id)
+            except Exception:
+                log.warning("root_cause collect: Continue failed", exc_info=True)
+    except Exception as e:
+        log.exception("debug_root_cause failed")
         return _error_json(_rdbg_error_text(e), type(e).__name__, phase=phase)
 
 

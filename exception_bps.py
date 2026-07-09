@@ -34,7 +34,11 @@ def should_halt(filters: list, exc_info: dict, stack: list) -> bool:
 def _extract_message(exc_info) -> str:
     if not isinstance(exc_info, dict):
         return ""
-    for key in ("messageText", "message", "text", "description"):
+    # `info` added 2026-07-10 (A2 code-verify): live rteProcessing carries the
+    # message text in `info` (see autonomy.extract_exception_symptom); without it
+    # a message_pattern filter never matched real exceptions → suppressed exactly
+    # the exception it was meant to catch. Aligned with extract_exception_symptom.
+    for key in ("messageText", "message", "info", "text", "description", "descr"):
         v = exc_info.get(key)
         if isinstance(v, str) and v:
             return v
