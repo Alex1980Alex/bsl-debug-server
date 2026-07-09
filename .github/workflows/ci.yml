@@ -1,0 +1,36 @@
+# B5.d roadmap 260708 (2026-07-10): Python CI заменил gradle build.yml
+# (Java CI имел 0 запусков за всю жизнь форка; живой код сабмодуля — Python
+# MCP-wrapper + 366 unit). src/main/java (yukon39) остаётся как офлайн-reference
+# RDBG wire-protocol и НЕ собирается.
+name: Python CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install pytest pytest-asyncio httpx mcp
+
+      # Структурный smoke: компилируются все модули wrapper'а (вкл. HMR-обёртку,
+      # которую тесты не импортируют)
+      - name: Compile smoke
+        run: >-
+          python -m compileall -q
+          mcp_debug_server.py mcp_hmr_proc.py autonomy.py bsl_locals.py
+          uuid_index.py logpoints.py coverage.py snapshot.py exception_bps.py
+          bp_conditions.py system_stops.py artifacts.py
+
+      - name: Unit tests
+        run: python -m pytest tests/ -q

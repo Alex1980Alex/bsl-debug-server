@@ -22,6 +22,10 @@ archive/
 # VS Code extension builds
 *.vsix
 
+# Local build artifact (B5.d roadmap 260708: untracked 12MB jar; reproducible via
+# ./gradlew build or upstream yukon39 releases; gradle/wrapper/*.jar stays tracked)
+bsl-debug-server-*.jar
+
 # Runtime debug artifacts (HMR session persistence + P0.B logpoint JSONL + P1.B ZIP bundles)
 data/debug_sessions/
 data/debug_logs/
