@@ -12,7 +12,9 @@ receives `client`, never imports mcp_debug_server (avoids circular import).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from pathlib import Path
 
 import uuid_index
@@ -376,3 +378,160 @@ async def build_diagnosis_record(
         "frames_total": depth,
         "frames_bounded": n < depth,
     }
+
+
+# ---------------------------------------------------------------------------
+# A3 debug_trace_variable — timeline over auto-logpoints (roadmap 260708 §7.6)
+# ---------------------------------------------------------------------------
+
+# BSL identifier: Cyrillic/Latin letter or underscore, then word chars (incl. Cyrillic).
+_BSL_IDENT_RE = re.compile(r"[A-Za-z_А-яЁё][\wА-яЁё]*")
+
+# Keywords / literals to exclude from "upstream" RHS identifiers (ru + en).
+_BSL_KEYWORDS = frozenset(
+    w.lower()
+    for w in (
+        "Если", "Тогда", "Иначе", "ИначеЕсли", "КонецЕсли", "Для", "Каждого", "Из",
+        "По", "Цикл", "КонецЦикла", "Пока", "Возврат", "Продолжить", "Прервать",
+        "И", "ИЛИ", "НЕ", "Новый", "Истина", "Ложь", "Неопределено", "NULL",
+        "Попытка", "Исключение", "КонецПопытки", "ВызватьИсключение", "Перем",
+        "Функция", "Процедура", "КонецФункции", "КонецПроцедуры", "Экспорт",
+        "If", "Then", "Else", "ElsIf", "EndIf", "For", "Each", "In", "To", "Do",
+        "EndDo", "While", "Return", "Continue", "Break", "And", "Or", "Not", "New",
+        "True", "False", "Undefined", "Try", "Except", "EndTry", "Raise", "Var",
+    )
+)
+
+
+def find_method_range(source_lines: list, method_name: str):
+    """1-based inclusive [start, end] line range of `Процедура/Функция method_name`.
+
+    Returns (start, end) or None if not found. `end` is the matching
+    `КонецПроцедуры/КонецФункции` (or last line if unterminated).
+    """
+    if not method_name:
+        return None
+    esc = re.escape(method_name)
+    head = re.compile(rf"^\s*(?:Процедура|Функция|Procedure|Function)\s+{esc}\s*\(", re.IGNORECASE)
+    tail = re.compile(r"^\s*(?:КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)\b", re.IGNORECASE)
+    start = None
+    for i, ln in enumerate(source_lines, start=1):
+        if start is None:
+            if head.search(ln):
+                start = i
+        elif tail.search(ln):
+            return (start, i)
+    return (start, len(source_lines)) if start is not None else None
+
+
+def _extract_upstream(rhs: str, name: str, cap: int = 3) -> list:
+    """RHS variable identifiers feeding the assignment (best-effort, ru+en).
+
+    Skips keywords, the traced name itself, and function-call heads (ident followed
+    by `(`). Deduped, capped. Used to trace `name` together with its inputs.
+    """
+    out: list = []
+    lname = name.lower()
+    for m in _BSL_IDENT_RE.finditer(rhs or ""):
+        ident = m.group(0)
+        low = ident.lower()
+        if low == lname or low in _BSL_KEYWORDS:
+            continue
+        # skip member-access tail (`Объект.Ident` — not a standalone variable)
+        if rhs[: m.start()].rstrip().endswith("."):
+            continue
+        # skip call heads (`Ident(` — a method/function call, not a variable)
+        if rhs[m.end():].lstrip().startswith("("):
+            continue
+        if ident not in out:
+            out.append(ident)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def find_assignment_lines(source_lines: list, name: str, line_range=None, upstream: bool = True) -> list:
+    """Lines where `name` is assigned (`name = ...` at statement start).
+
+    Statement-start anchoring skips comparison/other contexts (`Если name = ...`,
+    `Возврат name`, `Стр.name = ...`). `line_range`=(start,end) 1-based inclusive
+    scopes to a method; None = whole module. BSL `=` is both assign and compare —
+    only an assignment starts the statement with the bare identifier.
+
+    Returns [{line, text, rhs, upstream:[...]}] (1-based line numbers).
+    """
+    if not name:
+        return []
+    esc = re.escape(name)
+    # `^ws NAME ws = (not '=') RHS` — BSL has no '==', the `(?!=)` guards typos.
+    assign_re = re.compile(rf"^\s*{esc}\s*=\s*(?!=)(.*)$", re.IGNORECASE)
+    lo, hi = (line_range or (1, len(source_lines)))
+    out: list = []
+    for i in range(max(1, lo), min(len(source_lines), hi) + 1):
+        text = source_lines[i - 1]
+        m = assign_re.match(text)
+        if not m:
+            continue
+        rhs = m.group(1).strip()
+        # strip trailing line comment + semicolon for cleaner upstream parsing
+        rhs_code = rhs.split("//", 1)[0].rstrip().rstrip(";").strip()
+        out.append(
+            {
+                "line": i,
+                "text": text.rstrip(),
+                "rhs": rhs_code,
+                "upstream": _extract_upstream(rhs_code, name) if upstream else [],
+            }
+        )
+    return out
+
+
+def build_trace_template(name: str, upstream: list) -> str:
+    """Logpoint template capturing `name` (+ upstream vars): `name={name} u={u}`.
+
+    Each `{expr}` is evaluated in the stopped frame by the logpoint machinery.
+    """
+    parts = [f"{name}={{{name}}}"]
+    for u in upstream or []:
+        parts.append(f"{u}={{{u}}}")
+    return " ".join(parts)
+
+
+def read_trace_timeline(log_dir, session_id: str, keys: set, skip_lines: int, name: str) -> list:
+    """Read the logpoint JSONL and build the value timeline for one trace.
+
+    Filters to entries whose (object_id, property_id, line) ∈ `keys` and skips the
+    first `skip_lines` (entries that predate arm). Returns
+    [{line, ts, value, values, rendered}] in file order (chronological).
+    """
+    path = Path(log_dir) / f"{session_id}.jsonl"
+    if not path.exists():
+        return []
+    try:
+        raw_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        log.warning("read_trace_timeline read failed (%s): %s", path, e)
+        return []
+    out: list = []
+    for raw in raw_lines[skip_lines:]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            e = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        k = (e.get("object_id"), e.get("property_id"), e.get("line"))
+        if k not in keys:
+            continue
+        evaluated = e.get("evaluated") if isinstance(e.get("evaluated"), dict) else {}
+        out.append(
+            {
+                "line": e.get("line"),
+                "ts": e.get("ts"),
+                "value": evaluated.get(name),
+                "values": evaluated,
+                "rendered": e.get("rendered"),
+            }
+        )
+    return out

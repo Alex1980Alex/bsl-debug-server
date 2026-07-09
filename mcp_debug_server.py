@@ -352,6 +352,8 @@ class RDBGClient:
             "last_reconnect_ok": None,
             "last_reconnect_ts": None,
         }
+        # A3 (roadmap 260708): active debug_trace_variable state (arm→collect).
+        self._trace_var: Optional[dict] = None
 
     def _get_stop_event(self) -> asyncio.Event:
         """B3: session asyncio.Event for user-visible BP stops, bound to the
@@ -1728,6 +1730,14 @@ class RDBGClient:
         """
         if not self._set_breakpoints_cache:
             return
+        await self._push_bp_workspace()
+
+    async def _push_bp_workspace(self) -> None:
+        """Push the CURRENT bp cache to RDBG (setBreakpoints REPLACES the whole
+        workspace). Unlike `_reapply_bp_workspace` this pushes even an EMPTY cache
+        — used by A3 `debug_trace_variable` collect to clear its logpoint BPs from
+        RDBG after removing them from the cache (empty bpWorkspace clears all).
+        """
         module_bp_infos: list = []
         for entry in self._set_breakpoints_cache:
             mod_xml = (
@@ -2028,6 +2038,28 @@ async def _await_bp_stop(
         except asyncio.TimeoutError:
             pass
         event.clear()
+
+
+def _clear_logpoint_keys(client: "RDBGClient", keys) -> int:
+    """A3: remove logpoint keys (oid,pid,line) from `_logpoints` and drop those
+    lines from `_set_breakpoints_cache`. The caller must `_push_bp_workspace()`
+    afterwards to clear the BPs on RDBG (empty cache → empty workspace). Returns
+    the number of logpoint entries removed.
+    """
+    removed = 0
+    by_mod: dict = {}
+    for k in keys:
+        if client._logpoints.pop(k, None) is not None:
+            removed += 1
+        oid, pid, line = k
+        by_mod.setdefault((oid, pid), set()).add(line)
+    for ce in list(client._set_breakpoints_cache):
+        mod = (ce.get("object_id"), ce.get("property_id"))
+        if mod in by_mod:
+            ce["lines"] = [L for L in ce.get("lines", []) if L not in by_mod[mod]]
+            if not ce["lines"]:
+                client._set_breakpoints_cache.remove(ce)
+    return removed
 
 
 def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
@@ -3920,6 +3952,175 @@ async def debug_root_cause(
                 log.warning("root_cause collect: Continue failed", exc_info=True)
     except Exception as e:
         log.exception("debug_root_cause failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, phase=phase)
+
+
+@mcp.tool()
+async def debug_trace_variable(
+    name: str,
+    object_id: str = "",
+    module_type: str = "CommonModule",
+    property_id: str = "",
+    method: str = "",
+    phase: str = "collect",
+    max_lines: int = 20,
+    upstream: bool = True,
+) -> str:
+    """A3 (roadmap 260708 §7.6): trace-variable — авто-logpoint'ы на все строки
+    присваивания `name` (+ upstream-переменные RHS) → прогон → таймлайн значений
+    `[{line, value, ts}]` (InspectCoder «откуда взялось это значение»).
+
+    **Two-phase** (Ф-1: trigger исполняет ВЫЗЫВАЮЩИЙ через `1c-mcp-crud`):
+
+    1. `phase="arm"` (нужны `name` + `object_id`): читает исходник модуля, находит
+       строки `name = ...` (в области `method`, если задан — иначе весь модуль),
+       ставит на каждую logpoint с шаблоном `name={name} u={u}` (значение `name` +
+       её upstream-входы) + silent break-on-next → `{status:"armed", lines:[...]}`.
+       Затем ВЫ триггерите код.
+    2. `phase="collect"` (default): читает logpoint-JSONL (только записи этого
+       трейса), собирает таймлайн, снимает свои logpoint'ы (не мусорят сессию).
+
+    `name = ...` определяется по началу оператора (не ловит сравнения `Если name =`
+    и member-присваивания `Стр.name =`). Bounded `max_lines` (усечение видно в
+    `lines_bounded`). Logpoint исполняет `{expr}` как BSL в rphost — не трейсить в
+    untrusted-контексте.
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+
+        if phase == "arm":
+            if not name or not object_id:
+                return _error_json("arm requires name and object_id", "bad_args")
+            # Defensive (code-verify hardening): a prior arm without collect would
+            # leave its logpoints lingering (fire silently, pollute the log). Clear
+            # the previous trace before arming a new one.
+            if client._trace_var:
+                try:
+                    _clear_logpoint_keys(client, client._trace_var["keys"])
+                    await client._push_bp_workspace()
+                except Exception:
+                    log.warning("trace_variable arm: prior-trace cleanup failed", exc_info=True)
+                client._trace_var = None
+            xml_mt, pid = _resolve_property_id(module_type, property_id)
+            src_path = uuid_index.resolve_uuid(object_id, pid)
+            if not src_path or not Path(src_path).exists():
+                return _error_json(
+                    "source not resolvable for object_id/property_id",
+                    "no_source",
+                    object_id=object_id,
+                )
+            source_lines = (
+                Path(src_path).read_text(encoding="utf-8", errors="replace").splitlines()
+            )
+            line_range = autonomy.find_method_range(source_lines, method) if method else None
+            if method and line_range is None:
+                return _error_json(f"method '{method}' not found in source", "method_not_found")
+            all_assigns = autonomy.find_assignment_lines(
+                source_lines, name, line_range, upstream=upstream
+            )
+            if not all_assigns:
+                return json.dumps(
+                    {
+                        "status": "no_assignments",
+                        "name": name,
+                        "method": method or None,
+                        "hint": "no `name = ...` assignments found in scope",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            bounded = len(all_assigns) > max_lines
+            assigns = all_assigns[:max_lines]
+            by_template: dict = {}
+            keys: set = set()
+            lines_info: list = []
+            for a in assigns:
+                adj_line, applied_offset = _apply_line_offset(client, object_id, a["line"])
+                tmpl = autonomy.build_trace_template(name, a["upstream"])
+                by_template.setdefault(tmpl, []).append(adj_line)
+                keys.add((object_id, pid, adj_line))
+                lines_info.append(
+                    {
+                        "src_line": a["line"],
+                        "line": adj_line,
+                        "applied_offset": applied_offset,
+                        "upstream": a["upstream"],
+                        "text": a["text"],
+                    }
+                )
+            for tmpl, lns in by_template.items():
+                await client.set_breakpoints(
+                    module_type=xml_mt,
+                    object_id=object_id,
+                    property_id=pid,
+                    lines=lns,
+                    logpoint_template=tmpl,
+                )
+            # Count JSONL entries predating arm so collect reads only this run.
+            log_path = client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.jsonl"
+            armed_log_lines = 0
+            if log_path.exists():
+                try:
+                    armed_log_lines = sum(
+                        1 for _ in open(log_path, encoding="utf-8", errors="replace")
+                    )
+                except OSError:
+                    pass
+            client._trace_var = {
+                "name": name,
+                "keys": keys,
+                "armed_log_lines": armed_log_lines,
+            }
+            await client.set_break_on_next_statement(silent=True)
+            return json.dumps(
+                {
+                    "status": "armed",
+                    "name": name,
+                    "method": method or None,
+                    "lines": lines_info,
+                    "lines_bounded": bounded,
+                    "next": (
+                        "trigger the code (execute_code / UI / JOB), then call "
+                        "debug_trace_variable(phase='collect')"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if phase != "collect":
+            return _error_json(f"unknown phase '{phase}'", "bad_phase")
+
+        tv = client._trace_var
+        if not tv:
+            return _error_json(
+                "no active trace — call debug_trace_variable(phase='arm') first", "no_trace"
+            )
+        session_id = getattr(client, "session_id", "unknown")
+        timeline = autonomy.read_trace_timeline(
+            client._log_dir, session_id, tv["keys"], tv["armed_log_lines"], tv["name"]
+        )
+        # Remove our logpoints so they don't linger / fire on later runs.
+        try:
+            _clear_logpoint_keys(client, tv["keys"])
+            await client._push_bp_workspace()
+        except Exception:
+            log.warning("trace_variable collect: logpoint clear failed", exc_info=True)
+        client._trace_var = None
+        return json.dumps(
+            {
+                "name": tv["name"],
+                "hits": len(timeline),
+                "lines_traced": sorted({k[2] for k in tv["keys"]}),
+                "timeline": timeline,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_trace_variable failed")
         return _error_json(_rdbg_error_text(e), type(e).__name__, phase=phase)
 
 
