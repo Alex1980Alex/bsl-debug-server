@@ -3321,6 +3321,23 @@ class _AutotraceClient:
         self.set_bp_calls = []
         self.arm_calls = 0
         self.step_calls = []
+        # B3 (roadmap 260708 §7.6): mirror real RDBGClient event surface used by
+        # _await_bp_stop (event-driven collect wait).
+        self._bp_stop_event = None
+        self._bp_stop_event_loop = None
+
+    def _get_stop_event(self):
+        loop = asyncio.get_running_loop()
+        if self._bp_stop_event is None or self._bp_stop_event_loop is not loop:
+            self._bp_stop_event = asyncio.Event()
+            self._bp_stop_event_loop = loop
+        return self._bp_stop_event
+
+    def _signal_bp_stop(self):
+        try:
+            self._get_stop_event().set()
+        except RuntimeError:
+            pass
 
     @property
     def last_stopped_target_id(self):

@@ -335,6 +335,38 @@ class RDBGClient:
         self._force_recycle_invoked = False
         self._stop_events: list = []  # [{ts, target_id, lineNo}]
         self._rphosts_seen: set = set()
+        # B3 (roadmap 260708 §7.6): event-driven wait for user-visible BP stops.
+        # Lazily bound to the running loop (HMR-safe: recreated if the loop
+        # changes). `_stopped_targets` stays the source of truth — this Event is
+        # only a wakeup hint that removes poll-sleep latency in autotrace collect.
+        self._bp_stop_event: Optional[asyncio.Event] = None
+        self._bp_stop_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _get_stop_event(self) -> asyncio.Event:
+        """B3: session asyncio.Event for user-visible BP stops, bound to the
+        running loop.
+
+        Recreated if the loop changed (HMR restart / new session) so producer
+        (`_handle_command`) and consumer (`_await_bp_stop`) always share one
+        Event within the same loop. Must be called from within a running loop.
+        """
+        loop = asyncio.get_running_loop()
+        if self._bp_stop_event is None or self._bp_stop_event_loop is not loop:
+            self._bp_stop_event = asyncio.Event()
+            self._bp_stop_event_loop = loop
+        return self._bp_stop_event
+
+    def _signal_bp_stop(self) -> None:
+        """B3: wake event-driven waiters on a user-visible breakpoint stop.
+
+        Best-effort — no-op if there is no running loop. `_stopped_targets`
+        remains authoritative, so a missed signal only costs one safety-net
+        re-check (≤1s cap in `_await_bp_stop`), never a lost stop.
+        """
+        try:
+            self._get_stop_event().set()
+        except RuntimeError:
+            pass  # no running loop — nothing is awaiting anyway
 
     async def _post(
         self, command: str, body: str, include_dbgui_url: bool = False, _ui_plus_retry: bool = True
@@ -832,6 +864,10 @@ class RDBGClient:
                 if obj_id_top and line_no != "?":
                     key = f"{obj_id_top}:{line_no}"
                     self._bp_by_location[key] = self._bp_by_location.get(key, 0) + 1
+                # B3 (roadmap 260708 §7.6): wake event-driven waiters
+                # (debug_autotrace collect) — user-visible BP stop only, matching
+                # the reason="breakpoint" predicate in _await_bp_stop.
+                self._signal_bp_stop()
             # P2.A roadmap 260511: replay snapshot recording (after metrics gate so
             # only user-visible stops are recorded)
             if not stop_suppressed:
@@ -1816,6 +1852,55 @@ def _enrich_stack(stack: list) -> list:
                 frame["resolved_source"] = info
         enriched.append(frame)
     return enriched
+
+
+async def _await_bp_stop(client: "RDBGClient", timeout_sec: float) -> str:
+    """B3 (roadmap 260708 §7.6): event-driven wait for a USER-VISIBLE breakpoint
+    stop — replaces the fixed 0.3s poll-loop that debug_autotrace collect used.
+
+    Predicate (source of truth, identical to the prior poll-loop): a target in
+    `client._stopped_targets` whose reason is "breakpoint", surviving a 0.15s
+    debounce. Live-баг 2026-07-08: сырой resolve ловил транзиентный СИСТЕМНЫЙ
+    halt (spawn-halt свежего rphost, reason="step"), который system_stops
+    дренирует и Continue'ит — handler добавляет target в `_stopped_targets`
+    ДО фильтра system_stops, поэтому фильтруем по reason + debounce (silent-пути
+    drain+Continue снимают target через step()).
+
+    The `asyncio.Event` (set in `_handle_command` on a user-visible BP stop) is
+    only a wakeup hint → trap-latency drops from poll granularity to
+    event-dispatch (~0.1s active ping cadence). A ≤1.0s per-wait cap keeps the
+    eventual-guarantee even if a set is somehow missed (defense-in-depth): the
+    predicate re-check remains authoritative.
+
+    Returns the stopped target UUID, or "" on timeout.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_sec
+    event = client._get_stop_event()
+    while True:
+        candidate = next(
+            (
+                t
+                for t in getattr(client, "_stopped_targets", set())
+                if client._stop_reason_by_target.get(t) == "breakpoint"
+            ),
+            "",
+        )
+        if candidate:
+            await asyncio.sleep(0.15)  # debounce: пережить drain-Continue
+            if candidate in client._stopped_targets:
+                return candidate
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return ""
+        try:
+            # Wake on the next BP-stop signal; cap keeps the safety-net re-check
+            # alive even if a set was missed. clear() after wake → state re-check
+            # (below) is authoritative, so a set racing the clear is never lost.
+            await asyncio.wait_for(event.wait(), timeout=min(remaining, 1.0))
+        except asyncio.TimeoutError:
+            pass
+        event.clear()
 
 
 def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
@@ -3555,34 +3640,16 @@ async def debug_autotrace(
         if phase != "collect":
             return _error_json(f"unknown phase '{phase}'", "bad_phase")
 
-        # collect: poll for a USER-VISIBLE BP stop. Live-баг 2026-07-08: сырой
-        # _resolve_stopped_target ловил транзиентный СИСТЕМНЫЙ halt (spawn-halt
-        # свежего rphost, reason="step"), который system_stops дренирует и
-        # Continue'ит — collect возвращал hit=true до всякого триггера, а target
-        # умирал до bundle. Handler добавляет target в _stopped_targets ДО
-        # фильтра system_stops (:747), поэтому фильтруем по reason="breakpoint"
-        # + debounce 0.15s (silent-пути drain+Continue снимают target из
-        # _stopped_targets через step()).
-        poll = 0.3
-        waited = 0.0
-        target_id = ""
-        while waited < timeout_sec:
-            candidate = next(
-                (
-                    t
-                    for t in getattr(client, "_stopped_targets", set())
-                    if client._stop_reason_by_target.get(t) == "breakpoint"
-                ),
-                "",
-            )
-            if candidate:
-                await asyncio.sleep(0.15)  # debounce: пережить drain-Continue
-                if candidate in client._stopped_targets:
-                    target_id = candidate
-                    break
-            await asyncio.sleep(poll)
-            waited += poll
+        # collect: wait for a USER-VISIBLE BP stop. B3 (roadmap 260708 §7.6):
+        # event-driven wait (_await_bp_stop) вместо фиксированного 0.3s poll-loop
+        # → trap-latency с poll-гранулярности до event-dispatch (~0.1s active
+        # ping-каденс). Predicate неизменен: reason="breakpoint" + 0.15s debounce
+        # (транзиентный системный spawn-halt reason="step" отфильтрован; silent-
+        # пути drain+Continue снимают target из _stopped_targets через step()).
+        _t0 = asyncio.get_running_loop().time()
+        target_id = await _await_bp_stop(client, timeout_sec)
         if not target_id:
+            waited = asyncio.get_running_loop().time() - _t0
             verdict = (
                 {"status": "NO_HIT", "reason": f"no stop within {timeout_sec}s", "checked": []}
                 if expect
