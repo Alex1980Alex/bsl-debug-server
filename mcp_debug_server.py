@@ -341,6 +341,17 @@ class RDBGClient:
         # only a wakeup hint that removes poll-sleep latency in autotrace collect.
         self._bp_stop_event: Optional[asyncio.Event] = None
         self._bp_stop_event_loop: Optional[asyncio.AbstractEventLoop] = None
+        # B4 (roadmap 260708): heartbeat + auto-reattach recovery. The ping-loop
+        # counts consecutive ping failures; sustained loss (dbgs down / UI+
+        # unrecoverable) → bounded auto-reconnect (cooldown-throttled). Surfaced
+        # via get_target_state (session snapshot).
+        self._recovery: dict = {
+            "degraded": False,
+            "consecutive_ping_failures": 0,
+            "reconnect_attempts": 0,
+            "last_reconnect_ok": None,
+            "last_reconnect_ts": None,
+        }
 
     def _get_stop_event(self) -> asyncio.Event:
         """B3: session asyncio.Event for user-visible BP stops, bound to the
@@ -600,6 +611,9 @@ class RDBGClient:
     PING_INTERVAL_IDLE = 2.0
     PING_INTERVAL_ACTIVE = 0.1
     POST_SPAWN_POLL_SEC = 6.0  # time-based auto-attach diff (≈ legacy 3×2с)
+    # B4 (roadmap 260708): heartbeat recovery thresholds.
+    HEARTBEAT_FAIL_THRESHOLD = 3  # consecutive ping failures → degraded → reconnect
+    RECONNECT_COOLDOWN_SEC = 30.0  # min seconds between auto-reconnect attempts
 
     async def _ping_loop(self) -> None:
         """Periodic ping: keep session alive. Dispatch happens inside ping().
@@ -641,8 +655,15 @@ class RDBGClient:
                 await asyncio.sleep(interval)
                 try:
                     await self.ping()  # dispatches internally
+                    ping_ok = True
                 except Exception as e:
+                    ping_ok = False
                     log.debug("ping failed: %s", e)
+                # B4: heartbeat — sustained ping failure → bounded auto-reconnect.
+                try:
+                    await self._heartbeat_record(ping_ok)
+                except Exception as e:
+                    log.debug("heartbeat record failed: %s", e)
                 # Time-based (не per-iteration) auto-attach diff: ~6с независимо от
                 # каденса ping'а, чтобы fast-poll не молотил getDbgAllTargetStates.
                 elapsed_since_poll += interval
@@ -709,6 +730,95 @@ class RDBGClient:
         except Exception as e:
             log.warning("post-spawn attach failed: %s", e)
             return 0
+
+    async def _heartbeat_record(self, ping_ok: bool) -> None:
+        """B4 (roadmap 260708): track ping health; on sustained loss trigger a
+        bounded auto-reconnect.
+
+        Called from `_ping_loop` after every ping. `ping()` returns [] on "no
+        events" (not an error), so an exception here means a real transport
+        problem (dbgs :1550 down / connection refused, or UI+ unrecoverable even
+        after the per-call `_ui_plus_recover_and_retry`). After
+        `HEARTBEAT_FAIL_THRESHOLD` consecutive failures the session is marked
+        degraded and `_maybe_reconnect` (cooldown-throttled) attempts recovery.
+        """
+        if ping_ok:
+            if self._recovery["consecutive_ping_failures"]:
+                log.info(
+                    "[heartbeat] ping recovered after %d failure(s)",
+                    self._recovery["consecutive_ping_failures"],
+                )
+            self._recovery["consecutive_ping_failures"] = 0
+            self._recovery["degraded"] = False
+            return
+        self._recovery["consecutive_ping_failures"] += 1
+        if self._recovery["consecutive_ping_failures"] >= self.HEARTBEAT_FAIL_THRESHOLD:
+            self._recovery["degraded"] = True
+            await self._maybe_reconnect()
+
+    async def _maybe_reconnect(self) -> bool:
+        """B4: attempt an auto-reconnect, throttled by RECONNECT_COOLDOWN_SEC so a
+        dead dbgs isn't hammered every ping. Returns True on success."""
+        now = asyncio.get_running_loop().time()
+        last = self._recovery.get("last_reconnect_ts")
+        if last is not None and (now - last) < self.RECONNECT_COOLDOWN_SEC:
+            return False  # within cooldown — wait before retrying
+        self._recovery["last_reconnect_ts"] = now
+        self._recovery["reconnect_attempts"] += 1
+        try:
+            ok = await self._attempt_reconnect()
+        except Exception as e:
+            log.warning("[heartbeat] reconnect attempt raised: %s", e)
+            ok = False
+        self._recovery["last_reconnect_ok"] = ok
+        if ok:
+            self._recovery["consecutive_ping_failures"] = 0
+            self._recovery["degraded"] = False
+        return ok
+
+    async def _attempt_reconnect(self) -> bool:
+        """B4: full re-attach after sustained ping failure (dbgs restart / UI+
+        loss). Reuses the attach handshake (like `_ui_plus_full_reattach_and_retry`)
+        + re-applies the BP workspace + persists the new session_id.
+
+        ⚠ Runs INSIDE `_ping_loop`, so — unlike the per-call escalation — it must
+        NOT cancel `_ping_task` (would kill its own caller). The `finally` restores
+        `_attached`/`_registered` to True on any failure: the loop's liveness gate
+        is `_attached and _registered`, and we want the heartbeat to keep pinging +
+        retry after cooldown (a dead dbgs already leaves those True today). The
+        truth about health lives in `_recovery["degraded"]`.
+
+        Returns True only on successful re-registration.
+        """
+        old_sid = self.session_id
+        try:
+            try:
+                # cancel_ping=False: we ARE _ping_task — cancelling it (detach's
+                # default) would kill the heartbeat loop mid-reconnect.
+                await self.detach(cancel_ping=False)
+            except Exception:
+                pass  # dbgs may be down — best-effort cleanup of old session
+            self.session_id = str(uuid.uuid4())
+            # attach() sets _attached/_registered, re-creates _ping_task only if
+            # done() (ours is alive → no duplicate), and persists the new session.
+            await self.attach(cleanup_stale=False)  # raises if dbgs unreachable
+            if not self._registered:
+                log.warning("[heartbeat] re-attach not registered (ibInDebug?)")
+                return False
+            await self.init_settings()
+            await self.clear_break_on_next_statement()
+            await self.set_auto_attach_settings()
+            try:
+                await self._reapply_bp_workspace()
+            except Exception as e:
+                log.warning("[heartbeat] BP re-apply after reconnect failed: %s", e)
+            log.info("[heartbeat] auto-reconnect OK %s → %s", old_sid[:8], self.session_id[:8])
+            return True
+        finally:
+            # Keep the heartbeat loop alive regardless of outcome (see docstring).
+            if not self._registered:
+                self._attached = True
+                self._registered = True
 
     # Real-world finding 2026-05-09 §13.18: RDBG может emit `cmdIDNum=N` без
     # literal `cmdId="literal"`. Map ordinal → cmdId per yukon39 DBGUIExtCmds
@@ -1109,8 +1219,13 @@ class RDBGClient:
         await self._post("setAutoAttachSettings", body)
         return True
 
-    async def detach(self) -> bool:
-        if self._ping_task and not self._ping_task.done():
+    async def detach(self, cancel_ping: bool = True) -> bool:
+        # B4: `cancel_ping=False` for the heartbeat reconnect path, which calls
+        # detach from INSIDE _ping_task — cancelling it there would kill the loop
+        # (CancelledError is a BaseException, uncaught by `except Exception`).
+        # All other callers keep the default (they run outside the loop and want
+        # the ping-task torn down / recreated via attach()).
+        if cancel_ping and self._ping_task and not self._ping_task.done():
             self._ping_task.cancel()
         body = _build_request(
             _rdbg("infoBaseAlias", self.infobase_alias),
@@ -1189,6 +1304,7 @@ class RDBGClient:
                 "known_attached_targets": sorted(self._known_attached_targets),
                 "stopped_targets": sorted(self._stopped_targets),
                 "last_stopped_target_id": self._last_stopped_target_id,
+                "recovery": dict(self._recovery),  # B4: heartbeat/auto-reattach state
             }
         # Per-target: использовать get_targets() и отфильтровать
         targets = await self.get_targets()
