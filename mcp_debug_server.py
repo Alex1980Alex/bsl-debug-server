@@ -298,6 +298,10 @@ class RDBGClient:
         # sits there with reason="breakpoint" — _await_bp_stop keys off THIS set, not
         # raw membership, or autotrace collect would grab a draining logpoint stop.
         self._user_visible_stops: set[str] = set()
+        # M-6 (review 260710): wall-clock of the last user-visible stop, so the
+        # reconnect guard can age-bound — a stale halt (target died on a halt, no
+        # targetQuit ever arrives) must not block auto-reconnect forever.
+        self._last_visible_stop_ts: float = 0.0
         # H-5 (audit 260710): ring buffer of recent exception seeds (cheap — symptom +
         # stack, no eval), captured eagerly in rteProcessing. Lets debug_root_cause
         # collect return a degraded (window_closed) diagnosis even when targetQuit
@@ -387,6 +391,10 @@ class RDBGClient:
         }
         # A3 (roadmap 260708): active debug_trace_variable state (arm→collect).
         self._trace_var: Optional[dict] = None
+        # H-4 (review 260710): task that clears the stale RDBG workspace after an
+        # HMR restore. set_breakpoints awaits it FIRST so an empty clear can't race
+        # ahead of / clobber a freshly-set BP (setBreakpoints REPLACES the workspace).
+        self._hmr_clear_task: Optional[asyncio.Task] = None
         # M-2 (audit 260710): keys of the BP armed by the last debug_autotrace(arm),
         # cleared on collect so an autotrace BP doesn't linger and halt later runs
         # when nobody is collecting (parity with A3's logpoint teardown).
@@ -521,24 +529,35 @@ class RDBGClient:
         in_ping_task = asyncio.current_task() is self._ping_task
         old_sid = self.session_id
         try:
-            await self.detach(cancel_ping=not in_ping_task)
-        except Exception:
-            pass
-        self.session_id = str(uuid.uuid4())
-        self._attached = False
-        self._registered = False
-        if not in_ping_task and self._ping_task and not self._ping_task.done():
-            self._ping_task.cancel()
-            self._ping_task = None
-        await self.attach(cleanup_stale=False)
-        if self._registered:
-            await self.init_settings()
-            await self.clear_break_on_next_statement()
-            await self.set_auto_attach_settings()
-        log.info("UI+ escalation: re-attached %s → %s", old_sid[:8], self.session_id[:8])
-        return await self._post(
-            command, body, include_dbgui_url=include_dbgui_url, _ui_plus_retry=False
-        )
+            try:
+                await self.detach(cancel_ping=not in_ping_task)
+            except Exception:
+                pass
+            self.session_id = str(uuid.uuid4())
+            self._attached = False
+            self._registered = False
+            if not in_ping_task and self._ping_task and not self._ping_task.done():
+                self._ping_task.cancel()
+                self._ping_task = None
+            await self.attach(cleanup_stale=False)  # may raise if dbgs unreachable
+            if self._registered:
+                await self.init_settings()
+                await self.clear_break_on_next_statement()
+                await self.set_auto_attach_settings()
+            log.info("UI+ escalation: re-attached %s → %s", old_sid[:8], self.session_id[:8])
+            return await self._post(
+                command, body, include_dbgui_url=include_dbgui_url, _ui_plus_retry=False
+            )
+        finally:
+            # H-1 failure-path (review 260710): when running INSIDE _ping_task, a
+            # failed attach / ibInDebug leaves _attached=_registered=False → the
+            # loop's `while _attached and _registered` gate would silently kill the
+            # heartbeat (the same class as the CancelledError self-cancel, now via
+            # flags). Mirror _attempt_reconnect's finally-restore so the loop keeps
+            # pinging + retries. Truth about health lives in _recovery / next ping.
+            if in_ping_task and not self._registered:
+                self._attached = True
+                self._registered = True
 
     @staticmethod
     def _is_ui_plus_lost(err: "httpx.HTTPStatusError") -> bool:
@@ -665,6 +684,7 @@ class RDBGClient:
     HEARTBEAT_FAIL_THRESHOLD = 3  # consecutive ping failures → degraded → reconnect
     RECONNECT_COOLDOWN_SEC = 30.0  # base seconds between auto-reconnect attempts
     RECONNECT_BACKOFF_MAX_SEC = 300.0  # M-6: cap for exponential reconnect backoff
+    STALE_STOP_SEC = 120.0  # M-6 review: a stop older than this no longer blocks reconnect
 
     async def _ping_loop(self) -> None:
         """Periodic ping: keep session alive. Dispatch happens inside ping().
@@ -820,10 +840,16 @@ class RDBGClient:
         - `last_reconnect_ts` stamped AFTER the attempt (which can outlast the flat
           cooldown), preventing back-to-back retries.
         """
-        # Guard: never destroy an active user-visible stop.
+        # Guard: never destroy an active user-visible stop — BUT age-bound it
+        # (review 260710): if the target died on a halt, targetQuit never arrives
+        # and the sets never clear, which would block auto-reconnect forever. Only
+        # a RECENT stop (< STALE_STOP_SEC) protects the reconnect.
         if self._stopped_targets or self._user_visible_stops:
-            log.debug("[heartbeat] reconnect skipped — active stop in progress")
-            return False
+            fresh = (_time.time() - self._last_visible_stop_ts) < self.STALE_STOP_SEC
+            if fresh:
+                log.debug("[heartbeat] reconnect skipped — active stop in progress")
+                return False
+            log.info("[heartbeat] stale stop (> %.0fs) — allowing reconnect", self.STALE_STOP_SEC)
         now = asyncio.get_running_loop().time()
         last = self._recovery.get("last_reconnect_ts")
         failed = self._recovery.get("reconnect_backoff_steps", 0)
@@ -1064,11 +1090,16 @@ class RDBGClient:
                 # suppress gates, so _await_bp_stop never grabs a draining logpoint/
                 # coverage/hit-condition stop (which sits in _stopped_targets with
                 # reason="breakpoint" until its deferred eval + Continue finish).
-                self._user_visible_stops.add(target_id)
-                # B3 (roadmap 260708 §7.6): wake event-driven waiters
-                # (debug_autotrace collect) — user-visible BP stop only, matching
-                # the reason="breakpoint" predicate in _await_bp_stop.
-                self._signal_bp_stop()
+                # Review 260710: additionally require the target to STILL be stopped
+                # — a suppress helper whose step("Continue") FAILED returns
+                # not-suppressed but H-2's step-finally already discarded the target;
+                # marking it visible would create a "visible but gone" ghost.
+                if target_id in self._stopped_targets:
+                    self._user_visible_stops.add(target_id)
+                    self._last_visible_stop_ts = _time.time()  # M-6 age-bound
+                    # B3 (roadmap 260708 §7.6): wake event-driven waiters
+                    # (debug_autotrace collect) — user-visible BP stop only.
+                    self._signal_bp_stop()
             # P2.A roadmap 260511: replay snapshot recording (after metrics gate so
             # only user-visible stops are recorded)
             if not stop_suppressed:
@@ -1117,27 +1148,33 @@ class RDBGClient:
             snapshot.record(
                 self, target_id, "exception", stack, exc if isinstance(exc, dict) else None
             )
-            # M-1: mark user-visible (exception stops count for reasons=("exception",)).
-            self._user_visible_stops.add(target_id)
-            # H-5 (audit 260710): eagerly seed a cheap exception record (symptom +
-            # stack, NO eval) into a ring buffer. If the JOB force-resumes/quits
-            # before debug_root_cause collect runs, targetQuit pops
-            # _last_exception_by_target — the seed lets collect still return a
-            # degraded (window_closed) diagnosis instead of a false hit:false.
-            self._recent_exceptions.append(
-                {
-                    "target_id": target_id,
-                    "ts": _time.time(),
-                    "symptom": autonomy.extract_exception_symptom(exc),
-                    "stack": stack,
-                }
-            )
-            if len(self._recent_exceptions) > 16:
-                self._recent_exceptions = self._recent_exceptions[-16:]
-            # A2 (roadmap 260708 §7.6): wake event-driven waiters
-            # (debug_root_cause collect) — non-suppressed exception stop only
-            # (filtered ones already returned above), matching reasons=("exception",).
-            self._signal_bp_stop()
+            # Review 260710: only treat as user-visible / seed if the target is
+            # STILL stopped — an exception-filter suppress whose step("Continue")
+            # FAILED falls through here (returns not-suppressed) but H-2's finally
+            # already discarded the target; seeding then would attribute a
+            # window_closed diagnosis to an exception the filter meant to skip.
+            if target_id in self._stopped_targets:
+                # M-1: mark user-visible (exception stops count for reasons=("exception",)).
+                self._user_visible_stops.add(target_id)
+                self._last_visible_stop_ts = _time.time()  # M-6 age-bound
+                # H-5 (audit 260710): eagerly seed a cheap exception record (symptom
+                # + stack, NO eval). If the JOB force-resumes/quits before
+                # debug_root_cause collect runs, targetQuit pops
+                # _last_exception_by_target — the seed lets collect still return a
+                # degraded (window_closed) diagnosis instead of a false hit:false.
+                self._recent_exceptions.append(
+                    {
+                        "target_id": target_id,
+                        "ts": _time.time(),
+                        "symptom": autonomy.extract_exception_symptom(exc),
+                        "stack": stack,
+                    }
+                )
+                if len(self._recent_exceptions) > 16:
+                    self._recent_exceptions = self._recent_exceptions[-16:]
+                # A2 (roadmap 260708 §7.6): wake event-driven waiters
+                # (debug_root_cause collect) — non-suppressed exception stop only.
+                self._signal_bp_stop()
 
         elif cmd_type == "targetQuit":
             if target_id:
@@ -1877,6 +1914,28 @@ class RDBGClient:
         body = _build_request(self._base_fields(), workspace_xml)
         await self._post("setBreakpoints", body)
 
+    async def _hmr_clear_stale_workspace(self) -> None:
+        """H-4 (review 260710): guarded push of the (empty) workspace after an HMR
+        restore to clear RDBG's stale BPs. try/except so a dead-dbgs failure doesn't
+        surface as an unretrieved-task exception."""
+        try:
+            await self._push_bp_workspace()
+        except Exception as e:
+            log.debug("[hmr] stale-workspace clear failed: %s", e)
+
+    async def _drain_hmr_clear(self) -> None:
+        """H-4 (review 260710): await + clear the pending HMR stale-workspace clear
+        task, so set_breakpoints never races it (an empty clear must not land AFTER
+        a freshly-set BP — setBreakpoints REPLACES the whole workspace)."""
+        task = self._hmr_clear_task
+        if task is not None:
+            self._hmr_clear_task = None
+            if not task.done():
+                try:
+                    await task
+                except Exception:
+                    pass
+
     def _record_hit_condition(self, object_id, property_id, lines, hit_condition):
         """P0.A: register hit-condition per (oid, pid, line)."""
         for ln in lines:
@@ -1919,6 +1978,10 @@ class RDBGClient:
                 Empty (default) обычно works для standard configs; передавайте
                 для extensions.
         """
+        # H-4 (review 260710): if an HMR restore scheduled a stale-workspace clear,
+        # await it FIRST — else its empty REPLACE could land after this BP and wipe
+        # it (setBreakpoints REPLACES the whole workspace).
+        await self._drain_hmr_clear()
         # Fix #5 (live finding 2026-05-10): RDBG setBreakpoints REPLACES the
         # workspace each call. Aggregating cache + new entry → submit FULL
         # workspace XML с multiple moduleBPInfo, иначе предыдущие BPs теряются.
@@ -2037,8 +2100,10 @@ def _get_client() -> RDBGClient:
                 # fire as UNSUPPRESSED user-visible halts with nothing left to clear
                 # them (_reapply_bp_workspace no-ops on an empty cache). Push our
                 # now-empty workspace to clear RDBG's stale BPs. Better to lose BPs
-                # (the user re-sets them) than to get unremovable halts.
-                loop.create_task(_client._push_bp_workspace())
+                # (the user re-sets them) than to get unremovable halts. Stored +
+                # guarded (review 260710) so set_breakpoints can await it first (no
+                # race clobbering a fresh BP) and a dead-dbgs failure stays quiet.
+                _client._hmr_clear_task = loop.create_task(_client._hmr_clear_stale_workspace())
             except RuntimeError:
                 pass
             log.info(
@@ -4119,6 +4184,13 @@ async def debug_root_cause(
                 ensure_ascii=False,
                 indent=2,
             )
+        # H-5 (review 260710): consumed a live hit for this target — drop its
+        # seeds so a later collect (started ≤0.5s after this rte) can't re-report
+        # the already-diagnosed exception as a window_closed miss.
+        if getattr(client, "_recent_exceptions", None):
+            client._recent_exceptions = [
+                s for s in client._recent_exceptions if s.get("target_id") != target_id
+            ]
         try:
             record = await autonomy.build_diagnosis_record(
                 client,
@@ -4429,14 +4501,17 @@ async def debug_collection_page(
             )
         )
         _tp = (type_probe or "").lower()
-        if "соответств" in _tp or "map" == _tp:
+        # «соответств» covers Соответствие + ФиксированноеСоответствие; «map» (substr)
+        # covers Map/FixedMap (review 260710 — was exact-match, missed FixedMap).
+        if "соответств" in _tp or "map" in _tp:
             return _error_json(
                 f"{type_probe}: numeric paging invalid for Соответствие (keyed by ключ)",
                 "unpageable_type",
                 type=type_probe,
                 hint="обойди ключи: Для Каждого КЗ Из <expr> Цикл ... КЗ.Ключ / КЗ.Значение",
             )
-        if "результатзапроса" in _tp or "queryresult" in _tp:
+        # «выборка» covers ВыборкаИзРезультатаЗапроса (no numeric index either).
+        if "результатзапроса" in _tp or "queryresult" in _tp or "выборка" in _tp:
             return _error_json(
                 f"{type_probe}: РезультатЗапроса has no numeric index",
                 "unpageable_type",

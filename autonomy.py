@@ -115,9 +115,13 @@ def _extract_eval_value(result) -> str:
         for key in ("presentation", "value", "_value", "text", "resultValue"):
             if key in item and not isinstance(item[key], (dict, list)):
                 return str(item[key]).strip()
-        if "pres" in item and not isinstance(item["pres"], (dict, list)):
+        # Review 260710: only use `pres` when NON-EMPTY. Live RDBG sometimes carries
+        # an empty `pres` alongside a real typed value (logpoints._scalar guards the
+        # same way); an empty pres decoding to "" used to shadow valueDecimal="0" →
+        # a false definitive FAIL in the verdict. Empty → fall through to typed.
+        if item.get("pres") and not isinstance(item["pres"], (dict, list)):
             decoded = _decode_pres_b64(item["pres"])
-            if decoded is not None:
+            if decoded:
                 return decoded
         for key in ("valueDecimal", "valueStr", "valueBoolean"):
             if key in item and not isinstance(item[key], (dict, list)):
@@ -517,12 +521,16 @@ def find_method_range(source_lines: list, method_name: str):
 def _strip_bsl_strings(s: str) -> str:
     """Blank out BSL string literals so their contents aren't parsed as code.
 
-    BSL escapes a quote inside a string by doubling it (`""`), so the non-greedy
-    `"[^"]*"` split lands on real string boundaries; contents → `""`. Prevents
-    identifiers inside a literal (`"Итого по "`) from leaking into upstream and a
-    `//` inside a literal (`"http://x"`) from truncating the RHS. (LOW audit 260710)
+    LENGTH-PRESERVING: each literal's inner chars → spaces, quotes kept. This is
+    critical — callers use `find("//")` on the stripped string but index back into
+    the ORIGINAL (find_assignment_lines), so positions must stay aligned. A
+    non-length-preserving blank ('""') shifted the cut and truncated the RHS mid-
+    string for the common «literal + trailing // comment» case (adversarial review
+    260710). BSL doubles an inner quote (`""`), so the non-greedy `"[^"]*"` lands
+    on real boundaries. Blanks identifiers inside literals (`"Итого по "`) out of
+    upstream and stops a `//` inside a literal (`"http://x"`) from truncating.
     """
-    return re.sub(r'"[^"]*"', '""', s or "")
+    return re.sub(r'"[^"]*"', lambda m: '"' + " " * (len(m.group(0)) - 2) + '"', s or "")
 
 
 def _extract_upstream(rhs: str, name: str, cap: int = 3) -> list:

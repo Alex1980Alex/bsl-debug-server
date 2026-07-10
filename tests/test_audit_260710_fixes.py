@@ -184,8 +184,23 @@ async def test_m4_drain_active_awaits_pending():
     logpoints._active_tasks.add(t)
     t.add_done_callback(logpoints._active_tasks.discard)
     pending = await logpoints.drain_active(timeout=1.0)
-    assert pending == 1
+    assert pending == 0  # completed within the bounded wait → nothing still pending
     assert done == [True]  # awaited to completion, tail not truncated
+
+
+@pytest.mark.asyncio
+async def test_m4_drain_active_reports_still_pending_after_timeout():
+    async def _too_slow():
+        await asyncio.sleep(5.0)
+
+    t = asyncio.create_task(_too_slow())
+    logpoints._active_tasks.add(t)
+    t.add_done_callback(logpoints._active_tasks.discard)
+    try:
+        pending = await logpoints.drain_active(timeout=0.05)
+        assert pending == 1  # exceeded the bounded wait → still pending, tail may be late
+    finally:
+        t.cancel()
 
 
 # LOW — _extract_upstream ignores string literals + type after `Новый` --------
@@ -198,3 +213,134 @@ class TestUpstreamParsing:
     def test_type_after_novyi_not_upstream(self):
         up = autonomy._extract_upstream("Новый ТаблицаЗначений", "Т")
         assert up == []
+
+
+# Review 260710 — follow-up fixes -------------------------------------------
+class TestReviewFollowups:
+    def test_literal_plus_trailing_comment_not_truncated(self):
+        # BLOCKER regression: length-preserving _strip_bsl_strings keeps `//` index
+        # aligned so the RHS isn't cut mid-literal.
+        src = ['Статус = "Черновик"; // начальный']
+        out = autonomy.find_assignment_lines(src, "Статус")
+        assert len(out) == 1
+        assert out[0]["rhs"] == '"Черновик"'  # full literal, not truncated
+        assert out[0]["upstream"] == []  # no garbage from inside the string
+
+    def test_url_in_literal_not_split(self):
+        up = autonomy._extract_upstream('"http://x" + Хост', "Адрес")
+        assert up == ["Хост"]  # `//` inside the literal doesn't cut the RHS
+
+    def test_empty_pres_falls_through_to_typed(self):
+        # M-3 review: empty pres must not shadow a real typed value.
+        res = [{"resultValueInfo": {"valueDecimal": "0", "pres": ""}}]
+        assert autonomy._extract_eval_value(res) == "0"
+
+
+@pytest.mark.asyncio
+async def test_review_suppress_fail_does_not_seed_ghost():
+    # Stык M-1 × H-2: an exception-filter suppress whose step("Continue") FAILS must
+    # not leave a "visible but gone" target nor seed a ghost diagnosis.
+    c = _client()
+    c._exception_bp_filters = [{"message_pattern": "zzz", "module_pattern": ""}]  # won't match "boom"
+    c._resolve_target_uuid = lambda t: t
+    c._ensure_target_attached = AsyncMock()
+    c._post = AsyncMock(side_effect=RuntimeError("resumed"))  # step POST fails → step-finally discards
+    await c._handle_command(
+        {
+            "cmdId": "rteProcessing",
+            "targetID": "t",
+            "callStack": [_frame("o", "p", 5)],
+            "exception": {"code": "1", "info": "boom"},
+        }
+    )
+    assert "t" not in c._user_visible_stops
+    assert c._recent_exceptions == []
+
+
+@pytest.mark.asyncio
+async def test_review_h1_finally_restores_flags_on_failed_attach_in_ping_task():
+    # H-1 failure-path: a failed attach INSIDE _ping_task must restore the liveness
+    # flags so `while _attached and _registered` keeps the heartbeat alive.
+    c = _client()
+    c.detach = AsyncMock(return_value=True)
+    c.attach = AsyncMock(side_effect=RuntimeError("dbgs down"))
+
+    async def run():
+        c._ping_task = asyncio.current_task()
+        with pytest.raises(RuntimeError):
+            await c._ui_plus_full_reattach_and_retry("pingDebugUIParams", "<b/>", True)
+
+    await asyncio.create_task(run())
+    assert c._attached is True and c._registered is True
+
+
+@pytest.mark.asyncio
+async def test_review_m6_stale_stop_allows_reconnect():
+    import time as _t
+
+    c = _client()
+    c._stopped_targets.add("t")
+    c._last_visible_stop_ts = 0.0  # ancient → stale
+    c._attempt_reconnect = AsyncMock(return_value=True)
+    ok = await c._maybe_reconnect()
+    assert ok is True
+    c._attempt_reconnect.assert_awaited()
+
+    c2 = _client()
+    c2._stopped_targets.add("t")
+    c2._last_visible_stop_ts = _t.time()  # fresh → protected
+    c2._attempt_reconnect = AsyncMock(return_value=True)
+    ok2 = await c2._maybe_reconnect()
+    assert ok2 is False
+    c2._attempt_reconnect.assert_not_awaited()
+
+
+class _CollClient:
+    _attached = True
+    _registered = True
+    last_stopped_target_id = "tgt"
+
+    def __init__(self, type_name):
+        self._type = type_name
+
+    async def get_targets(self):
+        return []
+
+    async def eval_expression(self, expression, target_uuid=None, stack_level=0):
+        return [{"presentation": self._type if expression.startswith("ТипЗнч") else "0"}]
+
+    async def eval_local_variables(self, target_uuid=None, stack_level=0, expressions=None):
+        return [{"name": e} for e in (expressions or [])]
+
+
+@pytest.mark.asyncio
+async def test_m10_sootvetstvie_unpageable(monkeypatch):
+    import mcp_debug_server as mds
+
+    monkeypatch.setattr(mds, "_get_client", lambda: _CollClient("Соответствие"))
+    out = __import__("json").loads(await mds.debug_collection_page("М", start=0, count=5))
+    assert out.get("error_type") == "unpageable_type"
+
+
+@pytest.mark.asyncio
+async def test_m10_fixedmap_en_unpageable(monkeypatch):
+    import mcp_debug_server as mds
+
+    monkeypatch.setattr(mds, "_get_client", lambda: _CollClient("FixedMap"))
+    out = __import__("json").loads(await mds.debug_collection_page("М", start=0, count=5))
+    assert out.get("error_type") == "unpageable_type"
+
+
+@pytest.mark.asyncio
+async def test_review_h4_drain_awaits_clear_task():
+    c = _client()
+    order = []
+
+    async def _clear():
+        await asyncio.sleep(0.02)
+        order.append("clear")
+
+    c._hmr_clear_task = asyncio.create_task(_clear())
+    await c._drain_hmr_clear()
+    assert order == ["clear"]  # awaited to completion
+    assert c._hmr_clear_task is None

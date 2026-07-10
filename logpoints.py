@@ -22,13 +22,14 @@ async def drain_active(timeout: float = 2.0) -> int:
     `fire_logpoint` defers eval+JSONL-write to a `create_task`, so a reader
     (`debug_trace_variable` collect) that reads the JSONL immediately can truncate
     the tail — the last hit's write may still be pending. Await them (bounded) so
-    the timeline is complete. Returns the count that were still pending; a task
-    slower than `timeout` is left running (best-effort, never blocks forever).
+    the timeline is complete. Returns how many are STILL pending AFTER the bounded
+    wait (exceeded `timeout` → their tail may be late); a task slower than
+    `timeout` is left running (best-effort, never blocks forever).
     """
     pending = [t for t in list(_active_tasks) if not t.done()]
     if pending:
         await asyncio.wait(pending, timeout=timeout)
-    return len(pending)
+    return sum(1 for t in pending if not t.done())
 
 
 _PLACEHOLDER_RE = re.compile(r"(?<!\{)\{([^{}]+)\}(?!\})")
