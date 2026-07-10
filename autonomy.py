@@ -107,22 +107,21 @@ def _extract_eval_value(result) -> str:
         item = item[0] if item else None
     seen = 0
     while isinstance(item, dict) and seen < 6:
-        for key in (
-            "presentation",
-            "value",
-            "_value",
-            "text",
-            "resultValue",
-            "valueDecimal",
-            "valueStr",
-            "valueBoolean",
-        ):
+        # M-3 (audit 260710): human presentation FIRST — the verdict compares
+        # against `expected` written the way the platform presents a value (e.g.
+        # Булево → «Истина», not the typed `valueBoolean="true"`). Legacy
+        # presentation-ish keys, then base64 `pres`; typed `value*` keys only as a
+        # fallback when no presentation is available.
+        for key in ("presentation", "value", "_value", "text", "resultValue"):
             if key in item and not isinstance(item[key], (dict, list)):
                 return str(item[key]).strip()
         if "pres" in item and not isinstance(item["pres"], (dict, list)):
             decoded = _decode_pres_b64(item["pres"])
             if decoded is not None:
                 return decoded
+        for key in ("valueDecimal", "valueStr", "valueBoolean"):
+            if key in item and not isinstance(item[key], (dict, list)):
+                return str(item[key]).strip()
         # descend into a nested value container
         nxt = item.get("resultValueInfo") or item.get("calcResult") or item.get("result")
         if nxt is None or nxt is item:
@@ -130,6 +129,22 @@ def _extract_eval_value(result) -> str:
         item = nxt
         seen += 1
     return str(result).strip()
+
+
+def _eval_inconclusive(res) -> bool:
+    """M-3 (audit 260710): True if an eval result couldn't produce a value —
+    empty `[]` (evalExpr timed out before the async value arrived) or an error/
+    pending `evalResultState`. Such a check is INCONCLUSIVE, not FAIL: eval gave no
+    value, so a mismatch is not evidence of a bug (an agent must not «prove» a bug
+    that isn't there)."""
+    if not res:
+        return True
+    item = res[0] if isinstance(res, list) else res
+    if isinstance(item, dict):
+        state = str(item.get("evalResultState", "")).lower()
+        if state in ("error", "timeout", "pending", "notevaluated", "notcalculated"):
+            return True
+    return False
 
 
 async def evaluate_expect(client, target_id: str, expect: dict, stack_level: int = 0) -> dict:
@@ -148,27 +163,45 @@ async def evaluate_expect(client, target_id: str, expect: dict, stack_level: int
         `expected` to match the platform's value presentation.
     """
     checked: list = []
-    any_error = False
-    all_ok = True
     for expr, expected in expect.items():
         expected_s = str(expected).strip()
+        err = False
         try:
             res = await client.eval_expression(
                 expression=expr,
                 target_uuid=target_id,
                 stack_level=stack_level,
             )
-            actual = _extract_eval_value(res)
-            ok = actual == expected_s
+            if _eval_inconclusive(res):
+                actual = _extract_eval_value(res)
+                ok = False
+                err = True
+            else:
+                actual = _extract_eval_value(res)
+                ok = actual == expected_s
         except Exception as e:
             actual = f"<eval-error: {e}>"
             ok = False
-            any_error = True
-        all_ok = all_ok and ok
-        checked.append({"expr": expr, "expected": expected_s, "actual": actual, "ok": ok})
-    status = "INCONCLUSIVE" if any_error else ("PASS" if all_ok else "FAIL")
+            err = True
+        checked.append(
+            {"expr": expr, "expected": expected_s, "actual": actual, "ok": ok, "error": err}
+        )
+    # M-3 (audit 260710): a DEFINITIVE mismatch (eval produced a value ≠ expected)
+    # → FAIL, and it takes precedence over an INCONCLUSIVE sibling so a real bug is
+    # never masked by an unrelated eval-error. Only when there is no definitive
+    # mismatch but some check couldn't be evaluated → INCONCLUSIVE. All good → PASS.
+    definitive_fail = any((not c["ok"]) and (not c["error"]) for c in checked)
+    has_error = any(c["error"] for c in checked)
+    if definitive_fail:
+        status = "FAIL"
+    elif has_error:
+        status = "INCONCLUSIVE"
+    else:
+        status = "PASS"
     reason = "; ".join(
-        f"{c['expr']}={c['actual']}" + ("" if c["ok"] else f" ≠ {c['expected']}") for c in checked
+        f"{c['expr']}={c['actual']}"
+        + (" (eval-error)" if c["error"] else ("" if c["ok"] else f" ≠ {c['expected']}"))
+        for c in checked
     )
     return {"status": status, "reason": reason, "checked": checked}
 
@@ -369,6 +402,17 @@ async def build_diagnosis_record(
             "file_path": rs.get("file_path"),
             "line": frame.get("lineNo"),
         }
+    elif stack:
+        # LOW (audit 260710): max_frames=0 → no inspected frames, but the fault
+        # frame is still computable from the raw stack (innermost = last, Ф-2).
+        fr = stack[-1] if isinstance(stack[-1], dict) else {}
+        mod = fr.get("moduleID") if isinstance(fr.get("moduleID"), dict) else {}
+        info = uuid_index.get_source_info(mod.get("objectID", ""), mod.get("propertyID", "")) or {}
+        fault_location = {
+            "fqn": info.get("fqn"),
+            "file_path": info.get("file_path"),
+            "line": fr.get("lineNo"),
+        }
 
     return {
         "fault_location": fault_location,
@@ -377,6 +421,52 @@ async def build_diagnosis_record(
         "frames_inspected": frames_inspected,
         "frames_total": depth,
         "frames_bounded": n < depth,
+    }
+
+
+def build_seed_diagnosis(symptom: dict, stack: list) -> dict:
+    """H-5 (audit 260710): degraded diagnosis-record from a cheap eager seed
+    (symptom + stack captured in _handle_command(rteProcessing), NO eval).
+
+    Used by debug_root_cause collect when the ephemeral JOB force-resumed/quit
+    before collect could inspect the live frame (targetQuit popped the exception).
+    Same shape as build_diagnosis_record but `frames_inspected=[]` (no live locals)
+    and `window_closed=True` so the caller/agent knows locals are unavailable.
+    """
+    stack = stack or []
+    depth = len(stack)
+    propagation_path: list = []
+    for i, fr in enumerate(stack):
+        frd = fr if isinstance(fr, dict) else {}
+        mod = frd.get("moduleID") if isinstance(frd.get("moduleID"), dict) else {}
+        info = uuid_index.get_source_info(mod.get("objectID", ""), mod.get("propertyID", "")) or {}
+        propagation_path.append(
+            {
+                "index": i,
+                "fqn": info.get("fqn"),
+                "file_path": info.get("file_path"),
+                "line": frd.get("lineNo"),
+            }
+        )
+    fault_location = None
+    if stack:
+        # Fault frame = innermost = LAST element (RDBG callStack outermost-first, Ф-2).
+        fr = stack[-1] if isinstance(stack[-1], dict) else {}
+        mod = fr.get("moduleID") if isinstance(fr.get("moduleID"), dict) else {}
+        info = uuid_index.get_source_info(mod.get("objectID", ""), mod.get("propertyID", "")) or {}
+        fault_location = {
+            "fqn": info.get("fqn"),
+            "file_path": info.get("file_path"),
+            "line": fr.get("lineNo"),
+        }
+    return {
+        "fault_location": fault_location,
+        "runtime_symptom": symptom or {"code": "", "message": ""},
+        "propagation_path": propagation_path,
+        "frames_inspected": [],
+        "frames_total": depth,
+        "frames_bounded": depth > 0,
+        "window_closed": True,
     }
 
 
@@ -424,21 +514,39 @@ def find_method_range(source_lines: list, method_name: str):
     return (start, len(source_lines)) if start is not None else None
 
 
+def _strip_bsl_strings(s: str) -> str:
+    """Blank out BSL string literals so their contents aren't parsed as code.
+
+    BSL escapes a quote inside a string by doubling it (`""`), so the non-greedy
+    `"[^"]*"` split lands on real string boundaries; contents → `""`. Prevents
+    identifiers inside a literal (`"Итого по "`) from leaking into upstream and a
+    `//` inside a literal (`"http://x"`) from truncating the RHS. (LOW audit 260710)
+    """
+    return re.sub(r'"[^"]*"', '""', s or "")
+
+
 def _extract_upstream(rhs: str, name: str, cap: int = 3) -> list:
     """RHS variable identifiers feeding the assignment (best-effort, ru+en).
 
-    Skips keywords, the traced name itself, and function-call heads (ident followed
-    by `(`). Deduped, capped. Used to trace `name` together with its inputs.
+    Skips keywords, the traced name itself, function-call heads (ident followed by
+    `(`), member-access tails (`Объект.Ident`), type names after `Новый`, and
+    identifiers inside string literals. Deduped, capped.
     """
     out: list = []
     lname = name.lower()
+    rhs = _strip_bsl_strings(rhs)
     for m in _BSL_IDENT_RE.finditer(rhs or ""):
         ident = m.group(0)
         low = ident.lower()
         if low == lname or low in _BSL_KEYWORDS:
             continue
+        before = rhs[: m.start()].rstrip()
         # skip member-access tail (`Объект.Ident` — not a standalone variable)
-        if rhs[: m.start()].rstrip().endswith("."):
+        if before.endswith("."):
+            continue
+        # skip a type name right after `Новый`/`New` (`Новый ТаблицаЗначений`)
+        prev = before.split()[-1].lower() if before.split() else ""
+        if prev in ("новый", "new"):
             continue
         # skip call heads (`Ident(` — a method/function call, not a variable)
         if rhs[m.end():].lstrip().startswith("("):
@@ -473,8 +581,12 @@ def find_assignment_lines(source_lines: list, name: str, line_range=None, upstre
         if not m:
             continue
         rhs = m.group(1).strip()
-        # strip trailing line comment + semicolon for cleaner upstream parsing
-        rhs_code = rhs.split("//", 1)[0].rstrip().rstrip(";").strip()
+        # strip trailing line comment + semicolon for cleaner upstream parsing.
+        # Blank string literals FIRST so a `//` inside a literal ("http://x")
+        # doesn't truncate the RHS mid-string (LOW audit 260710).
+        rhs_nostr = _strip_bsl_strings(rhs)
+        cut = rhs_nostr.find("//")
+        rhs_code = (rhs[:cut] if cut != -1 else rhs).rstrip().rstrip(";").strip()
         out.append(
             {
                 "line": i,

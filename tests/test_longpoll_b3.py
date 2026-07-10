@@ -84,7 +84,11 @@ def test_signal_no_running_loop_is_noop():
 class TestAwaitBpStop:
     async def test_returns_present_breakpoint_target(self):
         c = _make_client()
+        # M-1 (audit 260710): a user-visible stop lives in _user_visible_stops
+        # (populated by _handle_command after the suppress gates), not raw
+        # _stopped_targets — that's what _await_bp_stop keys off now.
         c._stopped_targets.add(GOOD_UUID)
+        c._user_visible_stops.add(GOOD_UUID)
         c._stop_reason_by_target[GOOD_UUID] = "breakpoint"
         t0 = time.monotonic()
         tid = await _await_bp_stop(c, timeout_sec=5.0)
@@ -126,6 +130,7 @@ class TestAwaitBpStop:
         async def _fire():
             await asyncio.sleep(0.05)
             c._stopped_targets.add(GOOD_UUID)
+            c._user_visible_stops.add(GOOD_UUID)  # M-1
             c._stop_reason_by_target[GOOD_UUID] = "breakpoint"
             c._signal_bp_stop()
 
@@ -147,6 +152,7 @@ class TestAwaitBpStop:
         async def _fire_silent():
             await asyncio.sleep(0.05)
             c._stopped_targets.add(GOOD_UUID)
+            c._user_visible_stops.add(GOOD_UUID)  # M-1
             c._stop_reason_by_target[GOOD_UUID] = "breakpoint"
             # deliberately NO _signal_bp_stop()
 
@@ -203,6 +209,7 @@ class TestAutotraceCollect:
         c._attached = True
         c._registered = True
         c._stopped_targets.add(GOOD_UUID)
+        c._user_visible_stops.add(GOOD_UUID)  # M-1
         c._stop_reason_by_target[GOOD_UUID] = "breakpoint"
         c.step = AsyncMock()
         monkeypatch.setattr(mds, "_client", c, raising=False)

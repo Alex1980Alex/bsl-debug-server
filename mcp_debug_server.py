@@ -89,20 +89,37 @@ def _resolve_property_id(module_type: str, property_id: str = "") -> tuple[str, 
     return module_type, property_id
 
 
-def _apply_line_offset(client, object_id: str, line: int) -> tuple[int, int]:
+def _line_offset_key(object_id: str, property_id: str) -> tuple[str, str]:
+    """H-6 (audit 260710): line-offset cache key. ObjectModule / ManagerModule /
+    RecordSetModule of one object SHARE the object_id (they differ only by
+    property_id), so keying the offset by object_id alone let a ManagerModule
+    calibration silently shift BPs in the ObjectModule of the same object. Key by
+    (object_id, property_id)."""
+    return (object_id, property_id or "")
+
+
+def _apply_line_offset(
+    client, object_id: str, line: int, property_id: str = "", apply: bool = True
+) -> tuple[int, int]:
     """Apply cached per-module line offset (B2 roadmap 260708 §7.5).
 
     Deployed-config line numbers systematically drift from git/EDT source; a BP
     on the git line silently doesn't fire. `debug_calibrate_result` records the
-    measured offset per object_id (offset = nearest_fired − requested). This
-    applies it so a git-line BP lands on the deployed line without manual
-    calibration each time.
+    measured offset per (object_id, property_id) (offset = nearest_fired −
+    requested). This applies it so a git-line BP lands on the deployed line
+    without manual calibration each time.
 
-    Returns (adjusted_line, applied_offset). No cached offset → line unchanged,
-    offset 0.
+    `apply=False` (M-8) skips the shift — for callers already in deployed
+    coordinates (e.g. a BP placed on `nearest_fired` from calibrate_result), so
+    the offset isn't applied twice.
+
+    Returns (adjusted_line, applied_offset). No cached offset / apply=False →
+    line unchanged, offset 0.
     """
+    if not apply:
+        return line, 0
     offsets = getattr(client, "_line_offsets", None) or {}
-    off = offsets.get(object_id, 0)
+    off = offsets.get(_line_offset_key(object_id, property_id), 0)
     return (line + off if off else line), off
 
 
@@ -275,6 +292,17 @@ class RDBGClient:
         self._stop_reason_by_target: dict[str, str] = {}  # "breakpoint" | "step" | "exception"
         self._last_exception_by_target: dict[str, dict] = {}
         self._known_attached_targets: set[str] = set()  # idempotency for auto-attach
+        # M-1 (audit 260710): user-visible stops = targets that PASSED the suppress
+        # gates (logpoint/coverage/hit-condition/exception-filter). `_stopped_targets`
+        # is populated BEFORE those gates, so a suppressed (draining) stop transiently
+        # sits there with reason="breakpoint" — _await_bp_stop keys off THIS set, not
+        # raw membership, or autotrace collect would grab a draining logpoint stop.
+        self._user_visible_stops: set[str] = set()
+        # H-5 (audit 260710): ring buffer of recent exception seeds (cheap — symptom +
+        # stack, no eval), captured eagerly in rteProcessing. Lets debug_root_cause
+        # collect return a degraded (window_closed) diagnosis even when targetQuit
+        # popped _last_exception_by_target before collect ran (halt window 1-2s).
+        self._recent_exceptions: list = []  # [{target_id, ts, symptom, stack}]
         # P0.A roadmap 260511: hit-condition counters per (object_id, property_id, line).
         # RDBG не имеет native hit-count → wrapper-level enforcement в _handle_command.
         self._hit_conditions: dict[tuple, str] = {}  # (oid,pid,line) -> ">5" | "%3" | "=10"
@@ -351,9 +379,18 @@ class RDBGClient:
             "reconnect_attempts": 0,
             "last_reconnect_ok": None,
             "last_reconnect_ts": None,
+            # M-6 (audit 260710): exponential backoff step + honest handshake/BP
+            # outcome so a partial reconnect isn't reported as a clean success.
+            "reconnect_backoff_steps": 0,
+            "handshake_ok": None,
+            "bp_reapply_failed": None,
         }
         # A3 (roadmap 260708): active debug_trace_variable state (arm→collect).
         self._trace_var: Optional[dict] = None
+        # M-2 (audit 260710): keys of the BP armed by the last debug_autotrace(arm),
+        # cleared on collect so an autotrace BP doesn't linger and halt later runs
+        # when nobody is collecting (parity with A3's logpoint teardown).
+        self._autotrace_bp: set = set()
 
     def _get_stop_event(self) -> asyncio.Event:
         """B3: session asyncio.Event for user-visible BP stops, bound to the
@@ -470,16 +507,27 @@ class RDBGClient:
         return await self._ui_plus_full_reattach_and_retry(command, body, include_dbgui_url)
 
     async def _ui_plus_full_reattach_and_retry(self, command, body, include_dbgui_url):
-        """Stage 2 escalation: detach + new attachDebugUI + 4-step handshake."""
+        """Stage 2 escalation: detach + new attachDebugUI + 4-step handshake.
+
+        H-1 (audit 260710): this path is reachable from INSIDE `_ping_task` —
+        `ping()`→`_post("pingDebugUIParams")`→UI+ 400→here. Cancelling `_ping_task`
+        from within itself (detach's default `cancel_ping=True`, or the explicit
+        cancel below) raises CancelledError (a BaseException, uncaught by
+        `except Exception`) → the ping loop dies silently, taking the B4 heartbeat
+        + auto-reattach with it forever. Same self-cancel class B4 fixed in
+        `_attempt_reconnect`, left open here. Guard by identity: never tear down the
+        task we're running in; attach() won't spawn a duplicate while ours is alive.
+        """
+        in_ping_task = asyncio.current_task() is self._ping_task
         old_sid = self.session_id
         try:
-            await self.detach()
+            await self.detach(cancel_ping=not in_ping_task)
         except Exception:
             pass
         self.session_id = str(uuid.uuid4())
         self._attached = False
         self._registered = False
-        if self._ping_task and not self._ping_task.done():
+        if not in_ping_task and self._ping_task and not self._ping_task.done():
             self._ping_task.cancel()
             self._ping_task = None
         await self.attach(cleanup_stale=False)
@@ -615,7 +663,8 @@ class RDBGClient:
     POST_SPAWN_POLL_SEC = 6.0  # time-based auto-attach diff (≈ legacy 3×2с)
     # B4 (roadmap 260708): heartbeat recovery thresholds.
     HEARTBEAT_FAIL_THRESHOLD = 3  # consecutive ping failures → degraded → reconnect
-    RECONNECT_COOLDOWN_SEC = 30.0  # min seconds between auto-reconnect attempts
+    RECONNECT_COOLDOWN_SEC = 30.0  # base seconds between auto-reconnect attempts
+    RECONNECT_BACKOFF_MAX_SEC = 300.0  # M-6: cap for exponential reconnect backoff
 
     async def _ping_loop(self) -> None:
         """Periodic ping: keep session alive. Dispatch happens inside ping().
@@ -759,23 +808,45 @@ class RDBGClient:
             await self._maybe_reconnect()
 
     async def _maybe_reconnect(self) -> bool:
-        """B4: attempt an auto-reconnect, throttled by RECONNECT_COOLDOWN_SEC so a
-        dead dbgs isn't hammered every ping. Returns True on success."""
+        """B4: attempt an auto-reconnect, throttled so a dead dbgs isn't hammered
+        every ping. Returns True on success.
+
+        M-6 (audit 260710) hardening:
+        - Do NOT reconnect while a stop is being inspected: a slow-but-alive dbgs
+          (heavy evaluate/dump → ping timeout) must not tear down the user's active
+          halt with a fresh session_id.
+        - Exponential backoff (cooldown × 2^failed, capped) instead of a flat 30s,
+          so a genuinely dead dbgs backs off rather than retrying forever at 30s.
+        - `last_reconnect_ts` stamped AFTER the attempt (which can outlast the flat
+          cooldown), preventing back-to-back retries.
+        """
+        # Guard: never destroy an active user-visible stop.
+        if self._stopped_targets or self._user_visible_stops:
+            log.debug("[heartbeat] reconnect skipped — active stop in progress")
+            return False
         now = asyncio.get_running_loop().time()
         last = self._recovery.get("last_reconnect_ts")
-        if last is not None and (now - last) < self.RECONNECT_COOLDOWN_SEC:
-            return False  # within cooldown — wait before retrying
-        self._recovery["last_reconnect_ts"] = now
+        failed = self._recovery.get("reconnect_backoff_steps", 0)
+        cooldown = min(
+            self.RECONNECT_COOLDOWN_SEC * (2 ** failed),
+            self.RECONNECT_BACKOFF_MAX_SEC,
+        )
+        if last is not None and (now - last) < cooldown:
+            return False  # within (backed-off) cooldown — wait before retrying
         self._recovery["reconnect_attempts"] += 1
         try:
             ok = await self._attempt_reconnect()
         except Exception as e:
             log.warning("[heartbeat] reconnect attempt raised: %s", e)
             ok = False
+        self._recovery["last_reconnect_ts"] = asyncio.get_running_loop().time()
         self._recovery["last_reconnect_ok"] = ok
         if ok:
             self._recovery["consecutive_ping_failures"] = 0
             self._recovery["degraded"] = False
+            self._recovery["reconnect_backoff_steps"] = 0
+        else:
+            self._recovery["reconnect_backoff_steps"] = min(failed + 1, 8)
         return ok
 
     async def _attempt_reconnect(self) -> bool:
@@ -806,14 +877,27 @@ class RDBGClient:
             await self.attach(cleanup_stale=False)  # raises if dbgs unreachable
             if not self._registered:
                 log.warning("[heartbeat] re-attach not registered (ibInDebug?)")
+                self._recovery["handshake_ok"] = False
                 return False
-            await self.init_settings()
-            await self.clear_break_on_next_statement()
-            await self.set_auto_attach_settings()
+            # M-6 (audit 260710): guard the UI+ handshake — if it fails after a
+            # successful attach the client is half-registered; record it honestly
+            # instead of letting the exception bubble to _maybe_reconnect (which
+            # would report last_reconnect_ok=False while the session is attached).
+            try:
+                await self.init_settings()
+                await self.clear_break_on_next_statement()
+                await self.set_auto_attach_settings()
+                self._recovery["handshake_ok"] = True
+            except Exception as e:
+                log.warning("[heartbeat] post-reconnect handshake failed: %s", e)
+                self._recovery["handshake_ok"] = False
+                return False
             try:
                 await self._reapply_bp_workspace()
+                self._recovery["bp_reapply_failed"] = False
             except Exception as e:
                 log.warning("[heartbeat] BP re-apply after reconnect failed: %s", e)
+                self._recovery["bp_reapply_failed"] = True  # surfaced in get_target_state
             log.info("[heartbeat] auto-reconnect OK %s → %s", old_sid[:8], self.session_id[:8])
             return True
         finally:
@@ -976,6 +1060,11 @@ class RDBGClient:
                 if obj_id_top and line_no != "?":
                     key = f"{obj_id_top}:{line_no}"
                     self._bp_by_location[key] = self._bp_by_location.get(key, 0) + 1
+                # M-1 (audit 260710): mark user-visible ONLY after passing all
+                # suppress gates, so _await_bp_stop never grabs a draining logpoint/
+                # coverage/hit-condition stop (which sits in _stopped_targets with
+                # reason="breakpoint" until its deferred eval + Continue finish).
+                self._user_visible_stops.add(target_id)
                 # B3 (roadmap 260708 §7.6): wake event-driven waiters
                 # (debug_autotrace collect) — user-visible BP stop only, matching
                 # the reason="breakpoint" predicate in _await_bp_stop.
@@ -1028,6 +1117,23 @@ class RDBGClient:
             snapshot.record(
                 self, target_id, "exception", stack, exc if isinstance(exc, dict) else None
             )
+            # M-1: mark user-visible (exception stops count for reasons=("exception",)).
+            self._user_visible_stops.add(target_id)
+            # H-5 (audit 260710): eagerly seed a cheap exception record (symptom +
+            # stack, NO eval) into a ring buffer. If the JOB force-resumes/quits
+            # before debug_root_cause collect runs, targetQuit pops
+            # _last_exception_by_target — the seed lets collect still return a
+            # degraded (window_closed) diagnosis instead of a false hit:false.
+            self._recent_exceptions.append(
+                {
+                    "target_id": target_id,
+                    "ts": _time.time(),
+                    "symptom": autonomy.extract_exception_symptom(exc),
+                    "stack": stack,
+                }
+            )
+            if len(self._recent_exceptions) > 16:
+                self._recent_exceptions = self._recent_exceptions[-16:]
             # A2 (roadmap 260708 §7.6): wake event-driven waiters
             # (debug_root_cause collect) — non-suppressed exception stop only
             # (filtered ones already returned above), matching reasons=("exception",).
@@ -1036,6 +1142,7 @@ class RDBGClient:
         elif cmd_type == "targetQuit":
             if target_id:
                 self._stopped_targets.discard(target_id)
+                self._user_visible_stops.discard(target_id)  # M-1
                 self._last_stack_by_target.pop(target_id, None)
                 self._stop_reason_by_target.pop(target_id, None)
                 self._last_exception_by_target.pop(target_id, None)
@@ -1697,15 +1804,21 @@ class RDBGClient:
             _rdbg("targetID", _target_id_light(target_uuid)),
             _rdbg("action", action),
         )
-        root = await self._post("step", body)
-        # After step, target is running — drop from stopped set.
-        # Next CallStackFormed/RTE event will re-add it if hit again.
-        # Reviewer fix 2026-05-09: also clear stale exception cache so
-        # subsequent step.Continue from RTE doesn't see ghost exception.
-        self._stopped_targets.discard(target_uuid)
-        self._last_exception_by_target.pop(target_uuid, None)
-        if self._last_stopped_target_id == target_uuid:
-            self._last_stopped_target_id = None
+        # H-2 (audit 260710): drop from the stopped sets in `finally`, not only on
+        # POST success. The platform force-resumes ephemeral JOBs (halt window 1-2s,
+        # no RDBG resume event); the autotrace/root_cause finally-Continue then hits
+        # 400 and swallows it — if discard were gated on POST success the target would
+        # stay a "ghost" in _stopped_targets forever and every later _await_bp_stop
+        # would falsely match it with a stale cached stack. Once we've asked to
+        # step/continue the target is no longer stopped from our POV regardless.
+        try:
+            root = await self._post("step", body)
+        finally:
+            self._stopped_targets.discard(target_uuid)
+            self._user_visible_stops.discard(target_uuid)
+            self._last_exception_by_target.pop(target_uuid, None)
+            if self._last_stopped_target_id == target_uuid:
+                self._last_stopped_target_id = None
         return _parse_response(root)
 
     # -- Breakpoints API -----------------------------------------------------
@@ -1897,9 +2010,18 @@ def _get_client() -> RDBGClient:
             _client._attached = True
             _client._registered = True
             # B2 §7.5: restore per-module line offsets (measured by calibrate).
+            # H-6: decode "oid|pid" string keys back to (object_id, property_id)
+            # tuples; tolerate legacy flat keys (pre-H-6 persisted state).
             lo = state.get("line_offsets")
             if isinstance(lo, dict):
-                _client._line_offsets = {k: int(v) for k, v in lo.items()}
+                restored: dict = {}
+                for k, v in lo.items():
+                    if isinstance(k, str) and "|" in k:
+                        oid, _, pid = k.partition("|")
+                        restored[(oid, pid)] = int(v)
+                    else:
+                        restored[(str(k), "")] = int(v)  # legacy flat key
+                _client._line_offsets = restored
             try:
                 # FastMCP tool handlers run inside an active event loop, so
                 # asyncio.get_running_loop() succeeds here. RuntimeError only
@@ -1909,6 +2031,14 @@ def _get_client() -> RDBGClient:
                 loop = asyncio.get_running_loop()
                 if _client._ping_task is None or _client._ping_task.done():
                     _client._ping_task = loop.create_task(_client._ping_loop())
+                # H-4 (audit 260710): the BP cache is NOT persisted across an HMR
+                # restart, but RDBG still holds the old workspace — including any A3
+                # trace logpoints. With `_logpoints` empty after restore those would
+                # fire as UNSUPPRESSED user-visible halts with nothing left to clear
+                # them (_reapply_bp_workspace no-ops on an empty cache). Push our
+                # now-empty workspace to clear RDBG's stale BPs. Better to lose BPs
+                # (the user re-sets them) than to get unremovable halts.
+                loop.create_task(_client._push_bp_workspace())
             except RuntimeError:
                 pass
             log.info(
@@ -2015,17 +2145,22 @@ async def _await_bp_stop(
     deadline = loop.time() + timeout_sec
     event = client._get_stop_event()
     while True:
+        # M-1 (audit 260710): the source of truth is `_user_visible_stops` (targets
+        # that PASSED the suppress gates), NOT raw `_stopped_targets` — the latter
+        # transiently holds suppressed logpoint/coverage stops (reason="breakpoint")
+        # during their deferred eval+Continue, which a slow drain (>0.15s debounce)
+        # would let this predicate grab as a false hit.
         candidate = next(
             (
                 t
-                for t in getattr(client, "_stopped_targets", set())
+                for t in getattr(client, "_user_visible_stops", set())
                 if client._stop_reason_by_target.get(t) in reasons
             ),
             "",
         )
         if candidate:
-            await asyncio.sleep(0.15)  # debounce: пережить drain-Continue
-            if candidate in client._stopped_targets:
+            await asyncio.sleep(0.15)  # debounce: defense-in-depth vs drain-Continue
+            if candidate in client._user_visible_stops:
                 return candidate
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -3162,7 +3297,12 @@ def _persist_active_session(client: "RDBGClient") -> None:
         "infobase_alias": client.infobase_alias,
         "persisted_at": _time.time(),
         # B2 roadmap 260708 §7.5: per-module line offsets survive HMR restart.
-        "line_offsets": getattr(client, "_line_offsets", {}) or {},
+        # H-6: keys are (object_id, property_id) tuples — serialise as "oid|pid"
+        # (JSON has no tuple keys). Tolerate legacy flat string keys (pre-H-6).
+        "line_offsets": {
+            (f"{k[0]}|{k[1]}" if isinstance(k, tuple) else str(k)): int(v)
+            for k, v in (getattr(client, "_line_offsets", {}) or {}).items()
+        },
     }
     try:
         os.makedirs(os.path.dirname(_ACTIVE_SESSION_PATH) or ".", exist_ok=True)
@@ -3751,10 +3891,11 @@ async def debug_autotrace(
     verdict сравнивает строковое представление (как `debug_evaluate`, stack_level).
 
     **Контракт возврата (решение §5.2):** `{verdict, raw}`. `raw` — ВСЕГДА
-    источник истины (`hit`, frame-bundle, stack). `verdict` — машинное суждение
-    по `expect` (PASS/FAIL/NO_HIT/INCONCLUSIVE) или `null`, если `expect` не дан.
-    ⚠ Ф-2: порядок фреймов (stack[0] vs stack[-1]) для многофреймовых стеков —
-    смотри `raw.stack`; verdict/locals используют stack_level (как debug_evaluate).
+    источник истины (`hit` + frame-bundle: `frame`, `resolved_source`, `locals`,
+    `source_context`, `depth`, `stack_level`). `verdict` — машинное суждение по
+    `expect` (PASS/FAIL/NO_HIT/INCONCLUSIVE) или `null`, если `expect` не дан.
+    ⚠ Ф-2: `raw.frame` — фрейм на `stack_level` (0 = innermost, как в
+    debug_evaluate); полный стек — через отдельный `debug_stack_trace`.
     """
     try:
         client = _get_client()
@@ -3770,13 +3911,16 @@ async def debug_autotrace(
                     line=line,
                 )
             xml_mt, pid = _resolve_property_id(module_type, property_id)
-            adj_line, applied_offset = _apply_line_offset(client, object_id, line)
+            adj_line, applied_offset = _apply_line_offset(
+                client, object_id, line, property_id=pid
+            )
             await client.set_breakpoints(
                 module_type=xml_mt,
                 object_id=object_id,
                 property_id=pid,
                 lines=[adj_line],
             )
+            client._autotrace_bp = {(object_id, pid, adj_line)}  # M-2: cleared on collect
             await client.set_break_on_next_statement(silent=True)
             return json.dumps(
                 {
@@ -3807,6 +3951,17 @@ async def debug_autotrace(
         # пути drain+Continue снимают target из _stopped_targets через step()).
         _t0 = asyncio.get_running_loop().time()
         target_id = await _await_bp_stop(client, timeout_sec)
+        # M-2 (audit 260710): tear down the armed autotrace BP now (hit OR NO_HIT)
+        # so it doesn't linger and halt a later run with nobody collecting. Safe
+        # before inspection: the current halt persists until Continue; only future
+        # BPs are cleared (setBreakpoints REPLACES the workspace).
+        if client._autotrace_bp:
+            try:
+                _clear_logpoint_keys(client, client._autotrace_bp)
+                await client._push_bp_workspace()
+            except Exception:
+                log.warning("autotrace collect: armed-BP cleanup failed", exc_info=True)
+            client._autotrace_bp = set()
         if not target_id:
             waited = asyncio.get_running_loop().time() - _t0
             verdict = (
@@ -3900,7 +4055,11 @@ async def debug_root_cause(
                     "message_pattern": exception_message,
                     "module_pattern": exception_module,
                 }
-                client._exception_bp_filters.append(added)
+                # LOW (audit 260710): dedup — repeated arm→collect cycles would
+                # otherwise pile identical filters (harmless OR-semantics, but the
+                # list grows and exception_filters_total misleads).
+                if added not in client._exception_bp_filters:
+                    client._exception_bp_filters.append(added)
             await client.set_break_on_next_statement(silent=True)
             return json.dumps(
                 {
@@ -3924,9 +4083,37 @@ async def debug_root_cause(
         # reasons=("exception",) — _handle_command signals on non-suppressed
         # rteProcessing). Filtered exceptions were auto-Continue'd upstream.
         _t0 = asyncio.get_running_loop().time()
+        _t0_wall = _time.time()
         target_id = await _await_bp_stop(client, timeout_sec, reasons=("exception",))
         if not target_id:
             waited = asyncio.get_running_loop().time() - _t0
+            # H-5 (audit 260710): the exception may have been SEEN (rteProcessing
+            # fired) but the ephemeral JOB force-resumed/quit before we could grab
+            # the live frame — targetQuit then popped _last_exception_by_target.
+            # Fall back to a fresh eager seed (captured in _handle_command) so we
+            # return a degraded (window_closed) diagnosis instead of a false miss.
+            # Only consume a seed that arrived during THIS collect's wait window
+            # (ts ≥ start − 0.5s), and pop it so it isn't reused by a later collect.
+            recents = getattr(client, "_recent_exceptions", None) or []
+            seed = None
+            for i in range(len(recents) - 1, -1, -1):
+                if recents[i].get("ts", 0) >= _t0_wall - 0.5:
+                    seed = recents.pop(i)
+                    break
+            if seed is not None:
+                diag = autonomy.build_seed_diagnosis(seed.get("symptom", {}), seed.get("stack", []))
+                return json.dumps(
+                    {
+                        "diagnosis": diag,
+                        "raw": {
+                            "hit": False,
+                            "window_closed": True,
+                            "waited_sec": round(waited, 1),
+                        },
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
             return json.dumps(
                 {"diagnosis": None, "raw": {"hit": False, "waited_sec": round(waited, 1)}},
                 ensure_ascii=False,
@@ -4033,14 +4220,32 @@ async def debug_trace_variable(
                 )
             bounded = len(all_assigns) > max_lines
             assigns = all_assigns[:max_lines]
+            # M-5 (audit 260710): do NOT co-opt lines the user already owns — a
+            # trace logpoint would overwrite the user's logpoint template, and its
+            # later teardown (_clear_logpoint_keys) would strip the line from the
+            # shared BP-cache entry, silently deleting the user's own breakpoint.
+            # Skip colliding lines and report them instead of clobbering.
+            existing_lp = set(getattr(client, "_logpoints", {}).keys())
+            existing_bp = {
+                (ce.get("object_id"), ce.get("property_id"), L)
+                for ce in getattr(client, "_set_breakpoints_cache", [])
+                for L in ce.get("lines", [])
+            }
             by_template: dict = {}
             keys: set = set()
             lines_info: list = []
+            skipped: list = []
             for a in assigns:
-                adj_line, applied_offset = _apply_line_offset(client, object_id, a["line"])
+                adj_line, applied_offset = _apply_line_offset(
+                    client, object_id, a["line"], property_id=pid
+                )
+                key = (object_id, pid, adj_line)
+                if key in existing_lp or key in existing_bp:
+                    skipped.append({"src_line": a["line"], "line": adj_line, "reason": "user_bp_or_logpoint"})
+                    continue
                 tmpl = autonomy.build_trace_template(name, a["upstream"])
                 by_template.setdefault(tmpl, []).append(adj_line)
-                keys.add((object_id, pid, adj_line))
+                keys.add(key)
                 lines_info.append(
                     {
                         "src_line": a["line"],
@@ -4049,6 +4254,18 @@ async def debug_trace_variable(
                         "upstream": a["upstream"],
                         "text": a["text"],
                     }
+                )
+            if not keys:
+                return json.dumps(
+                    {
+                        "status": "no_traceable_lines",
+                        "name": name,
+                        "method": method or None,
+                        "skipped_collisions": skipped,
+                        "hint": "all assignment lines already carry a user BP/logpoint",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
                 )
             for tmpl, lns in by_template.items():
                 await client.set_breakpoints(
@@ -4081,6 +4298,7 @@ async def debug_trace_variable(
                     "method": method or None,
                     "lines": lines_info,
                     "lines_bounded": bounded,
+                    "skipped_collisions": skipped,  # M-5
                     "next": (
                         "trigger the code (execute_code / UI / JOB), then call "
                         "debug_trace_variable(phase='collect')"
@@ -4099,6 +4317,10 @@ async def debug_trace_variable(
                 "no active trace — call debug_trace_variable(phase='arm') first", "no_trace"
             )
         session_id = getattr(client, "session_id", "unknown")
+        # M-4 (audit 260710): await in-flight deferred logpoint tasks so the last
+        # hit's eval+JSONL-write lands before we read the timeline (else the tail is
+        # truncated and its record orphans into a later trace).
+        pending_evals = await logpoints.drain_active(timeout=2.0)
         timeline = autonomy.read_trace_timeline(
             client._log_dir, session_id, tv["keys"], tv["armed_log_lines"], tv["name"]
         )
@@ -4113,6 +4335,7 @@ async def debug_trace_variable(
             {
                 "name": tv["name"],
                 "hits": len(timeline),
+                "pending_evals": pending_evals,  # M-4: >0 → some tail may be late
                 "lines_traced": sorted({k[2] for k in tv["keys"]}),
                 "timeline": timeline,
             },
@@ -4196,6 +4419,30 @@ async def debug_collection_page(
         if not target_id:
             return _error_json("No stopped targets", "no_stopped_target", targets=scanned)
         count = max(1, min(int(count), 200))
+        # M-10 (audit 260710): `<expr>[i]` numeric indexing is valid for
+        # Массив/ТаблицаЗначений, but a Соответствие indexes by KEY (→ silent
+        # Неопределено pages) and РезультатЗапроса has no numeric index at all.
+        # Probe the type and return an actionable hint instead of wrong data.
+        type_probe = autonomy._extract_eval_value(
+            await client.eval_expression(
+                expression=f"ТипЗнч({expression})", target_uuid=target_id, stack_level=stack_level
+            )
+        )
+        _tp = (type_probe or "").lower()
+        if "соответств" in _tp or "map" == _tp:
+            return _error_json(
+                f"{type_probe}: numeric paging invalid for Соответствие (keyed by ключ)",
+                "unpageable_type",
+                type=type_probe,
+                hint="обойди ключи: Для Каждого КЗ Из <expr> Цикл ... КЗ.Ключ / КЗ.Значение",
+            )
+        if "результатзапроса" in _tp or "queryresult" in _tp:
+            return _error_json(
+                f"{type_probe}: РезультатЗапроса has no numeric index",
+                "unpageable_type",
+                type=type_probe,
+                hint="выгрузи: <expr>.Выгрузить() → ТаблицаЗначений, затем страницу этой ТЗ",
+            )
         exprs = autonomy.build_page_expressions(expression, int(start), count, columns)
         values = await client.eval_local_variables(
             target_uuid=target_id,
@@ -4226,6 +4473,7 @@ async def debug_set_breakpoint(
     property_id: str = "",
     condition: str = "",
     hit_condition: str = "",
+    apply_offset: bool = True,
 ) -> str:
     """Set a breakpoint in a BSL module.
 
@@ -4250,8 +4498,12 @@ async def debug_set_breakpoint(
     # Re-attach moved out: debug_connect handles initial attach; повторный attach
     # перед каждым set_breakpoint ломает established BP-delivery state в dbgs.exe.
     xml_module_type, property_id = _resolve_property_id(module_type, property_id)
-    # B2 §7.5: auto-apply measured deployed↔src offset (calibrate_result).
-    line, applied_offset = _apply_line_offset(client, object_id, line)
+    # B2 §7.5: auto-apply measured deployed↔src offset (calibrate_result), keyed
+    # by (object_id, property_id) — H-6. apply_offset=False to skip (M-8, e.g. a
+    # BP already in deployed coords from calibrate_result → no double-shift).
+    line, applied_offset = _apply_line_offset(
+        client, object_id, line, property_id=property_id, apply=apply_offset
+    )
     result = await client.set_breakpoints(
         module_type=xml_module_type,
         object_id=object_id,
@@ -4305,8 +4557,8 @@ async def debug_set_logpoint(
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     xml_module_type, property_id = _resolve_property_id(module_type, property_id)
-    # B2 §7.5: auto-apply measured deployed↔src offset (calibrate_result).
-    line, applied_offset = _apply_line_offset(client, object_id, line)
+    # B2 §7.5: auto-apply measured deployed↔src offset, keyed by (oid, pid) — H-6.
+    line, applied_offset = _apply_line_offset(client, object_id, line, property_id=property_id)
     await client.set_breakpoints(
         module_type=xml_module_type,
         object_id=object_id,
@@ -4565,6 +4817,11 @@ async def debug_coverage_register(lines: list[dict]) -> str:
         module_type = spec.get("module_type", "CommonModule")
         xml_mt, pid = _resolve_property_id(module_type, spec.get("property_id", ""))
         fp = spec.get("file_path", "")
+        # M-7 (audit 260710): apply the same B2 offset as set_breakpoint/logpoint —
+        # both the tracker key AND the BP must use the DEPLOYED line, or the hit
+        # (which fires at the deployed line) never matches the git-line tracker key
+        # → coverage silently misses on drifted modules.
+        line, applied_offset = _apply_line_offset(client, oid, int(line), property_id=pid)
         bsl_coverage.register_line(client, oid, pid, line, fp)
         # Register as BP via existing aggregation (no condition, no template)
         await client.set_breakpoints(
@@ -4573,7 +4830,14 @@ async def debug_coverage_register(lines: list[dict]) -> str:
             property_id=pid,
             lines=[int(line)],
         )
-        registered.append({"object_id": oid, "line": int(line), "property_id": pid})
+        registered.append(
+            {
+                "object_id": oid,
+                "line": int(line),
+                "property_id": pid,
+                "applied_offset": applied_offset,
+            }
+        )
     return json.dumps(
         {
             "status": "registered",
@@ -4745,10 +5009,18 @@ async def debug_calibrate_result(
             )
         results.append(entry)
         # B2 §7.5: record measured offset so future BPs on git lines auto-shift.
-        if entry["offset"]:
+        # H-6: key by (object_id, property_id). H-7: offset==0 (redeploy realigned
+        # the lines) must CLEAR any stale non-zero offset — a leftover offset keeps
+        # shifting BPs and is worse than none. `is not None` guards the "no fired
+        # lines" case (offset None → leave whatever's cached untouched).
+        if entry["offset"] is not None:
             if not hasattr(client, "_line_offsets"):
                 client._line_offsets = {}
-            client._line_offsets[oid] = int(entry["offset"])
+            key = _line_offset_key(oid, pid)
+            if entry["offset"]:
+                client._line_offsets[key] = int(entry["offset"])
+            else:
+                client._line_offsets.pop(key, None)
             _persist_active_session(client)
         if clear:
             fan_set = set(meta["lines"])

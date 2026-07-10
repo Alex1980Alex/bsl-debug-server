@@ -1330,9 +1330,12 @@ class TestClusterLoadProbe:
         assert result["status"] == "warn"
 
 
-@pytest.mark.asyncio
 class TestSessionDiff:
-    """L3 §12.7 — cross-session diff для regression detection."""
+    """L3 §12.7 — cross-session diff для regression detection.
+
+    (audit 260710 LOW: removed a stray class-level @pytest.mark.asyncio — every
+    method here is synchronous, the marker only emitted PytestWarnings.)
+    """
 
     def _summary(
         self, sid: str, fired: int, evals: int = 0, failures: int = 0, ui_retries: int = 0
@@ -3263,17 +3266,33 @@ class TestApplyLineOffset:
         assert (line, off) == (42, 0)
 
     def test_offset_applied(self, client):
-        client._line_offsets = {"obj": 3}
+        # H-6: key is (object_id, property_id); "" pid when not given.
+        client._line_offsets = {("obj", ""): 3}
         line, off = mds._apply_line_offset(client, "obj", 67)
         assert (line, off) == (70, 3)
 
     def test_offset_for_other_object_not_applied(self, client):
-        client._line_offsets = {"other": 5}
+        client._line_offsets = {("other", ""): 5}
         line, off = mds._apply_line_offset(client, "obj", 42)
         assert (line, off) == (42, 0)
 
+    def test_offset_not_shared_across_modules_of_same_object(self, client):
+        # H-6 regression: ManagerModule offset must NOT bleed into ObjectModule
+        # of the same object_id (they differ only by property_id).
+        client._line_offsets = {("obj", "mgr-pid"): 3}
+        line, off = mds._apply_line_offset(client, "obj", 67, property_id="obj-pid")
+        assert (line, off) == (67, 0)
+        line, off = mds._apply_line_offset(client, "obj", 67, property_id="mgr-pid")
+        assert (line, off) == (70, 3)
+
+    def test_apply_offset_false_skips(self, client):
+        # M-8: apply=False → no shift even with a cached offset.
+        client._line_offsets = {("obj", ""): 3}
+        line, off = mds._apply_line_offset(client, "obj", 67, apply=False)
+        assert (line, off) == (67, 0)
+
     def test_negative_offset(self, client):
-        client._line_offsets = {"obj": -2}
+        client._line_offsets = {("obj", ""): -2}
         line, off = mds._apply_line_offset(client, "obj", 10)
         assert (line, off) == (8, -2)
 
@@ -3285,10 +3304,11 @@ class TestLineOffsetsPersistence:
         client._attached = True
         client._registered = True
         client.session_id = "sess-1"
-        client._line_offsets = {"objA": 3, "objB": -1}
+        # H-6: tuple keys serialise as "oid|pid".
+        client._line_offsets = {("objA", "pidA"): 3, ("objB", "pidB"): -1}
         mds._persist_active_session(client)
         loaded = mds._load_active_session()
-        assert loaded["line_offsets"] == {"objA": 3, "objB": -1}
+        assert loaded["line_offsets"] == {"objA|pidA": 3, "objB|pidB": -1}
         assert loaded["session_id"] == "sess-1"
 
     def test_persist_empty_offsets_when_absent(self, client, tmp_path, monkeypatch):
@@ -3314,10 +3334,14 @@ class _AutotraceClient:
         self._last_stopped_target_id = stopped_target
         self._last_stack_by_target = {}
         self._stopped_targets = {stopped_target} if stopped_target else set()
+        # M-1 (audit 260710): _await_bp_stop keys off _user_visible_stops (targets
+        # that passed the suppress gates), not raw _stopped_targets.
+        self._user_visible_stops = {stopped_target} if stopped_target else set()
         self._stop_reason_by_target = {stopped_target: stop_reason} if stopped_target else {}
         if stopped_target and stack is not None:
             self._last_stack_by_target[stopped_target] = stack
         self._line_offsets = line_offsets or {}
+        self._autotrace_bp = set()  # M-2 (audit 260710)
         self.set_bp_calls = []
         self.arm_calls = 0
         self.step_calls = []
@@ -3371,7 +3395,9 @@ class _AutotraceClient:
 class TestDebugAutotrace:
     @pytest.mark.asyncio
     async def test_arm_sets_bp_with_offset_and_arms(self, monkeypatch):
-        client = _AutotraceClient(line_offsets={"obj": 3})
+        # H-6: offset keyed by (object_id, resolved property_id).
+        _, mgr_pid = mds._resolve_property_id("ManagerModule", "")
+        client = _AutotraceClient(line_offsets={("obj", mgr_pid): 3})
         monkeypatch.setattr(mds, "_get_client", lambda: client)
         out = json.loads(
             await mds.debug_autotrace(
@@ -3450,8 +3476,11 @@ class TestDebugAutotrace:
         orig_sleep = asyncio.sleep
 
         async def draining_sleep(sec):
-            # первый (debounce) sleep симулирует drain: target уходит из stopped
+            # первый (debounce) sleep симулирует drain: target уходит из stopped.
+            # M-1 (audit 260710): drain (step/targetQuit) снимает target из ОБОИХ
+            # наборов; _await_bp_stop re-check'ает _user_visible_stops (source of truth).
             client._stopped_targets.discard("tgt")
+            client._user_visible_stops.discard("tgt")
             await orig_sleep(0)
 
         monkeypatch.setattr(mds, "_get_client", lambda: client)

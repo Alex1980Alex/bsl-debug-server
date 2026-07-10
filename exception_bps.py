@@ -19,13 +19,20 @@ def should_halt(filters: list, exc_info: dict, stack: list) -> bool:
     if not filters:
         return True  # default: halt all exceptions
     msg = _extract_message(exc_info).lower()
-    top_module = _extract_top_module_name(stack).lower()
+    modules = [m.lower() for m in _extract_module_names(stack)]
     for f in filters:
         mp = (f.get("message_pattern") or "").lower()
         modp = (f.get("module_pattern") or "").lower()
         if mp and mp not in msg:
             continue
-        if modp and modp not in top_module:
+        # H-3 (audit 260710): match module_pattern against ANY frame, not just
+        # stack[0]. RDBG callStack is OUTERMOST-first (fault frame is LAST, Ф-2),
+        # so keying on stack[0] compared the entry-point JOB module, not the
+        # throwing one → the filter never matched → maybe_suppress auto-Continue'd
+        # exactly the exception it meant to catch (same class of bug already fixed
+        # for message_pattern via `info`). "module X" filter = "X is in the throw
+        # path" is the useful semantics anyway.
+        if modp and not any(modp in m for m in modules):
             continue
         return True
     return False
@@ -45,14 +52,16 @@ def _extract_message(exc_info) -> str:
     return ""
 
 
-def _extract_top_module_name(stack) -> str:
-    top = stack[0] if isinstance(stack, list) and stack else None
-    if not isinstance(top, dict):
-        return ""
-    pres = top.get("presentation", "")
-    if isinstance(pres, str):
-        return pres
-    return ""
+def _extract_module_names(stack) -> list:
+    """Presentations of ALL frame modules (Ф-2-agnostic — see should_halt)."""
+    out: list = []
+    if isinstance(stack, list):
+        for fr in stack:
+            if isinstance(fr, dict):
+                pres = fr.get("presentation", "")
+                if isinstance(pres, str) and pres:
+                    out.append(pres)
+    return out
 
 
 async def maybe_suppress(client, target_id, exc_info, stack) -> bool:

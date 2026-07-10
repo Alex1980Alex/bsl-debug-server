@@ -16,6 +16,21 @@ log = logging.getLogger("1c-debug-mcp.logpoints")
 _active_tasks: set = set()
 
 
+async def drain_active(timeout: float = 2.0) -> int:
+    """M-4 (audit 260710): await in-flight deferred logpoint tasks.
+
+    `fire_logpoint` defers eval+JSONL-write to a `create_task`, so a reader
+    (`debug_trace_variable` collect) that reads the JSONL immediately can truncate
+    the tail — the last hit's write may still be pending. Await them (bounded) so
+    the timeline is complete. Returns the count that were still pending; a task
+    slower than `timeout` is left running (best-effort, never blocks forever).
+    """
+    pending = [t for t in list(_active_tasks) if not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
+    return len(pending)
+
+
 _PLACEHOLDER_RE = re.compile(r"(?<!\{)\{([^{}]+)\}(?!\})")
 
 

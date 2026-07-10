@@ -140,6 +140,7 @@ class TestAwaitReasons:
     async def test_exception_reason_matches(self):
         c = _make_client()
         c._stopped_targets.add(TGT)
+        c._user_visible_stops.add(TGT)  # M-1: source of truth for _await_bp_stop
         c._stop_reason_by_target[TGT] = "exception"
         tid = await _await_bp_stop(c, timeout_sec=5.0, reasons=("exception",))
         assert tid == TGT
@@ -261,6 +262,7 @@ class TestDebugRootCause:
         c._attached = True
         c._registered = True
         c._stopped_targets.add(TGT)
+        c._user_visible_stops.add(TGT)  # M-1
         c._stop_reason_by_target[TGT] = "exception"
         c._last_stack_by_target[TGT] = stack
         c._last_exception_by_target[TGT] = {"code": "9", "info": "деление на ноль"}
