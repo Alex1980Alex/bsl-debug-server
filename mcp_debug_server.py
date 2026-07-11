@@ -4754,6 +4754,10 @@ async def debug_set_breakpoint(
     # Re-attach moved out: debug_connect handles initial attach; повторный attach
     # перед каждым set_breakpoint ломает established BP-delivery state в dbgs.exe.
     xml_module_type, property_id = _resolve_property_id(module_type, property_id)
+    # C3 (roadmap 260708 §8.1): classify the SRC-coordinate line the caller passed
+    # (before the deployed-offset shift below) so `location` in the response can warn
+    # about a non-executable target + suggest the nearest executable line.
+    requested_line = line
     # B2 §7.5: auto-apply measured deployed↔src offset (calibrate_result), keyed
     # by (object_id, property_id) — H-6. apply_offset=False to skip (M-8, e.g. a
     # BP already in deployed coords from calibrate_result → no double-shift).
@@ -4777,10 +4781,89 @@ async def debug_set_breakpoint(
             "applied_offset": applied_offset,
             "module_type": module_type,
             "response": result,
+            "location": _classify_bp_line(object_id, property_id, module_type, requested_line),
         },
         ensure_ascii=False,
         indent=2,
     )
+
+
+def _classify_bp_line(object_id: str, property_id: str, module_type: str, src_line: int) -> Optional[dict]:
+    """C3 (roadmap 260708 §8.1) advisory line-class of a BP target vs its resolved src file;
+    None when source unresolvable; the caller passes the src-coordinate line (before B2 deployed-offset)."""
+    try:
+        _, pid = _resolve_property_id(module_type, property_id)
+        src_path = uuid_index.resolve_uuid(object_id, pid)
+        if not src_path or not Path(src_path).exists():
+            return None
+        # utf-8-sig: 1С EDT/Designer .bsl dumps often carry a BOM; without
+        # stripping it `﻿` sticks to line 1 (str.strip() won't remove it) →
+        # line-1 prefix matches fail → misclassified. Matches bsl_locals reader.
+        lines = Path(src_path).read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        classified = bsl_locals.classify_lines(lines)
+        info = classified.get(src_line)
+        if not info:
+            return None
+        out = {
+            "line": src_line,
+            "class": info["class"],
+            "executable": info["executable"],
+            "uncertain": info["uncertain"],
+        }
+        if not info["executable"]:
+            out["nearest_executable"] = bsl_locals.nearest_executable(classified, src_line)
+        return out
+    except Exception:
+        log.debug("_classify_bp_line failed", exc_info=True)
+        return None
+
+
+@mcp.tool()
+async def debug_breakpoint_locations(object_id: str, from_line: int = 1, to_line: int = 0, module_type: str = "CommonModule", property_id: str = "") -> str:
+    """C3 (roadmap 260708 §8.1) - list which lines in a module range a breakpoint can actually fire on
+    (RDBG silently ignores BPs on comments/block-keywords/declarations/string-continuations).
+    Heuristic + advisory. `to_line=0` means to end of file. Lines are SRC coordinates
+    (B2 deployed-offset applies separately at set time)."""
+    client = _get_client()
+    if not client._attached:
+        return _error_json("Not connected. Call debug_connect first.", "not_connected")
+    try:
+        _, pid = _resolve_property_id(module_type, property_id)
+        src_path = uuid_index.resolve_uuid(object_id, pid)
+        if not src_path or not Path(src_path).exists():
+            return _error_json("source not resolvable for object_id/property_id", "no_source", object_id=object_id)
+        lines = Path(src_path).read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        to = None if not to_line else to_line
+        classified = bsl_locals.classify_lines(lines, from_line or 1, to)
+        executable = [ln for ln in sorted(classified) if classified[ln]["executable"]]
+        non_executable = [
+            {
+                "line": ln,
+                "class": classified[ln]["class"],
+                "uncertain": classified[ln]["uncertain"],
+                "text": classified[ln]["text"],
+            }
+            for ln in sorted(classified)
+            if not classified[ln]["executable"]
+        ]
+        return json.dumps(
+            {
+                "object_id": object_id,
+                "module_type": module_type,
+                "source": str(src_path),
+                "from_line": from_line or 1,
+                "to_line": to or len(lines),
+                "executable_lines": executable,
+                "executable_count": len(executable),
+                "non_executable": non_executable,
+                "note": "advisory heuristic; classes header/structural are uncertain and may still be settable; B2 deployed-offset applies at set time",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_breakpoint_locations failed")
+        return _error_json(str(e), type(e).__name__, object_id=object_id)
 
 
 @mcp.tool()
