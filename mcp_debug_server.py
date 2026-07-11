@@ -1826,6 +1826,64 @@ class RDBGClient:
         finally:
             self._pending_evals.pop(expr_result_id, None)
 
+    async def modify_value(
+        self,
+        name: str,
+        value_expr: str,
+        target_uuid: Optional[str] = None,
+        stack_level: int = 0,
+        variant: str = "expr",
+        timeout_ms: int = 5000,
+    ) -> list[dict]:
+        """C1 (roadmap 260708 W3): set a variable/property value at a halt.
+
+        RDBG native `modifyValue` command (RDBGModifyValueRequest). evalExpr
+        CANNOT assign — in BSL `=` is comparison in expression context and
+        `Выполнить(...)` is void ("Ожидается выражение"), both live-probed
+        2026-07-11. `modifyValue` is the real setter the platform's "Set Value"
+        maps to (`valueModified` event 9 is its confirmation). Sets `name` (at
+        `stack_level`) to the result of BSL `value_expr` via
+        newValueInfo.valueExpression (variant="expr").
+
+        `modifyDataPath` reuses the exact CalculationSourceDataStorage shape of
+        eval_expression's `expr` (stackLevel + srcCalcInfo[calcItem]).
+
+        SECURITY: value_expr executes as BSL in the running rphost (same note as
+        logpoints) — never pass untrusted expressions.
+
+        `timeout_ms` is RDBG's server-side wait in MILLISECONDS (live-probed
+        2026-07-11: sending "3" returned «не удалось получить результат ... в
+        течение 3 миллисекунд» → the field is ms, not seconds; default 5000).
+
+        Returns the parsed RDBG response (list[dict]); shape carries
+        `processed` + `newValueState`|`errorDescr`. Synchronous (unlike evalExpr
+        it is not event-driven) — no _pending_evals / ping-loop wait needed.
+        """
+        target_uuid = self._resolve_target_uuid(target_uuid)
+        if not target_uuid:
+            raise ValueError("modify_value: no target_uuid and no last_stopped")
+        await self._ensure_target_attached(target_uuid)
+        expr_result_id = str(uuid.uuid4())
+        src_calc_info = _calc("expressionResultID", expr_result_id) + _calc(
+            "calcItem",
+            _calc("itemType", "expression") + _calc("expression", _escape_xml(name)),
+        )
+        modify_data_path = _calc("stackLevel", str(stack_level)) + _calc(
+            "srcCalcInfo", src_calc_info
+        )
+        new_value_info = _calc("variant", variant) + _calc(
+            "valueExpression", _escape_xml(value_expr)
+        )
+        body = _build_request(
+            self._base_fields(),
+            _rdbg("targetID", _target_id_light(target_uuid)),
+            _rdbg("modifyDataPath", modify_data_path),
+            _rdbg("newValueInfo", new_value_info),
+            _rdbg("timeout", str(timeout_ms)),
+        )
+        root = await self._post("modifyValue", body)
+        return _parse_response(root)
+
     # -- Control API -------------------------------------------------------
 
     async def step(self, action: str = "Continue", target_uuid: Optional[str] = None) -> list[dict]:
@@ -3896,6 +3954,123 @@ async def debug_evaluate(expression: str, target_id: str = "", stack_level: int 
         log.exception("debug_evaluate failed")
         return _error_json(
             _rdbg_error_text(e), type(e).__name__, expression=expression, target_id=target_id
+        )
+
+
+def _extract_modify_result(parsed) -> tuple[bool, Optional[str]]:
+    """Extract (processed, error) from a parsed `modifyValue` response.
+
+    Two live-verified shapes (RDBG 8.3.27.1936, 2026-07-11):
+    - SUCCESS: `[{_tag: newValueState, evalResultState: "correctly",
+      resultValueInfo: {...new value...}}]` — success is signalled by
+      `newValueState.evalResultState == "correctly"`; there is NO `processed`
+      element on success.
+    - FAILURE: `[{_tag: processed, _value: "false"}, {_tag: errorDescr,
+      _value: <base64>}]` — e.g. too-small `timeout` or a bad `value_expr`
+      (the errorDescr carries the BSL/compile error).
+    Robust to either; unknown shape → (False, None) (full `raw` surfaced by the
+    tool for diagnosis).
+    """
+    processed = False
+    error = None
+    items = parsed if isinstance(parsed, list) else [parsed]
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        tag = it.get("_tag")
+        # explicit processed bool (failure shape)
+        if tag == "processed":
+            processed = str(it.get("_value", "")).strip().lower() == "true"
+        elif "processed" in it and not isinstance(it["processed"], (dict, list)):
+            processed = str(it["processed"]).strip().lower() == "true"
+        # errorDescr (base64) — failure detail
+        if tag == "errorDescr" and it.get("_value"):
+            error = autonomy._decode_pres_b64(it["_value"]) or str(it["_value"])
+        elif it.get("errorDescr") and not isinstance(it["errorDescr"], (dict, list)):
+            error = autonomy._decode_pres_b64(it["errorDescr"]) or str(it["errorDescr"])
+        # newValueState (success shape) — evalResultState carries the verdict
+        nvs = it if tag == "newValueState" else it.get("newValueState")
+        if isinstance(nvs, dict):
+            state = nvs.get("evalResultState")
+            if state == "correctly":
+                processed = True
+            elif state == "withErrors" and error is None:
+                error = autonomy._extract_eval_value(nvs) or "withErrors"
+    return processed, error
+
+
+@mcp.tool()
+async def debug_set_variable(
+    name: str,
+    value_expression: str,
+    target_id: str = "",
+    stack_level: int = 0,
+    verify: bool = True,
+) -> str:
+    """C1 (roadmap 260708 W3): set a variable's value at a breakpoint.
+
+    Runtime hypothesis-testing — mutate a frame variable/property to the result
+    of a BSL expression, then continue («а что если тут X=0?»). Uses RDBG native
+    `modifyValue` (evalExpr CANNOT assign — BSL `=` is comparison, `Выполнить`
+    is void; live-probed 2026-07-11). Returns a guard `{old,new,changed}` so the
+    effect is visible.
+
+    Args:
+        name: variable/property to set (e.g. "Итог", "Контрагент.ИНН").
+        value_expression: BSL expression for the new value (e.g. "0",
+            "\"тест\"", "Дата(2026,1,1)", "Новый Массив"). Executed as BSL in
+            the rphost — SECURITY: never pass untrusted expressions.
+        target_id: UUID; empty → cached last_stopped → get_targets scan.
+        stack_level: 0 = current/innermost frame, 1 = caller, ...
+        verify: read the value before+after (guard {old,new,changed}). False
+            skips the two extra reads.
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        target_id, _ = await _resolve_stopped_target(client, target_id)
+        if not target_id:
+            return _error_json("No stopped targets", "no_stopped_target", target_id=target_id)
+
+        async def _read():
+            res = await client.eval_expression(
+                expression=name, target_uuid=target_id, stack_level=stack_level
+            )
+            return autonomy._extract_eval_value(res) if res else None
+
+        old = await _read() if verify else None
+        raw = await client.modify_value(
+            name=name,
+            value_expr=value_expression,
+            target_uuid=target_id,
+            stack_level=stack_level,
+        )
+        processed, error = _extract_modify_result(raw)
+        new = await _read() if verify else None
+        return json.dumps(
+            {
+                "name": name,
+                "value_expression": value_expression,
+                "stack_level": stack_level,
+                "processed": processed,
+                "error": error,
+                "old": old,
+                "new": new,
+                "changed": (old != new) if verify else None,
+                "raw": raw,
+                "security_note": (
+                    "modifyValue исполняет value_expression как BSL в rphost — "
+                    "не передавать untrusted"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_set_variable failed")
+        return _error_json(
+            _rdbg_error_text(e), type(e).__name__, name=name, target_id=target_id
         )
 
 
