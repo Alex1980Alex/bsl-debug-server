@@ -4957,6 +4957,242 @@ async def debug_set_function_breakpoint(method_fqn: str, condition: str = "", hi
         return _error_json(_rdbg_error_text(e), type(e).__name__, method_fqn=method_fqn)
 
 
+def _a5_eq(actual, expected) -> bool:
+    """A5: normalized equality between a captured logpoint value and an expected literal.
+
+    None-guard (NOT `or ""`): a falsy value like 0/False must NOT collapse to "" —
+    `expected=0` with a runtime value of 0 is a legitimate PASS (code-verify 2026-07-11).
+    """
+    a = "" if actual is None else str(actual).strip()
+    e = "" if expected is None else str(expected).strip()
+    if a.lower() == e.lower():
+        return True
+    bool_map = {
+        "истина": "t",
+        "true": "t",
+        "да": "t",
+        "ложь": "f",
+        "false": "f",
+        "нет": "f",
+    }
+    ma = bool_map.get(a.lower())
+    me = bool_map.get(e.lower())
+    if ma is not None and me is not None:
+        return ma == me
+    return False
+
+
+def _a5_read_entries(log_dir, session_id: str, keys: set, skip_lines: int) -> list:
+    """A5: read logpoint JSONL entries matching (object_id, property_id, line) keys, skipping already-seen lines."""
+    path = Path(log_dir) / f"{session_id}.jsonl"
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as e:
+        log.warning("A5: failed to read logpoint file %s: %s", path, e)
+        return []
+    out = []
+    for raw in lines[skip_lines:]:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        k = (entry.get("object_id"), entry.get("property_id"), entry.get("line"))
+        if k not in keys:
+            continue
+        evaluated = entry.get("evaluated")
+        out.append(
+            {
+                "key": k,
+                "line": entry.get("line"),
+                "ts": entry.get("ts"),
+                "values": evaluated if isinstance(evaluated, dict) else {},
+            }
+        )
+    return out
+
+
+@mcp.tool()
+async def debug_hypothesis(assertions: Optional[list] = None, phase: str = "arm", timeout_sec: int = 30) -> str:
+    """A5 (roadmap 260708 §8.3) - batch runtime hypothesis-test. Each assertion
+    {object_id, line, module_type?, property_id?, expr, expected?, label?} becomes a
+    logpoint evaluating `expr`; one trigger run; collect judges per-assertion
+    PASS/FAIL/NO_HIT/INCONCLUSIVE. Two-phase: phase="arm" (set logpoints + silent
+    break-on-next; trigger your code after), then phase="collect".
+    SECURITY: expr executes as BSL in rphost.
+    """
+    try:
+        client = _get_client()
+        if not client._attached:
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        if phase == "arm":
+            if not assertions:
+                return _error_json("arm requires assertions", "bad_args")
+            if len(assertions) > 50:
+                return _error_json("too many assertions (cap 50)", "too_many")
+
+            prior = getattr(client, "_hypothesis", None)
+            if prior:
+                try:
+                    _clear_logpoint_keys(client, prior["keys"])
+                    await client._push_bp_workspace()
+                except Exception:
+                    log.warning("hypothesis arm: failed to clear prior logpoints", exc_info=True)
+                client._hypothesis = None
+
+            resolved = []
+            by_key = {}
+            keys = set()
+
+            for i, a in enumerate(assertions):
+                object_id = a.get("object_id")
+                line = a.get("line")
+                expr = a.get("expr")
+                if not object_id or not line or not expr:
+                    return _error_json(f"assertion {i} needs object_id,line,expr", "bad_assertion", index=i)
+                try:
+                    line = int(line)  # coerce "42"→42 so key/teardown match logpoint's int line
+                except (TypeError, ValueError):
+                    return _error_json(f"assertion {i} line must be an integer", "bad_assertion", index=i)
+
+                xml_mt, pid = _resolve_property_id(a.get("module_type", "CommonModule"), a.get("property_id", ""))
+                adj_line, applied_offset = _apply_line_offset(client, object_id, line, property_id=pid)
+                key = (object_id, pid, adj_line)
+
+                g = by_key.setdefault(
+                    key,
+                    {"xml_mt": xml_mt, "object_id": object_id, "pid": pid, "line": adj_line, "exprs": []},
+                )
+                g["exprs"].append(expr)
+                keys.add(key)
+
+                resolved.append(
+                    {
+                        "index": i,
+                        "label": a.get("label") or f"#{i}@{adj_line}",
+                        "key": key,
+                        "expr": expr,
+                        "expected": a.get("expected"),
+                        "line": adj_line,
+                        "applied_offset": applied_offset,
+                    }
+                )
+
+            for key, g in by_key.items():
+                template = " ".join("{" + ex + "}" for ex in g["exprs"])
+                await client.set_breakpoints(
+                    module_type=g["xml_mt"],
+                    object_id=g["object_id"],
+                    property_id=g["pid"],
+                    lines=[g["line"]],
+                    logpoint_template=template,
+                )
+
+            log_path = client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.jsonl"
+            armed = 0
+            if log_path.exists():
+                try:
+                    with open(log_path, encoding="utf-8", errors="replace") as f:
+                        armed = sum(1 for _ in f)
+                except OSError:
+                    pass
+
+            client._hypothesis = {"assertions": resolved, "keys": keys, "armed_log_lines": armed}
+
+            await client.set_break_on_next_statement(silent=True)
+
+            return json.dumps(
+                {
+                    "status": "armed",
+                    "assertion_count": len(resolved),
+                    "lines": sorted({r["line"] for r in resolved}),
+                    "next": "trigger the code, then debug_hypothesis(phase='collect')",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if phase != "collect":
+            return _error_json(f"unknown phase '{phase}'", "bad_phase")
+
+        h = getattr(client, "_hypothesis", None)
+        if not h:
+            return _error_json("no active hypothesis - call phase='arm' first", "no_hypothesis")
+
+        await logpoints.drain_active(timeout=2.0)
+
+        entries = _a5_read_entries(client._log_dir, getattr(client, "session_id", "unknown"), h["keys"], h["armed_log_lines"])
+
+        per_assertion = []
+        passed = failed = no_hit = inconclusive = hit = 0
+
+        for r in h["assertions"]:
+            matches = [en for en in entries if en["key"] == r["key"]]
+            fired = bool(matches)
+            hits = len(matches)
+            actual = matches[0]["values"].get(r["expr"]) if fired else None
+
+            if not fired:
+                verdict = "NO_HIT"
+                no_hit += 1
+            elif r["expr"] not in matches[0]["values"]:
+                verdict = "INCONCLUSIVE"
+                inconclusive += 1
+            elif r["expected"] is None:
+                verdict = "HIT"
+                hit += 1
+            elif _a5_eq(actual, r["expected"]):
+                verdict = "PASS"
+                passed += 1
+            else:
+                verdict = "FAIL"
+                failed += 1
+
+            per_assertion.append(
+                {
+                    "label": r["label"],
+                    "line": r["line"],
+                    "expr": r["expr"],
+                    "fired": fired,
+                    "hits": hits,
+                    "actual": actual,
+                    "expected": r["expected"],
+                    "verdict": verdict,
+                }
+            )
+
+        try:
+            _clear_logpoint_keys(client, h["keys"])
+            await client._push_bp_workspace()
+        except Exception:
+            log.warning("hypothesis collect: logpoint clear failed", exc_info=True)
+
+        client._hypothesis = None
+
+        return json.dumps(
+            {
+                "verdict": {
+                    "passed": passed,
+                    "failed": failed,
+                    "no_hit": no_hit,
+                    "inconclusive": inconclusive,
+                    "hit": hit,
+                    "per_assertion": per_assertion,
+                },
+                "raw": {"entries": len(entries)},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_hypothesis failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, phase=phase)
+
+
 @mcp.tool()
 async def debug_set_logpoint(
     object_id: str,
