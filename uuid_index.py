@@ -91,6 +91,8 @@ class UUIDIndex:
         self._lock = threading.Lock()
         # uuid (lowercase) → {"mdo": str, "name": str, "kind": str, "child_kind": str|None}
         self._index: Optional[dict[str, dict]] = None
+        # C2 (roadmap §8.2): lazy reverse map fqn_lower → (object_id, module_type)
+        self._reverse: Optional[dict] = None
 
     def _src_fingerprint(self) -> Optional[dict]:
         """Recursive fingerprint of the .mdo tree for cache invalidation.
@@ -208,6 +210,7 @@ class UUIDIndex:
         """Force re-scan on next lookup (e.g. after `git pull`)."""
         with self._lock:
             self._index = None
+            self._reverse = None
             try:
                 self.cache_path.unlink(missing_ok=True)
             except OSError:
@@ -274,6 +277,23 @@ class UUIDIndex:
             "file_path": rel_path,
             "exists": bool(path and path.exists()),
         }
+
+    def find_by_fqn(self, module_fqn: str) -> Optional[tuple]:
+        """C2 (roadmap §8.2) reverse lookup: module fqn → (object_id, module_type).
+
+        Lazily builds the reverse map on first call (cached until reset()).
+        Case-insensitive; None if the fqn isn't a known module. The caller
+        still verifies the resolved source file exists (invalid object/manager/
+        recordset combos resolve to a path that won't exist).
+        """
+        if not module_fqn:
+            return None
+        idx = self._ensure_index()
+        with self._lock:
+            if self._reverse is None:
+                self._reverse = _reverse_fqn_entries(idx)
+            rev = self._reverse  # capture under lock — concurrent reset() nils it
+        return rev.get(module_fqn.strip().lower())
 
 
 # Singleton convenience for in-process callers
@@ -363,3 +383,56 @@ def get_source_info(object_id: str, property_id: str,
     return get_index_for_alias(
         alias if alias is not None else _active_alias
     ).get_source_info(object_id, property_id)
+
+
+def _reverse_fqn_entries(entries: dict) -> dict:
+    """C2 (roadmap 260708 §8.2): reverse of get_source_info's fqn-builder —
+    module fqn (lowercased) -> (object_id_lower, module_type), used by
+    debug_set_function_breakpoint to resolve a fully-qualified BSL name back
+    to the source object/module that produced it.
+
+    Mirrors UUIDIndex.get_source_info exactly:
+      - forms/commands children build "{kind_ru}.{ParentName}.Форма.{name}"
+        / "{kind_ru}.{ParentName}.Команда.{name}" (module_type FormModule /
+        CommandModule respectively);
+      - root objects build "{kind_ru}.{Name}" for CommonModule, or the three
+        object/manager/recordset combos "{kind_ru}.{Name}[.Suffix]" for
+        everything else. Non-existent modules (e.g. an ObjectModule combo for
+        a kind that has no object module) are simply resolved to a fqn that
+        will never match a real source file — filtered out by the caller's
+        existence check at resolve time, not here.
+
+    setdefault() keeps the first writer on a (rare) fqn collision, since dict
+    iteration order is insertion order and we prefer earlier entries.
+    """
+    rev: dict = {}
+    for uuid_l, rec in entries.items():
+        kind_ru = _KIND_FQN.get((rec.get("kind") or "").lower(), rec.get("kind", ""))
+        child = rec.get("child_kind")
+        if child == "forms":
+            fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Форма.{rec['name']}"
+            rev.setdefault(fqn.lower(), (uuid_l, "FormModule"))
+        elif child == "commands":
+            fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Команда.{rec['name']}"
+            rev.setdefault(fqn.lower(), (uuid_l, "CommandModule"))
+        else:
+            k = (rec.get("kind") or "").lower()
+            if k == "commonmodule":
+                combos = [("CommonModule", "")]
+            else:
+                combos = [
+                    ("ObjectModule", "МодульОбъекта"),
+                    ("ManagerModule", "МодульМенеджера"),
+                    ("RecordSetModule", "МодульНабораЗаписей"),
+                ]
+            for module_type, suffix in combos:
+                fqn = f"{kind_ru}.{rec['name']}" + (f".{suffix}" if suffix else "")
+                rev.setdefault(fqn.lower(), (uuid_l, module_type))
+    return rev
+
+
+def find_by_fqn(module_fqn: str, alias: Optional[str] = None) -> Optional[tuple]:
+    """C2 (roadmap §8.2) module-level convenience: module fqn -> (object_id, module_type)."""
+    return get_index_for_alias(
+        alias if alias is not None else _active_alias
+    ).find_by_fqn(module_fqn)

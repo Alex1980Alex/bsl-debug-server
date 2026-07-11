@@ -4866,6 +4866,97 @@ async def debug_breakpoint_locations(object_id: str, from_line: int = 1, to_line
         return _error_json(str(e), type(e).__name__, object_id=object_id)
 
 
+def _first_executable_line(source_lines: list, start: int, end: int) -> Optional[int]:
+    """
+    C2 (roadmap §8.2): find the first BP-settable (executable) line within a
+    method's [start, end] range. Classifies the range via bsl_locals and
+    returns the smallest line number marked executable, or None if the
+    range contains no executable lines.
+    """
+    classified = bsl_locals.classify_lines(source_lines, start, end)
+    for ln in sorted(classified):
+        if classified[ln]["executable"]:
+            return ln
+    return None
+
+
+@mcp.tool()
+async def debug_set_function_breakpoint(method_fqn: str, condition: str = "", hit_condition: str = "") -> str:
+    """
+    C2 (roadmap 260708 §8.2) - set a breakpoint by METHOD NAME instead of line
+    number (robust to src<->deployed line drift).
+
+    method_fqn = "<ModuleFQN>.<Method>", e.g.
+    "ОбщийМодуль.mcp_ОтладкаВыполненияКода.ВыполнитьКодСУдержанием" or
+    "Документ.Реализация.МодульОбъекта.ОбработкаПроведения".
+
+    Resolves the module, finds the method's first executable line, and sets
+    a breakpoint there (B2 deployed-offset applies via debug_set_breakpoint).
+    """
+    client = _get_client()
+    if not client._attached:
+        return _error_json("Not connected. Call debug_connect first.", "not_connected")
+
+    try:
+        if "." not in method_fqn:
+            return _error_json("method_fqn must be '<ModuleFQN>.<Method>'", "bad_fqn")
+
+        module_fqn, _, method = method_fqn.rpartition(".")
+
+        resolved = uuid_index.find_by_fqn(module_fqn)
+        if not resolved:
+            return _error_json(
+                f"module fqn not found: {module_fqn}", "module_not_found", module_fqn=module_fqn
+            )
+        object_id, module_type = resolved
+
+        _, pid = _resolve_property_id(module_type, "")
+        src_path = uuid_index.resolve_uuid(object_id, pid)
+        if not src_path or not Path(src_path).exists():
+            return _error_json(
+                "source not resolvable for module", "no_source", module_fqn=module_fqn
+            )
+
+        source_lines = Path(src_path).read_text(encoding="utf-8-sig", errors="replace").splitlines()
+
+        rng = autonomy.find_method_range(source_lines, method)
+        if rng is None:
+            return _error_json(
+                f"method '{method}' not found in {module_fqn}", "method_not_found", method=method
+            )
+        start, end = rng
+
+        first_exec = _first_executable_line(source_lines, start, end)
+        line = first_exec if first_exec is not None else start
+
+        bp_json = await debug_set_breakpoint(
+            object_id=object_id,
+            line=line,
+            module_type=module_type,
+            condition=condition,
+            hit_condition=hit_condition,
+        )
+
+        return json.dumps(
+            {
+                "resolved": {
+                    "module_fqn": module_fqn,
+                    "method": method,
+                    "object_id": object_id,
+                    "module_type": module_type,
+                    "line": line,
+                    "method_range": [start, end],
+                },
+                "bp": json.loads(bp_json),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_set_function_breakpoint failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__, method_fqn=method_fqn)
+
+
 @mcp.tool()
 async def debug_set_logpoint(
     object_id: str,
