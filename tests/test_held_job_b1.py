@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -157,3 +158,79 @@ async def test_release_tool_no_active_job(monkeypatch):
     monkeypatch.setattr(mds, "_get_client", lambda: c)
     out = json.loads(await mds.debug_release_held_job())
     assert out["released"] is False
+
+
+# --- HTTP transport Ф-1(a) (review 260711: was untested) ------------------
+class _FakeResp:
+    def __init__(self, status_code=200, json_data=None, text=""):
+        self.status_code = status_code
+        self._json = {"result": "ok"} if json_data is None else json_data
+        self.text = text
+
+    def json(self):
+        return self._json
+
+
+@pytest.mark.asyncio
+async def test_execute_code_http_success(monkeypatch):
+    monkeypatch.setenv("MCP_ONEC_URL", "http://localhost/transport")
+    monkeypatch.setenv("MCP_ONEC_USERNAME", "u")
+    monkeypatch.setenv("MCP_ONEC_PASSWORD", "p")
+    http = AsyncMock()
+    http.post = AsyncMock(return_value=_FakeResp(200, {"result": {"data": 4}}))
+    res = await held_job.execute_code_http(http, "А = 1;")
+    assert res["ok"] is True
+    call = http.post.call_args
+    assert call.args[0] == "http://localhost/transport/hs/mcp/rpc"
+    payload = call.kwargs["json"]
+    assert payload["params"]["name"] == "execute_code"
+    assert payload["params"]["arguments"]["code"] == "А = 1;"
+
+
+@pytest.mark.asyncio
+async def test_execute_code_http_error_status(monkeypatch):
+    monkeypatch.setenv("MCP_ONEC_URL", "http://localhost/transport")
+    http = AsyncMock()
+    http.post = AsyncMock(return_value=_FakeResp(500, text="boom"))
+    res = await held_job.execute_code_http(http, "X;")
+    assert res["ok"] is False and "500" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_execute_code_http_no_url(monkeypatch):
+    monkeypatch.delenv("MCP_ONEC_URL", raising=False)
+    res = await held_job.execute_code_http(AsyncMock(), "X;")
+    assert res["ok"] is False and "MCP_ONEC_URL" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_execute_code_http_never_raises(monkeypatch):
+    monkeypatch.setenv("MCP_ONEC_URL", "http://localhost/transport")
+    http = AsyncMock()
+    http.post = AsyncMock(side_effect=RuntimeError("network down"))
+    res = await held_job.execute_code_http(http, "X;")
+    assert res["ok"] is False  # swallowed, never raises
+
+
+@pytest.mark.asyncio
+async def test_launch_http_transport_one_call(monkeypatch):
+    monkeypatch.setenv("MCP_ONEC_URL", "http://localhost/transport")
+    c = _HeldClient()
+    monkeypatch.setattr(mds, "_get_client", lambda: c)
+    monkeypatch.setattr(held_job, "execute_code_http", AsyncMock(return_value={"ok": True}))
+    out = json.loads(await mds.debug_launch_held_job(code="X = 1;", timeout_sec=30))
+    assert out["status"] == "launched"  # HTTP one-call
+    assert out["transport"] == "http"
+    assert out["trigger_bsl"] is None  # not returned when HTTP-triggered
+
+
+@pytest.mark.asyncio
+async def test_launch_releases_previous_hold(monkeypatch):
+    # review 260711: second launch frees the first hold instead of leaking it.
+    c = _HeldClient()
+    c._held_job = {"key": "hold-prev-1", "timeout_sec": 60, "launched": True}
+    monkeypatch.setattr(mds, "_get_client", lambda: c)
+    out = json.loads(await mds.debug_launch_held_job(code="Y = 1;", timeout_sec=30))
+    # new hold active with a fresh key (previous released, not leaked)
+    assert c._held_job is not None and c._held_job["key"] != "hold-prev-1"
+    assert out["key"] == c._held_job["key"]
