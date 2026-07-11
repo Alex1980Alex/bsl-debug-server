@@ -24,8 +24,17 @@ DEFAULT_TIMEOUT_SEC = 60
 
 
 def _bsl_string(s: str) -> str:
-    """Wrap a Python string as a BSL string literal (double-up inner quotes)."""
-    return '"' + (s or "").replace('"', '""') + '"'
+    """Wrap a Python string as a BSL string literal.
+
+    Two BSL rules: (1) an inner `"` is doubled `""`; (2) a string literal CANNOT
+    contain a raw newline — each continuation physical line must start with `|`
+    (the pipe is a marker; the value still contains the newline). Without (2) a
+    multi-line `code` (the common debug case) produced INVALID BSL that broke at
+    the first newline (adversarial review 260711).
+    """
+    s = (s or "").replace('"', '""')
+    s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\n|")
+    return '"' + s + '"'
 
 
 def build_trigger_code(code: str, key: str, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> str:

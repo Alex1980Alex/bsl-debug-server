@@ -4739,6 +4739,11 @@ async def debug_launch_held_job(
         if not (client._attached and client._registered):
             return _error_json("Not connected. Call debug_connect first.", "not_connected")
 
+        # Review 260711: release any previous held job first so its rphost doesn't
+        # linger until timeout when a new one is launched.
+        if client._held_job:
+            await _release_held_job(client)
+
         # опц. arm BP на целевую строку (с авто-offset B2)
         armed_bp = None
         if object_id and line > 0:

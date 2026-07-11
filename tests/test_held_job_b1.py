@@ -35,6 +35,18 @@ class TestBuilders:
         code = held_job.build_trigger_code('С = "a";', "k", 60)
         assert 'П.Добавить("С = ""a"";")' in code  # doubled quotes → valid BSL literal
 
+    def test_multiline_code_uses_pipe_continuation(self):
+        # Review 260711: multi-line code must become a valid BSL multi-line literal
+        # (each continuation line starts with `|`), not break at the newline.
+        s = held_job._bsl_string("А = 1;\nБ = 2;")
+        assert s == '"А = 1;\n|Б = 2;"'
+        # and the same via the trigger builder (CRLF normalised)
+        code = held_job.build_trigger_code("X = 1;\r\nY = 2;", "k", 30)
+        assert 'П.Добавить("X = 1;\n|Y = 2;")' in code
+
+    def test_release_code_key_with_quote_escaped(self):
+        assert held_job._bsl_string('k"1') == '"k""1"'
+
     def test_release_code_shape(self):
         rel = held_job.build_release_code("hold-abc-1")
         assert rel == 'ХранилищеОбщихНастроек.Сохранить("mcp_debug_hold_release", "hold-abc-1", Истина);'
