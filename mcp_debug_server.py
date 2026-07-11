@@ -36,6 +36,7 @@ import coverage as bsl_coverage  # P1.A roadmap 260511
 import exception_bps  # P3.B roadmap 260511
 import snapshot  # P2.A roadmap 260511
 import autonomy  # A0/A1 roadmap 260708
+import held_job  # B1 roadmap 260708 / ADR-049
 
 logging.basicConfig(
     level=logging.INFO,
@@ -399,6 +400,11 @@ class RDBGClient:
         # cleared on collect so an autotrace BP doesn't linger and halt later runs
         # when nobody is collecting (parity with A3's logpoint teardown).
         self._autotrace_bp: set = set()
+        # B1 (roadmap 260708, ADR-049): active persistent-JOB hold. When set, a
+        # long-lived debug-worker (mcp_ОтладкаВыполненияКода.ВыполнитьКодСУдержанием)
+        # is holding its rphost alive; debug_step("Continue") releases it.
+        self._held_job: Optional[dict] = None  # {key, timeout_sec, launched}
+        self._held_job_seq: int = 0
 
     def _get_stop_event(self) -> asyncio.Event:
         """B3: session asyncio.Event for user-visible BP stops, bound to the
@@ -4672,9 +4678,127 @@ async def debug_step(action: str = "Continue", target_id: str = "") -> str:
     if not target_id:
         return json.dumps({"error": "No stopped targets"})
     result = await client.step(action=action, target_uuid=target_id)
-    return json.dumps(
-        {"action": action, "target_id": target_id, "result": result}, ensure_ascii=False, indent=2
-    )
+    released = None
+    # B1 (roadmap 260708): a Continue on a held JOB also releases the worker's
+    # hold-loop so its rphost quits instead of spinning until timeout.
+    if action == "Continue" and client._held_job:
+        released = await _release_held_job(client)
+    out = {"action": action, "target_id": target_id, "result": result}
+    if released is not None:
+        out["held_job_released"] = released
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+async def _release_held_job(client: "RDBGClient") -> dict:
+    """B1: release the active persistent-JOB hold. Uses the HTTP execute_code
+    transport when MCP_ONEC_* env is set (Ф-1a); otherwise returns the release
+    BSL for the agent to run via 1c-mcp-crud (Ф-1b). Clears `_held_job`."""
+    hj = client._held_job or {}
+    key = hj.get("key", "")
+    client._held_job = None
+    if not key:
+        return {"released": False, "reason": "no active held job"}
+    release_bsl = held_job.build_release_code(key)
+    if held_job.transport_available():
+        res = await held_job.execute_code_http(client._http, release_bsl)
+        return {"released": bool(res.get("ok")), "key": key, "transport": "http", "detail": res}
+    return {
+        "released": False,
+        "key": key,
+        "transport": "two_phase",
+        "release_bsl": release_bsl,
+        "hint": "run release_bsl via 1c-mcp-crud execute_code to free the rphost early (else it self-releases on timeout)",
+    }
+
+
+@mcp.tool()
+async def debug_launch_held_job(
+    code: str,
+    timeout_sec: int = 60,
+    object_id: str = "",
+    line: int = 0,
+    module_type: str = "CommonModule",
+    property_id: str = "",
+) -> str:
+    """B1 (roadmap 260708, ADR-049): запустить долгоживущий debug-worker, который
+    исполняет `code` и УДЕРЖИВАЕТ rphost живым (до debug_step(Continue) или
+    таймаута), решая корень P-1(a) — эфемерный JOB-rphost живёт <100ms.
+
+    Опц. `object_id`+`line` — ставит BP на целевую строку ДО запуска (arm),
+    чтобы BP fire'нул внутри `code`. Затем: ping до callStackFormed → inspect →
+    debug_step(Continue) (освободит удержание).
+
+    Transport: при заданных env MCP_ONEC_* wrapper сам триггерит через HTTP
+    execute_code (Ф-1a, one-call). Иначе — two-phase (Ф-1b): возвращает
+    `trigger_bsl`, который ВЫ запускаете через `1c-mcp-crud:execute_code`.
+
+    SECURITY: `code` исполняется привилегированно в rphost — не передавай untrusted.
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+
+        # опц. arm BP на целевую строку (с авто-offset B2)
+        armed_bp = None
+        if object_id and line > 0:
+            xml_mt, pid = _resolve_property_id(module_type, property_id)
+            adj_line, applied_offset = _apply_line_offset(client, object_id, line, property_id=pid)
+            await client.set_breakpoints(
+                module_type=xml_mt, object_id=object_id, property_id=pid, lines=[adj_line]
+            )
+            armed_bp = {"object_id": object_id, "line": adj_line, "applied_offset": applied_offset}
+
+        # silent-arm следующий JOB-rphost (Шаблон 6): его поймает ping
+        await client.set_break_on_next_statement(silent=True)
+
+        client._held_job_seq += 1
+        key = held_job.make_key(getattr(client, "session_id", "sess"), client._held_job_seq)
+        trigger_bsl = held_job.build_trigger_code(code, key, timeout_sec)
+        client._held_job = {"key": key, "timeout_sec": timeout_sec, "launched": True}
+
+        triggered = None
+        if held_job.transport_available():
+            triggered = await held_job.execute_code_http(client._http, trigger_bsl)
+
+        return json.dumps(
+            {
+                "status": "launched" if triggered and triggered.get("ok") else "armed",
+                "key": key,
+                "armed_bp": armed_bp,
+                "timeout_sec": timeout_sec,
+                "transport": "http" if triggered else "two_phase",
+                "trigger_bsl": None if (triggered and triggered.get("ok")) else trigger_bsl,
+                "trigger_detail": triggered,
+                "next": (
+                    "debug_ping → callStackFormed on the JOB target → inspect → "
+                    "debug_step('Continue') (releases the hold)"
+                    if (triggered and triggered.get("ok"))
+                    else "run trigger_bsl via 1c-mcp-crud execute_code, then debug_ping → inspect → debug_step('Continue')"
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_launch_held_job failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__)
+
+
+@mcp.tool()
+async def debug_release_held_job() -> str:
+    """B1: явно освободить активное удержание JOB (обычно это делает
+    debug_step(Continue)). При HTTP-транспорте пишет release-флаг; иначе
+    возвращает `release_bsl` для запуска через 1c-mcp-crud."""
+    try:
+        client = _get_client()
+        if not client._held_job:
+            return json.dumps({"released": False, "reason": "no active held job"}, ensure_ascii=False)
+        res = await _release_held_job(client)
+        return json.dumps(res, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.exception("debug_release_held_job failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
