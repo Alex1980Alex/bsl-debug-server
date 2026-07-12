@@ -411,9 +411,10 @@ class RDBGClient:
         # {name, mode, predicate, run_id, fires, max_fires}. Empty by default →
         # the _handle_command watch-gate is a no-op (zero behaviour change).
         self._watchpoints: dict[tuple, dict] = {}
-        self._watch_last: dict = {}  # name -> last observed value (change detection)
+        self._watch_last: dict = {}  # (target_id, name) -> last observed value (F-5)
         self._watch_changes: list = []  # in-memory change records (mirror of JSONL)
         self._watch_run: Optional[dict] = None  # {keys, name, run_id, armed_log_lines}
+        self._watch_halt_count: int = 0  # F-4: watch-driven halts (session_summary)
         # A6 (roadmap 260708 §8.6): correlation id threaded through every artifact
         # (logpoint/watch JSONL, snapshot, coverage, summary). Default set at connect.
         self._correlation_id: Optional[str] = None
@@ -3838,6 +3839,10 @@ async def debug_session_summary(format: str = "json") -> str:
         },
         "stop_events": list(_client._stop_events),
         "rphosts_seen": list(_client._rphosts_seen),
+        # F-4 (re-audit 260712): watch-driven halts bypass the BP metrics path,
+        # so surface their count explicitly (also visible as reason="watchpoint"
+        # entries in stop_events).
+        "watch_halts": getattr(_client, "_watch_halt_count", 0),
     }
     # Persist для cross-session diff (§12.7)
     _persist_session_summary(summary)
@@ -5161,6 +5166,17 @@ async def debug_set_function_breakpoint(method_fqn: str, condition: str = "", hi
             )
         start, end = rng
 
+        # C2 warning (re-audit 260712): a duplicated method name → find_method_range
+        # silently used the FIRST; surface it so the agent isn't misled.
+        def_count = autonomy.count_method_definitions(source_lines, method)
+        warning = None
+        if def_count > 1:
+            warning = (
+                f"method '{method}' is defined {def_count}× in {module_fqn}; "
+                f"BP set on the FIRST definition (line {start}). "
+                "Pass an explicit line via debug_set_breakpoint to target another."
+            )
+
         first_exec = _first_executable_line(source_lines, start, end)
         line = first_exec if first_exec is not None else start
 
@@ -5172,21 +5188,21 @@ async def debug_set_function_breakpoint(method_fqn: str, condition: str = "", hi
             hit_condition=hit_condition,
         )
 
-        return json.dumps(
-            {
-                "resolved": {
-                    "module_fqn": module_fqn,
-                    "method": method,
-                    "object_id": object_id,
-                    "module_type": module_type,
-                    "line": line,
-                    "method_range": [start, end],
-                },
-                "bp": json.loads(bp_json),
+        result = {
+            "resolved": {
+                "module_fqn": module_fqn,
+                "method": method,
+                "object_id": object_id,
+                "module_type": module_type,
+                "line": line,
+                "method_range": [start, end],
+                "definitions_found": def_count,
             },
-            ensure_ascii=False,
-            indent=2,
-        )
+            "bp": json.loads(bp_json),
+        }
+        if warning:
+            result["warning"] = warning
+        return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         log.exception("debug_set_function_breakpoint failed")
         return _error_json(_rdbg_error_text(e), type(e).__name__, method_fqn=method_fqn)

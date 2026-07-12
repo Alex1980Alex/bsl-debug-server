@@ -497,16 +497,23 @@ _BSL_KEYWORDS = frozenset(
 )
 
 
+def _method_head_re(method_name: str):
+    esc = re.escape(method_name)
+    return re.compile(
+        rf"^\s*(?:Процедура|Функция|Procedure|Function)\s+{esc}\s*\(", re.IGNORECASE
+    )
+
+
 def find_method_range(source_lines: list, method_name: str):
     """1-based inclusive [start, end] line range of `Процедура/Функция method_name`.
 
     Returns (start, end) or None if not found. `end` is the matching
-    `КонецПроцедуры/КонецФункции` (or last line if unterminated).
+    `КонецПроцедуры/КонецФункции` (or last line if unterminated). Takes the FIRST
+    definition; use `count_method_definitions` to detect a duplicated name.
     """
     if not method_name:
         return None
-    esc = re.escape(method_name)
-    head = re.compile(rf"^\s*(?:Процедура|Функция|Procedure|Function)\s+{esc}\s*\(", re.IGNORECASE)
+    head = _method_head_re(method_name)
     tail = re.compile(r"^\s*(?:КонецПроцедуры|КонецФункции|EndProcedure|EndFunction)\b", re.IGNORECASE)
     start = None
     for i, ln in enumerate(source_lines, start=1):
@@ -516,6 +523,18 @@ def find_method_range(source_lines: list, method_name: str):
         elif tail.search(ln):
             return (start, i)
     return (start, len(source_lines)) if start is not None else None
+
+
+def count_method_definitions(source_lines: list, method_name: str) -> int:
+    """Number of `Процедура/Функция method_name(` headers in the module.
+
+    C2 warning (re-audit 260712): >1 means the name is duplicated and
+    find_method_range silently picks the first — the caller surfaces a warning.
+    """
+    if not method_name:
+        return 0
+    head = _method_head_re(method_name)
+    return sum(1 for ln in source_lines if head.search(ln))
 
 
 def _strip_bsl_strings(s: str) -> str:

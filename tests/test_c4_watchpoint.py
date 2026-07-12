@@ -159,7 +159,7 @@ async def test_record_only_continues(tmp_path):
 @pytest.mark.asyncio
 async def test_unchanged_not_recorded(tmp_path):
     c = _MockClient("1", tmp_path, mode="record_only")
-    c._watch_last["Ответ"] = "1"  # already seen == "1"
+    c._watch_last[("t1", "Ответ")] = "1"  # already seen == "1"
     await watchpoints.fire_watchpoint(c, "t1", _stack(), tmp_path)
     await watchpoints.drain_active()
     c.step.assert_awaited_once()  # Continue
@@ -169,7 +169,7 @@ async def test_unchanged_not_recorded(tmp_path):
 @pytest.mark.asyncio
 async def test_break_on_first_change_halts(tmp_path):
     c = _MockClient("2", tmp_path, mode="break_on_first_change")
-    c._watch_last["Ответ"] = "1"  # prior value → change to "2"
+    c._watch_last[("t1", "Ответ")] = "1"  # prior value → change to "2"
     await watchpoints.fire_watchpoint(c, "t1", _stack(), tmp_path)
     await watchpoints.drain_active()
     c.step.assert_not_awaited()  # left halted
@@ -181,7 +181,7 @@ async def test_break_on_first_change_halts(tmp_path):
 @pytest.mark.asyncio
 async def test_break_when_predicate(tmp_path):
     c = _MockClient("0", tmp_path, mode="break_when", predicate=("=", "0"))
-    c._watch_last["Ответ"] = "5"  # change 5 → 0, predicate "= 0" satisfied
+    c._watch_last[("t1", "Ответ")] = "5"  # change 5 → 0, predicate "= 0" satisfied
     await watchpoints.fire_watchpoint(c, "t1", _stack(), tmp_path)
     await watchpoints.drain_active()
     c.step.assert_not_awaited()  # halted on predicate match
@@ -191,7 +191,7 @@ async def test_break_when_predicate(tmp_path):
 @pytest.mark.asyncio
 async def test_break_when_predicate_unsatisfied_continues(tmp_path):
     c = _MockClient("3", tmp_path, mode="break_when", predicate=("=", "0"))
-    c._watch_last["Ответ"] = "5"  # change 5 → 3, predicate "= 0" NOT satisfied
+    c._watch_last[("t1", "Ответ")] = "5"  # change 5 → 3, predicate "= 0" NOT satisfied
     await watchpoints.fire_watchpoint(c, "t1", _stack(), tmp_path)
     await watchpoints.drain_active()
     c.step.assert_awaited_once()  # Continue — predicate not met

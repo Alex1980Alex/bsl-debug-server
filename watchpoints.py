@@ -217,11 +217,15 @@ async def _compare_and_decide(client, target_id, key, wp, log_dir) -> None:
         except Exception as exc:
             new_val = f"<eval-error: {type(exc).__name__}>"
 
+        # F-5 (re-audit 260712): key change-detection by (target_id, name), not
+        # `name` alone — parallel rphosts running the same code would otherwise
+        # interleave old/new across targets and mis-detect changes.
         last = getattr(client, "_watch_last", {})
-        old = last.get(name, _UNSEEN)
+        last_key = (target_id, name)
+        old = last.get(last_key, _UNSEEN)
         first = old is _UNSEEN
         changed = first or (_norm(new_val) != _norm(old))
-        last[name] = new_val
+        last[last_key] = new_val
         client._watch_last = last
 
         record = {
@@ -266,6 +270,23 @@ async def _compare_and_decide(client, target_id, key, wp, log_dir) -> None:
                 import time as _t
 
                 client._last_visible_stop_ts = _t.time()
+                # F-4 (re-audit 260712): the watch gate returned early in
+                # _handle_command, so this halt bypassed the metrics block. Record
+                # it into _stop_events / _watch_halt_count so debug_session_summary
+                # doesn't undercount watch-driven halts.
+                try:
+                    client._stop_events.append(
+                        {
+                            "ts": record["ts"],
+                            "target_id": target_id,
+                            "lineNo": key[2],
+                            "reason": "watchpoint",
+                        }
+                    )
+                    client._watch_halt_count = getattr(client, "_watch_halt_count", 0) + 1
+                    getattr(client, "_rphosts_seen", set()).add(target_id)
+                except Exception:
+                    log.debug("watchpoint metrics record failed", exc_info=True)
                 client._signal_bp_stop()
             except Exception:
                 log.debug("watchpoint halt-promote signalling failed", exc_info=True)

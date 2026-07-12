@@ -63,6 +63,24 @@ _PROP_FQN = {
     "d5963243-262e-4398-b4d7-fb16d06484f6": "",  # CommonModule whole-module
 }
 
+# C2 en-fqn (re-audit 260712): English metadata-class prefixes, so
+# find_by_fqn also resolves the EN form ("Document.X.ObjectModule",
+# "CommonModule.Y") — the RU-only reverse map used to return None for them.
+_KIND_FQN_EN = {
+    "document": "Document", "catalog": "Catalog",
+    "informationregister": "InformationRegister",
+    "accumulationregister": "AccumulationRegister",
+    "accountingregister": "AccountingRegister",
+    "calculationregister": "CalculationRegister",
+    "chartofcharacteristictypes": "ChartOfCharacteristicTypes",
+    "chartofaccounts": "ChartOfAccounts",
+    "chartofcalculationtypes": "ChartOfCalculationTypes",
+    "businessprocess": "BusinessProcess", "task": "Task",
+    "exchangeplan": "ExchangePlan", "enum": "Enum",
+    "report": "Report", "dataprocessor": "DataProcessor",
+    "commonmodule": "CommonModule", "subsystem": "Subsystem",
+}
+
 # Default location relative to repo root — override via env var or arg.
 DEFAULT_CONFIG_SRC = Path(
     r"C:\1С-Framework\ИБTransportManagementDevelop\Конфигурация\src"
@@ -407,27 +425,34 @@ def _reverse_fqn_entries(entries: dict) -> dict:
     """
     rev: dict = {}
     for uuid_l, rec in entries.items():
-        kind_ru = _KIND_FQN.get((rec.get("kind") or "").lower(), rec.get("kind", ""))
+        k = (rec.get("kind") or "").lower()
+        kind_ru = _KIND_FQN.get(k, rec.get("kind", ""))
+        kind_en = _KIND_FQN_EN.get(k, rec.get("kind", ""))
         child = rec.get("child_kind")
         if child == "forms":
-            fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Форма.{rec['name']}"
-            rev.setdefault(fqn.lower(), (uuid_l, "FormModule"))
+            parent = Path(rec["mdo"]).parent.name
+            # RU «Форма» + EN «Form» (re-audit 260712)
+            rev.setdefault(f"{kind_ru}.{parent}.Форма.{rec['name']}".lower(), (uuid_l, "FormModule"))
+            rev.setdefault(f"{kind_en}.{parent}.Form.{rec['name']}".lower(), (uuid_l, "FormModule"))
         elif child == "commands":
-            fqn = f"{kind_ru}.{Path(rec['mdo']).parent.name}.Команда.{rec['name']}"
-            rev.setdefault(fqn.lower(), (uuid_l, "CommandModule"))
+            parent = Path(rec["mdo"]).parent.name
+            rev.setdefault(f"{kind_ru}.{parent}.Команда.{rec['name']}".lower(), (uuid_l, "CommandModule"))
+            rev.setdefault(f"{kind_en}.{parent}.Command.{rec['name']}".lower(), (uuid_l, "CommandModule"))
         else:
-            k = (rec.get("kind") or "").lower()
             if k == "commonmodule":
-                combos = [("CommonModule", "")]
+                # (module_type, RU-suffix, EN-suffix)
+                combos = [("CommonModule", "", "")]
             else:
                 combos = [
-                    ("ObjectModule", "МодульОбъекта"),
-                    ("ManagerModule", "МодульМенеджера"),
-                    ("RecordSetModule", "МодульНабораЗаписей"),
+                    ("ObjectModule", "МодульОбъекта", "ObjectModule"),
+                    ("ManagerModule", "МодульМенеджера", "ManagerModule"),
+                    ("RecordSetModule", "МодульНабораЗаписей", "RecordSetModule"),
                 ]
-            for module_type, suffix in combos:
-                fqn = f"{kind_ru}.{rec['name']}" + (f".{suffix}" if suffix else "")
-                rev.setdefault(fqn.lower(), (uuid_l, module_type))
+            for module_type, ru_suffix, en_suffix in combos:
+                ru_fqn = f"{kind_ru}.{rec['name']}" + (f".{ru_suffix}" if ru_suffix else "")
+                en_fqn = f"{kind_en}.{rec['name']}" + (f".{en_suffix}" if en_suffix else "")
+                rev.setdefault(ru_fqn.lower(), (uuid_l, module_type))
+                rev.setdefault(en_fqn.lower(), (uuid_l, module_type))
     return rev
 
 
