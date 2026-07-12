@@ -147,6 +147,8 @@ async def _eval_log_continue(client, target_id, key, template, log_dir):
         entry = {
             "ts": datetime.now().isoformat(),
             "target_id": target_id,
+            # A6.3 roadmap 260708 §8.6: correlation id groups the artifact trail.
+            "correlation_id": getattr(client, "_correlation_id", None),
             "object_id": key[0], "property_id": key[1], "line": key[2],
             "template": template,
             "rendered": _render(template, evaluated),

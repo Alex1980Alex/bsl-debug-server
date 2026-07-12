@@ -8,6 +8,7 @@ Export: SonarQube genericCoverage.xml (https://docs.sonarsource.com/sonarqube-se
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -94,3 +95,39 @@ def export_generic_coverage_xml(client, output_path: str) -> dict:
 
 def _fallback_path(object_id, property_id):
     return f"<unknown>/{object_id[:8]}_{property_id[:8]}.bsl"
+
+
+def export_counts_sidecar(client, sidecar_path: str, top_n: int = 20) -> dict:
+    """C6.1 roadmap 260708 §8.5: export precise hit COUNTS alongside the XML.
+
+    SonarQube genericCoverage.xml has no per-line count field (covered=true/false
+    only), so precise counts go to a JSON sidecar `<session>.counts.json`
+    `[{file, line, count}]` and `hot_lines` (top-N by count) is returned for the
+    tool response. The collector already exists (`_coverage_tracked[key]["hits"]`).
+
+    Returns {path, lines_total, hot_lines}. Never raises for a write failure —
+    the sidecar is best-effort next to the (already-written) XML.
+    """
+    tracked = getattr(client, "_coverage_tracked", {}) or {}
+    rows = []
+    for (oid, pid, line), state in tracked.items():
+        fp = state.get("file_path") or _fallback_path(oid, pid)
+        rows.append({"file": fp, "line": int(line), "count": int(state.get("hits", 0))})
+    rows.sort(key=lambda r: (r["file"], r["line"]))
+    hot = sorted(rows, key=lambda r: r["count"], reverse=True)[: max(0, top_n)]
+    hot_lines = [r for r in hot if r["count"] > 0]
+    out = Path(sidecar_path)
+    payload = {
+        "correlation_id": getattr(client, "_correlation_id", None),
+        "session_id": getattr(client, "session_id", None),
+        "lines": rows,
+    }
+    written = ""
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        written = str(out)
+    except OSError as e:
+        log.warning("[C6.1] counts sidecar write failed (%s): %s", out, e)
+    return {"path": written, "lines_total": len(rows), "hot_lines": hot_lines}

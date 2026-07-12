@@ -37,6 +37,8 @@ import exception_bps  # P3.B roadmap 260511
 import snapshot  # P2.A roadmap 260511
 import autonomy  # A0/A1 roadmap 260708
 import held_job  # B1 roadmap 260708 / ADR-049
+import watchpoints  # C4 roadmap 260708 §8.4
+import diff_runs  # A4 roadmap 260708 §8.7
 
 logging.basicConfig(
     level=logging.INFO,
@@ -405,6 +407,20 @@ class RDBGClient:
         # is holding its rphost alive; debug_step("Continue") releases it.
         self._held_job: Optional[dict] = None  # {key, timeout_sec, launched}
         self._held_job_seq: int = 0
+        # C4 (roadmap 260708 §8.4): active watchpoints — (oid,pid,line) -> spec
+        # {name, mode, predicate, run_id, fires, max_fires}. Empty by default →
+        # the _handle_command watch-gate is a no-op (zero behaviour change).
+        self._watchpoints: dict[tuple, dict] = {}
+        self._watch_last: dict = {}  # name -> last observed value (change detection)
+        self._watch_changes: list = []  # in-memory change records (mirror of JSONL)
+        self._watch_run: Optional[dict] = None  # {keys, name, run_id, armed_log_lines}
+        # A6 (roadmap 260708 §8.6): correlation id threaded through every artifact
+        # (logpoint/watch JSONL, snapshot, coverage, summary). Default set at connect.
+        self._correlation_id: Optional[str] = None
+        # C6.2 (roadmap 260708 §8.5): opt-in variable capture on snapshot record.
+        self._capture_variables: bool = False
+        self._snapshot_seq: int = 0  # A4.1 monotonic stop ordinal per session
+        self._record_label: Optional[str] = None  # A4.1 run label ("ok"/"fail")
 
     def _get_stop_event(self) -> asyncio.Event:
         """B3: session asyncio.Event for user-visible BP stops, bound to the
@@ -1037,6 +1053,17 @@ class RDBGClient:
             # Clear break_on_next flag: user got the stop they armed
             if self._break_on_next_armed:
                 self._break_on_next_armed = False
+            # C4 roadmap 260708 §8.4: watchpoint — deferred compare/record. Empty
+            # `_watchpoints` by default → no-op. On a watch line the stop is
+            # suppressed (like a logpoint); the deferred task decides Continue vs
+            # promote-to-visible (break_on_first_change / break_when).
+            watch_fired = False
+            if stop_by_bp and stack and self._watchpoints:
+                watch_fired = await watchpoints.fire_watchpoint(
+                    self, target_id, stack, self._log_dir
+                )
+            if watch_fired:
+                return
             # P1.A roadmap 260511: coverage hit (silent counter, auto-Continue)
             coverage_hit = False
             if stop_by_bp and stack and self._coverage_tracked:
@@ -1107,9 +1134,10 @@ class RDBGClient:
                     # (debug_autotrace collect) — user-visible BP stop only.
                     self._signal_bp_stop()
             # P2.A roadmap 260511: replay snapshot recording (after metrics gate so
-            # only user-visible stops are recorded)
+            # only user-visible stops are recorded). C6.2: deferred variable capture
+            # when enabled.
             if not stop_suppressed:
-                snapshot.record(
+                _schedule_snapshot(
                     self, target_id, self._stop_reason_by_target.get(target_id, "bp"), stack
                 )
 
@@ -1151,7 +1179,8 @@ class RDBGClient:
                 if suppressed:
                     return
             # P2.A roadmap 260511: replay snapshot for user-visible exception
-            snapshot.record(
+            # (C6.2: deferred variable capture when enabled).
+            _schedule_snapshot(
                 self, target_id, "exception", stack, exc if isinstance(exc, dict) else None
             )
             # Review 260710: only treat as user-visible / seed if the target is
@@ -2149,6 +2178,9 @@ def _get_client() -> RDBGClient:
                     else:
                         restored[(str(k), "")] = int(v)  # legacy flat key
                 _client._line_offsets = restored
+            # A6.3: restore correlation id across HMR restart.
+            if state.get("correlation_id"):
+                _client._correlation_id = state["correlation_id"]
             try:
                 # FastMCP tool handlers run inside an active event loop, so
                 # asyncio.get_running_loop() succeeds here. RuntimeError only
@@ -2326,6 +2358,42 @@ def _clear_logpoint_keys(client: "RDBGClient", keys) -> int:
     return removed
 
 
+# C6.2 (roadmap 260708 §8.5): in-flight snapshot-with-variables tasks (strong refs,
+# like logpoints._active_tasks — asyncio keeps only weak refs to create_task results).
+_snapshot_tasks: set = set()
+
+
+async def _snapshot_with_vars(client, target_id: str, reason: str, stack: list, exc: dict | None):
+    """C6.2: eval bounded top-K locals off the stopped frame, then record the
+    snapshot WITH variables. Runs in its own task — eval_expression awaits an
+    `exprEvaluated` event delivered by the ping_loop, which can't run while we are
+    inside _handle_command. Best-effort: degrades to variables=None on any error."""
+    variables: Optional[dict] = None
+    try:
+        locals_list = await client.eval_locals_auto(target_uuid=target_id, stack_level=0)
+        variables = {}
+        for item in (locals_list or [])[:12]:  # bounded (halt window 1-2s)
+            if isinstance(item, dict) and item.get("name"):
+                variables[item["name"]] = autonomy._extract_eval_value(item)
+    except Exception as e:
+        log.debug("[C6.2] snapshot variable capture failed: %s", e)
+    snapshot.record(client, target_id, reason, stack, exc, variables=variables)
+
+
+def _schedule_snapshot(client, target_id: str, reason: str, stack: list, exc: dict | None = None):
+    """Record a stop snapshot — deferred WITH variables when capture is on (C6.2),
+    otherwise synchronous (unchanged P2.A behaviour). `snapshot.record` gates on
+    `_recording_enabled` itself, so a no-recording session is a no-op either way."""
+    if not getattr(client, "_recording_enabled", False):
+        return
+    if getattr(client, "_capture_variables", False):
+        task = asyncio.create_task(_snapshot_with_vars(client, target_id, reason, stack, exc))
+        _snapshot_tasks.add(task)
+        task.add_done_callback(_snapshot_tasks.discard)
+    else:
+        snapshot.record(client, target_id, reason, stack, exc)
+
+
 def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
     """Clean, concise message from an exception, stripping RDBG's verbose XML.
 
@@ -2357,6 +2425,69 @@ def _error_json(message: str, error_type: str = "error", **extra) -> str:
     return json.dumps(
         {"error": message, "error_type": error_type, **extra}, ensure_ascii=False, indent=2
     )
+
+
+# ---------------------------------------------------------------------------
+# A6 roadmap 260708 §8.6: InspectWare session-state + valid-next tool hints
+# ---------------------------------------------------------------------------
+
+# Which tools are meaningful in each session state — so an agent on an ephemeral
+# target sees `valid_next` instead of poking a command that 400s (e.g. `evaluate`
+# on a non-stopped target). Advisory, not enforced.
+_VALID_NEXT = {
+    "Start": [
+        "debug_set_breakpoint", "debug_set_function_breakpoint", "debug_set_logpoint",
+        "debug_set_watchpoint", "debug_hypothesis", "debug_autotrace", "debug_trace_variable",
+        "debug_capture_mode", "debug_launch_held_job", "debug_session_record", "debug_step",
+        "debug_ping", "debug_targets", "debug_disconnect",
+    ],
+    "Runtime-State": [
+        "debug_inspect_frame", "debug_variables", "debug_evaluate", "debug_stack_trace",
+        "debug_collection_info", "debug_collection_page", "debug_set_variable",
+        "debug_watchpoint_result", "debug_step", "debug_ping",
+    ],
+    "Runtime-Error": [
+        "debug_root_cause", "debug_inspect_frame", "debug_variables", "debug_evaluate",
+        "debug_stack_trace", "debug_set_variable", "debug_step", "debug_ping",
+    ],
+    "Post-Mortem": [
+        "debug_replay_list", "debug_replay_seek", "debug_session_summary", "debug_session_diff",
+        "debug_diff_runs", "debug_coverage_export", "debug_connect",
+    ],
+    "Done": ["debug_connect", "debug_health_check"],
+}
+
+
+def _session_state(client) -> str:
+    """A6.1: compute the InspectWare-style session state from wrapper state.
+
+    Start (connected, none stopped) / Runtime-State (a user-visible stop) /
+    Runtime-Error (a stopped target whose reason is an exception) / Post-Mortem
+    (recording on, no attached targets left) / Done (not attached).
+    """
+    if not getattr(client, "_attached", False):
+        return "Done"
+    stopped = getattr(client, "_user_visible_stops", set()) or set()
+    if stopped:
+        reasons = getattr(client, "_stop_reason_by_target", {})
+        if any(reasons.get(t) == "exception" for t in stopped):
+            return "Runtime-Error"
+        return "Runtime-State"
+    if getattr(client, "_recording_enabled", False) and not (
+        getattr(client, "_known_attached_targets", set()) or set()
+    ):
+        return "Post-Mortem"
+    return "Start"
+
+
+def _state_hint(client) -> dict:
+    """A6.2: `{session_state, valid_next, correlation_id}` for key tool responses."""
+    state = _session_state(client)
+    return {
+        "session_state": state,
+        "valid_next": _VALID_NEXT.get(state, []),
+        "correlation_id": getattr(client, "_correlation_id", None),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3097,6 +3228,7 @@ async def debug_connect(
     infobase_alias: str = "TestDB",
     force_recycle_rphost: bool = False,
     recycle_strategy: str = "auto",
+    correlation_id: str = "",
 ) -> str:
     """Connect to 1C debug agent and attach as debug client.
 
@@ -3180,6 +3312,9 @@ async def debug_connect(
     pre_existing_rphosts = detect_pre_existing_rphosts()
 
     _client = RDBGClient(debug_url, infobase_alias)
+    # A6.3 roadmap 260708 §8.6: correlation id (CloudEvents-compatible) threaded
+    # through every artifact of this debug session. Default = fresh uuid4.
+    _client._correlation_id = correlation_id or uuid.uuid4().hex
     try:
         version = await _client.get_api_version()
         existing_id = await _client.get_debug_id()
@@ -3331,6 +3466,7 @@ async def debug_connect(
                 "Got 'ibInDebug' — another debugger (EDT?) is active. "
                 "Stop EDT debugging for full access."
             )
+        result["state_hint"] = _state_hint(_client)  # A6.2
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         log.exception("Connect failed")
@@ -3432,6 +3568,10 @@ def _persist_active_session(client: "RDBGClient") -> None:
             (f"{k[0]}|{k[1]}" if isinstance(k, tuple) else str(k)): int(v)
             for k, v in (getattr(client, "_line_offsets", {}) or {}).items()
         },
+        # A6.3 roadmap 260708 §8.6: correlation id survives HMR restart so the
+        # artifact trail (logpoint/watch JSONL, snapshot, coverage, summary) stays
+        # groupable by one id across the whole task.
+        "correlation_id": getattr(client, "_correlation_id", None),
     }
     try:
         os.makedirs(os.path.dirname(_ACTIVE_SESSION_PATH) or ".", exist_ok=True)
@@ -3558,6 +3698,77 @@ async def debug_session_diff(prev_session_id: str, curr_session_id: Optional[str
 
 
 @mcp.tool()
+async def debug_diff_runs(
+    ok_session_id: str,
+    fail_session_id: str,
+    watch: Optional[list] = None,
+    ignore_names: Optional[list] = None,
+    max_stops: int = 200,
+) -> str:
+    """A4 (roadmap 260708 §8.7): differential debugging — STATE-level diff of two
+    recorded runs ("работало вчера — сегодня нет" → первая точка расхождения).
+
+    Record both runs first with `debug_session_record(capture_variables=True,
+    label=...)` — one against the passing scenario, one against the failing one —
+    then pass their session IDs. The tool aligns stops by
+    `(module_fqn, line, hit_index)` and returns the FIRST divergence:
+    - `flow` — the stop sequences differ (a branch taken in one run, not the other);
+    - `state` — the flow matches but a `watch` variable's value differs.
+
+    Two-infobase runs = two session IDs (record each against its own alias); the
+    live "arm+trigger ×2 inside the tool" path is a SKILL recipe, not coded here
+    (roadmap A4.5). `watch` lists variable names to state-compare (needs
+    capture_variables); `ignore_names` filters noisy names (dates/GUIDs).
+
+    Returns `{verdict:{first_divergence}, raw:{aligned, diffs, ok_stops, fail_stops}}`.
+    """
+    try:
+        watch = watch or []
+        ignore_names = ignore_names or []
+        ok_entries = snapshot.read_entries(ok_session_id)
+        fail_entries = snapshot.read_entries(fail_session_id)
+        if not ok_entries:
+            return _error_json(
+                f"no snapshots for ok_session_id '{ok_session_id}' — record with "
+                "debug_session_record(capture_variables=True, label='ok') first",
+                "no_ok_snapshots",
+            )
+        if not fail_entries:
+            return _error_json(
+                f"no snapshots for fail_session_id '{fail_session_id}' — record with "
+                "debug_session_record(capture_variables=True, label='fail') first",
+                "no_fail_snapshots",
+            )
+        ok_seq = diff_runs.build_sequence(ok_entries)
+        fail_seq = diff_runs.build_sequence(fail_entries)
+        aligned = diff_runs.align(ok_seq, fail_seq)
+        first = diff_runs.first_divergence(ok_seq, fail_seq, watch, ignore_names)
+        diffs = diff_runs.state_diffs(aligned, watch, ignore_names, max_stops)
+        return json.dumps(
+            {
+                "verdict": {
+                    "first_divergence": first,
+                    "diverged": first is not None,
+                    "kind": first.get("kind") if first else None,
+                },
+                "raw": {
+                    "ok_stops": len(ok_seq),
+                    "fail_stops": len(fail_seq),
+                    "watch": watch,
+                    "aligned": len(aligned),
+                    "aligned_bounded": len(aligned) > max_stops,
+                    "diffs": diffs,
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_diff_runs failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__)
+
+
+@mcp.tool()
 async def debug_session_summary(format: str = "json") -> str:
     """Roadmap §12.3 Level 3 — post-mortem session metrics.
 
@@ -3582,6 +3793,7 @@ async def debug_session_summary(format: str = "json") -> str:
     cache_lines_total = sum(len(e.get("lines", [])) for e in _client._set_breakpoints_cache)
     summary = {
         "session_id": _client.session_id,
+        "correlation_id": getattr(_client, "_correlation_id", None),  # A6.3
         "started_at": _client._session_started_at,
         "infobase_alias": _client.infobase_alias,
         "attached": _client._attached,
@@ -3738,6 +3950,7 @@ async def debug_targets() -> str:
             "targets": targets,
             "count": len(targets),
             "stopped_target": stopped,
+            "state_hint": _state_hint(client),  # A6.2
         },
         ensure_ascii=False,
         indent=2,
@@ -3764,6 +3977,7 @@ async def debug_ping() -> str:
     result = {"events": events, "count": len(events)}
     if client._consecutive_empty_pings >= 3:
         result["no_fire_diagnostics"] = _build_no_fire_diagnostics(client)
+    result["state_hint"] = _state_hint(client)  # A6.2
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -5194,6 +5408,203 @@ async def debug_hypothesis(assertions: Optional[list] = None, phase: str = "arm"
 
 
 @mcp.tool()
+async def debug_set_watchpoint(
+    name: str,
+    object_id: str,
+    module_type: str = "CommonModule",
+    property_id: str = "",
+    method: str = "",
+    mode: str = "record_only",
+    break_when: str = "",
+    max_fires: int = watchpoints.DEFAULT_MAX_FIRES,
+) -> str:
+    """C4 (roadmap 260708 §8.4): data breakpoint / watchpoint (RDBG has no native).
+
+    Arms a wrapper-side BP on every `name = ...` assignment line in scope; on each
+    fire a deferred task evaluates `name`, compares to the previous value and:
+      - `record_only` — records the change + auto-Continues (timeline only);
+      - `break_on_first_change` — leaves the target halted on the FIRST change;
+      - `break_when` — leaves it halted on a change whose new value satisfies
+        `break_when` (e.g. "= 0", "<> Истина", "< 0").
+
+    Two-step (like A3/A5): arm here, trigger your code, then
+    `debug_watchpoint_result()` for the change timeline (+ teardown).
+
+    SECURITY: `name` is evaluated as BSL in the running rphost. Hot-loop guard:
+    `max_fires` per line (default 200) — the watch stops recording (but keeps
+    auto-Continuing) past the cap, surfaced as `capped`.
+    """
+    try:
+        client = _get_client()
+        if not (client._attached and client._registered):
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        if mode not in watchpoints._VALID_MODES:
+            return _error_json(
+                f"invalid mode '{mode}'", "bad_mode", allowed=list(watchpoints._VALID_MODES)
+            )
+        predicate = None
+        if mode == "break_when":
+            predicate = watchpoints.parse_break_when(break_when)
+            if predicate is None:
+                return _error_json(
+                    "break_when mode requires a predicate like '= 0' / '<> Истина'",
+                    "bad_break_when",
+                )
+        if not name or not object_id:
+            return _error_json("name and object_id are required", "bad_args")
+
+        # Clear any prior watch run (parity with A3 arm — no lingering watch BPs).
+        prior = getattr(client, "_watch_run", None)
+        if prior:
+            try:
+                _clear_logpoint_keys(client, prior["keys"])  # shares BP-cache teardown
+                for k in prior["keys"]:
+                    client._watchpoints.pop(k, None)
+                await client._push_bp_workspace()
+            except Exception:
+                log.warning("watchpoint arm: prior-run cleanup failed", exc_info=True)
+            client._watch_run = None
+
+        xml_mt, pid = _resolve_property_id(module_type, property_id)
+        src_path = uuid_index.resolve_uuid(object_id, pid)
+        if not src_path or not Path(src_path).exists():
+            return _error_json(
+                "source not resolvable for object_id/property_id", "no_source", object_id=object_id
+            )
+        source_lines = Path(src_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        line_range = autonomy.find_method_range(source_lines, method) if method else None
+        if method and line_range is None:
+            return _error_json(f"method '{method}' not found in source", "method_not_found")
+        assigns = watchpoints.plan_watchpoints(
+            source_lines, name, autonomy.find_assignment_lines, line_range
+        )
+        if not assigns:
+            return json.dumps(
+                {
+                    "status": "no_assignments",
+                    "name": name,
+                    "method": method or None,
+                    "hint": "no `name = ...` assignments found in scope",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        run_id = f"wp-{uuid.uuid4().hex[:8]}"
+        client._watch_last = {}  # fresh change-detection baseline per arm
+        keys: set = set()
+        lines_info: list = []
+        lines_by_mod: list = []
+        for a in assigns:
+            adj_line, applied_offset = _apply_line_offset(
+                client, object_id, a["line"], property_id=pid
+            )
+            key = (object_id, pid, adj_line)
+            keys.add(key)
+            client._watchpoints[key] = {
+                "name": name,
+                "mode": mode,
+                "predicate": predicate,
+                "run_id": run_id,
+                "fires": 0,
+                "max_fires": max(1, int(max_fires)),
+            }
+            lines_by_mod.append(adj_line)
+            lines_info.append(
+                {"src_line": a["line"], "line": adj_line, "applied_offset": applied_offset, "text": a["text"]}
+            )
+        await client.set_breakpoints(
+            module_type=xml_mt, object_id=object_id, property_id=pid, lines=lines_by_mod
+        )
+
+        # Count watch-JSONL lines predating arm so result reads only this run.
+        watch_path = client._log_dir / f"{getattr(client, 'session_id', 'unknown')}.watch.jsonl"
+        armed_log_lines = 0
+        if watch_path.exists():
+            try:
+                armed_log_lines = sum(1 for _ in open(watch_path, encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+        client._watch_run = {
+            "keys": keys,
+            "name": name,
+            "run_id": run_id,
+            "armed_log_lines": armed_log_lines,
+        }
+        # Capture-mode so short-lived JOB rphosts are BP-receptive (roadmap C4.2).
+        await client.set_break_on_next_statement(silent=True)
+        return json.dumps(
+            {
+                "status": "armed",
+                "name": name,
+                "mode": mode,
+                "run_id": run_id,
+                "lines": lines_info,
+                "next": "trigger the code, then debug_watchpoint_result()",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_set_watchpoint failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__)
+
+
+@mcp.tool()
+async def debug_watchpoint_result(clear: bool = True) -> str:
+    """C4 (roadmap 260708 §8.4): change timeline for the active watchpoint run.
+
+    Returns `[{line, old, new, changed, ts}]` (only CHANGE events are recorded),
+    the halt record if a break-mode fired, plus `capped`. `clear=True` (default)
+    tears down the watch BPs so they don't linger on later runs.
+    """
+    try:
+        client = _get_client()
+        if not client._attached:
+            return _error_json("Not connected. Call debug_connect first.", "not_connected")
+        run = getattr(client, "_watch_run", None)
+        if not run:
+            return _error_json("no active watchpoint — call debug_set_watchpoint first", "no_watch")
+        pending = await watchpoints.drain_active(timeout=2.0)
+        session_id = getattr(client, "session_id", "unknown")
+        timeline = watchpoints.read_timeline(
+            client._log_dir, session_id, run["run_id"], run["keys"], run["armed_log_lines"]
+        )
+        capped = any(
+            client._watchpoints.get(k, {}).get("capped") for k in run["keys"]
+        )
+        halted = next(
+            (client._watchpoints[k].get("halted_at") for k in run["keys"]
+             if k in client._watchpoints and client._watchpoints[k].get("halted_at")),
+            None,
+        )
+        if clear:
+            try:
+                _clear_logpoint_keys(client, run["keys"])
+                for k in run["keys"]:
+                    client._watchpoints.pop(k, None)
+                await client._push_bp_workspace()
+            except Exception:
+                log.warning("watchpoint result: teardown failed", exc_info=True)
+            client._watch_run = None
+        return json.dumps(
+            {
+                "name": run["name"],
+                "changes": len(timeline),
+                "pending_evals": pending,
+                "capped": capped,
+                "halted_at": halted,
+                "timeline": timeline,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as e:
+        log.exception("debug_watchpoint_result failed")
+        return _error_json(_rdbg_error_text(e), type(e).__name__)
+
+
+@mcp.tool()
 async def debug_set_logpoint(
     object_id: str,
     line: int,
@@ -5271,6 +5682,7 @@ async def debug_step(action: str = "Continue", target_id: str = "") -> str:
     out = {"action": action, "target_id": target_id, "result": result}
     if released is not None:
         out["held_job_released"] = released
+    out["state_hint"] = _state_hint(client)  # A6.2
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 
@@ -5656,6 +6068,12 @@ async def debug_coverage_export(output_path: str = "") -> str:
         sess = getattr(client, "session_id", None) or "unknown"
         output_path = str(out_dir / f"{sess}.xml")
     result = bsl_coverage.export_generic_coverage_xml(client, output_path)
+    # C6.1 roadmap 260708 §8.5: precise counts sidecar (XML has no count field) +
+    # hot_lines top-N. Written next to the XML as <base>.counts.json.
+    sidecar_path = str(Path(output_path).with_suffix(".counts.json"))
+    counts = bsl_coverage.export_counts_sidecar(client, sidecar_path)
+    result["counts_path"] = counts["path"]
+    result["hot_lines"] = counts["hot_lines"]
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -5861,27 +6279,41 @@ async def debug_calibrate_result(
 
 
 @mcp.tool()
-async def debug_session_record(enable: bool = True) -> str:
-    """P2.A roadmap 260511: toggle session snapshot recording.
+async def debug_session_record(
+    enable: bool = True, capture_variables: bool = False, label: str = ""
+) -> str:
+    """P2.A roadmap 260511 + C6.2/A4.1 roadmap 260708: toggle snapshot recording.
 
     When enabled, every user-visible stop event (BP fire / exception not filtered)
-    appends snapshot entry to `data/debug_replays/<session>.jsonl`. Entry shape:
-    `{ts, iso, session_id, target_id, reason, stack, exception?}`.
+    appends a snapshot entry to `data/debug_replays/<session>.jsonl`. Entry shape:
+    `{ts, iso, session_id, correlation_id, label, stop_seq, target_id, reason,
+    stack, exception?, variables?}`.
 
     NOT true time-travel — snapshots are read-only post-mortem inspection. Use
-    `debug_replay_seek(index)` / `debug_replay_list()` для retrieval.
+    `debug_replay_seek(index | query)` / `debug_replay_list()` для retrieval.
 
     Args:
         enable: True (default) — start recording. False — stop recording.
+        capture_variables: C6.2 — also capture bounded top-K locals per stop
+            (deferred eval; needed for `debug_replay_seek(query=...)` on variables
+            and `debug_diff_runs` state-level diff). Costs an eval per stop.
+        label: A4.1 — tag stops of this run (e.g. "ok"/"fail") for differential
+            debugging (`debug_diff_runs`).
     """
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     client._recording_enabled = bool(enable)
+    client._capture_variables = bool(capture_variables)
+    client._record_label = label or None
+    if enable:
+        client._snapshot_seq = 0  # fresh ordinal per record session
     return json.dumps(
         {
             "status": "recording_enabled" if enable else "recording_disabled",
             "recording_enabled": client._recording_enabled,
+            "capture_variables": client._capture_variables,
+            "label": client._record_label,
             "session_id": getattr(client, "session_id", None),
         },
         ensure_ascii=False,
@@ -5912,16 +6344,39 @@ async def debug_replay_list() -> str:
 
 
 @mcp.tool()
-async def debug_replay_seek(index: int) -> str:
-    """P2.A roadmap 260511: retrieve full snapshot at given index.
+async def debug_replay_seek(index: int = -1, query: str = "") -> str:
+    """P2.A roadmap 260511 + C6.3 roadmap 260708 §8.5: retrieve a snapshot.
 
-    Returns full entry: `{ts, iso, session_id, target_id, reason, stack, exception?}`
-    or `{error: "out of range"}`.
+    Two addressing modes (argument overload):
+    - numeric `index` (default when no query): the Nth recorded snapshot;
+    - semantic `query` (C6.3): the FIRST snapshot whose state satisfies a
+      predicate `<name> <op> <literal>`, e.g. `"Итог < 0"`, `"reason = exception"`,
+      `"КлючУдержания = hold-c1b"`. `name` may be a captured local (needs
+      `debug_session_record(capture_variables=True)`) or a special field
+      (`line`/`reason`/`module`/`fqn`). Ops: `= <> < > <= >=`.
+
+    Returns the full entry (+ `index`) or `{error}`.
     """
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     sess = getattr(client, "session_id", None)
+    if query:
+        if snapshot.parse_seek_query(query) is None:
+            return _error_json(
+                f"unparseable seek query '{query}' — expected '<name> <op> <literal>'",
+                "bad_query",
+            )
+        entry = snapshot.seek_by_query(sess, query) if sess else None
+        if entry is None:
+            return json.dumps(
+                {"error": "no snapshot matched query", "query": query, "session_id": sess},
+                ensure_ascii=False,
+                indent=2,
+            )
+        return json.dumps(entry, ensure_ascii=False, indent=2)
+    if index < 0:
+        return _error_json("provide a non-negative index or a query", "bad_args", index=index)
     entry = snapshot.seek_snapshot(sess, index) if sess else None
     if entry is None:
         return json.dumps(
@@ -5929,6 +6384,8 @@ async def debug_replay_seek(index: int) -> str:
             ensure_ascii=False,
             indent=2,
         )
+    entry = dict(entry)
+    entry["index"] = index
     return json.dumps(entry, ensure_ascii=False, indent=2)
 
 
@@ -6257,7 +6714,9 @@ async def debug_target_state(target_id: str = "") -> str:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
     state = await client.get_target_state(target_uuid=target_id or None)
     return json.dumps(
-        {"target_id": target_id or None, "state": state}, ensure_ascii=False, indent=2
+        {"target_id": target_id or None, "state": state, "state_hint": _state_hint(client)},
+        ensure_ascii=False,
+        indent=2,
     )
 
 
