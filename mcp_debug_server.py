@@ -1097,7 +1097,11 @@ class RDBGClient:
             # §12.3 Level 3 — track stop event для session_summary
             from datetime import datetime as _dt
 
-            top = stack[0] if stack else {}
+            # Ф-2 (re-audit 260712, LOW §4): RDBG callStack is OUTERMOST-first — the
+            # stop/BP frame is the LAST element. Metrics keyed off stack[0] recorded
+            # the entry-point line, so session_summary «врал» про строку BP на
+            # многофреймовых стеках. Innermost = stack[-1].
+            top = stack[-1] if stack else {}
             line_no = top.get("lineNo", "?") if isinstance(top, dict) else "?"
             obj_id_top = ""
             if isinstance(top, dict):
@@ -1665,8 +1669,10 @@ class RDBGClient:
             fut: asyncio.Future = loop.create_future()
             self._pending_evals[result_id] = fut
             result_ids.append((name, result_id, fut))
+            # Re-audit 260712 (LOW §4): escape — легитимный BSL с `<`/`&`
+            # (`?(А<Б,…)`) ломал XML-запрос; parity с condition/modify_value.
             src_calc_info = _calc("expressionResultID", result_id) + _calc(
-                "calcItem", _calc("itemType", "expression") + _calc("expression", name)
+                "calcItem", _calc("itemType", "expression") + _calc("expression", _escape_xml(name))
             )
             expr_blocks.append(
                 _rdbg(
@@ -1809,8 +1815,9 @@ class RDBGClient:
         loop = asyncio.get_event_loop()
         pending_fut: asyncio.Future = loop.create_future()
         self._pending_evals[expr_result_id] = pending_fut
+        # Re-audit 260712 (LOW §4): escape — `<`/`&` в BSL ломали XML (parity с condition).
         src_calc_info = _calc("expressionResultID", expr_result_id) + _calc(
-            "calcItem", _calc("itemType", "expression") + _calc("expression", expression)
+            "calcItem", _calc("itemType", "expression") + _calc("expression", _escape_xml(expression))
         )
         pres_options_xml = _calc("maxTextSize", str(max_text_size))
         if view_interface:
@@ -2392,6 +2399,17 @@ def _schedule_snapshot(client, target_id: str, reason: str, stack: list, exc: di
         task.add_done_callback(_snapshot_tasks.discard)
     else:
         snapshot.record(client, target_id, reason, stack, exc)
+
+
+async def _drain_snapshot_tasks(timeout: float = 2.0) -> int:
+    """M-4-класс (re-audit 260712 F-2): await in-flight deferred snapshot writes so
+    replay/diff readers see the tail (the last stop's variables-eval + JSONL write
+    may still be pending). Mirror of logpoints/watchpoints drain_active. Returns
+    how many are STILL pending after the bounded wait."""
+    pending = [t for t in list(_snapshot_tasks) if not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
+    return sum(1 for t in pending if not t.done())
 
 
 def _rdbg_error_text(exc: Exception, limit: int = 400) -> str:
@@ -3725,6 +3743,9 @@ async def debug_diff_runs(
     try:
         watch = watch or []
         ignore_names = ignore_names or []
+        # F-2 (re-audit 260712): the last stop's deferred variables-snapshot may
+        # still be writing — drain before reading either session's entries.
+        await _drain_snapshot_tasks()
         ok_entries = snapshot.read_entries(ok_session_id)
         fail_entries = snapshot.read_entries(fail_session_id)
         if not ok_entries:
@@ -5261,6 +5282,18 @@ async def debug_hypothesis(assertions: Optional[list] = None, phase: str = "arm"
             resolved = []
             by_key = {}
             keys = set()
+            skipped = []
+
+            # M-5-класс (re-audit 260712): не со-optить строки, уже занятые ЧУЖИМ
+            # logpoint'ом (A3-trace/user) или BP — _record_logpoint = last-writer-wins,
+            # а наш teardown (_clear_logpoint_keys) снял бы чужой ключ целиком.
+            # Паттерн A3 arm: пропустить коллизию + surfaced skipped_collisions.
+            existing_lp = set(getattr(client, "_logpoints", {}).keys())
+            existing_bp = {
+                (ce.get("object_id"), ce.get("property_id"), L)
+                for ce in getattr(client, "_set_breakpoints_cache", [])
+                for L in ce.get("lines", [])
+            }
 
             for i, a in enumerate(assertions):
                 object_id = a.get("object_id")
@@ -5276,6 +5309,9 @@ async def debug_hypothesis(assertions: Optional[list] = None, phase: str = "arm"
                 xml_mt, pid = _resolve_property_id(a.get("module_type", "CommonModule"), a.get("property_id", ""))
                 adj_line, applied_offset = _apply_line_offset(client, object_id, line, property_id=pid)
                 key = (object_id, pid, adj_line)
+                if key not in by_key and (key in existing_lp or key in existing_bp):
+                    skipped.append({"index": i, "line": adj_line, "reason": "user_bp_or_logpoint"})
+                    continue
 
                 g = by_key.setdefault(
                     key,
@@ -5294,6 +5330,17 @@ async def debug_hypothesis(assertions: Optional[list] = None, phase: str = "arm"
                         "line": adj_line,
                         "applied_offset": applied_offset,
                     }
+                )
+
+            if not by_key:
+                return json.dumps(
+                    {
+                        "status": "no_armable_assertions",
+                        "skipped_collisions": skipped,
+                        "hint": "all assertion lines already carry a user BP/logpoint",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
                 )
 
             for key, g in by_key.items():
@@ -5324,6 +5371,7 @@ async def debug_hypothesis(assertions: Optional[list] = None, phase: str = "arm"
                     "status": "armed",
                     "assertion_count": len(resolved),
                     "lines": sorted({r["line"] for r in resolved}),
+                    "skipped_collisions": skipped,  # M-5 (re-audit 260712)
                     "next": "trigger the code, then debug_hypothesis(phase='collect')",
                 },
                 ensure_ascii=False,
@@ -5337,55 +5385,59 @@ async def debug_hypothesis(assertions: Optional[list] = None, phase: str = "arm"
         if not h:
             return _error_json("no active hypothesis - call phase='arm' first", "no_hypothesis")
 
-        await logpoints.drain_active(timeout=2.0)
-
-        entries = _a5_read_entries(client._log_dir, getattr(client, "session_id", "unknown"), h["keys"], h["armed_log_lines"])
-
         per_assertion = []
         passed = failed = no_hit = inconclusive = hit = 0
 
-        for r in h["assertions"]:
-            matches = [en for en in entries if en["key"] == r["key"]]
-            fired = bool(matches)
-            hits = len(matches)
-            actual = matches[0]["values"].get(r["expr"]) if fired else None
-
-            if not fired:
-                verdict = "NO_HIT"
-                no_hit += 1
-            elif r["expr"] not in matches[0]["values"]:
-                verdict = "INCONCLUSIVE"
-                inconclusive += 1
-            elif r["expected"] is None:
-                verdict = "HIT"
-                hit += 1
-            elif _a5_eq(actual, r["expected"]):
-                verdict = "PASS"
-                passed += 1
-            else:
-                verdict = "FAIL"
-                failed += 1
-
-            per_assertion.append(
-                {
-                    "label": r["label"],
-                    "line": r["line"],
-                    "expr": r["expr"],
-                    "fired": fired,
-                    "hits": hits,
-                    "actual": actual,
-                    "expected": r["expected"],
-                    "verdict": verdict,
-                }
-            )
-
+        # Re-audit 260712: teardown in FINALLY (roadmap §8.8 op-rule 2) — an
+        # exception anywhere in collect (drain / JSONL read / judging) must not
+        # leave our logpoints armed (they'd fire silently on later runs and
+        # pollute the shared session JSONL).
         try:
-            _clear_logpoint_keys(client, h["keys"])
-            await client._push_bp_workspace()
-        except Exception:
-            log.warning("hypothesis collect: logpoint clear failed", exc_info=True)
+            await logpoints.drain_active(timeout=2.0)
 
-        client._hypothesis = None
+            entries = _a5_read_entries(client._log_dir, getattr(client, "session_id", "unknown"), h["keys"], h["armed_log_lines"])
+
+            for r in h["assertions"]:
+                matches = [en for en in entries if en["key"] == r["key"]]
+                fired = bool(matches)
+                hits = len(matches)
+                actual = matches[0]["values"].get(r["expr"]) if fired else None
+
+                if not fired:
+                    verdict = "NO_HIT"
+                    no_hit += 1
+                elif r["expr"] not in matches[0]["values"]:
+                    verdict = "INCONCLUSIVE"
+                    inconclusive += 1
+                elif r["expected"] is None:
+                    verdict = "HIT"
+                    hit += 1
+                elif _a5_eq(actual, r["expected"]):
+                    verdict = "PASS"
+                    passed += 1
+                else:
+                    verdict = "FAIL"
+                    failed += 1
+
+                per_assertion.append(
+                    {
+                        "label": r["label"],
+                        "line": r["line"],
+                        "expr": r["expr"],
+                        "fired": fired,
+                        "hits": hits,
+                        "actual": actual,
+                        "expected": r["expected"],
+                        "verdict": verdict,
+                    }
+                )
+        finally:
+            try:
+                _clear_logpoint_keys(client, h["keys"])
+                await client._push_bp_workspace()
+            except Exception:
+                log.warning("hypothesis collect: logpoint clear failed", exc_info=True)
+            client._hypothesis = None
 
         return json.dumps(
             {
@@ -5495,11 +5547,26 @@ async def debug_set_watchpoint(
         keys: set = set()
         lines_info: list = []
         lines_by_mod: list = []
+        skipped: list = []
+        # M-5-класс (re-audit 260712 F-1): не занимать строки с ЧУЖИМ logpoint'ом/BP —
+        # watch-гейт стоит ПЕРЕД logpoint-гейтом (чужой logpoint голодал бы), а наш
+        # teardown (_clear_logpoint_keys) снял бы чужой ключ. Паттерн A3/A5 arm.
+        existing_lp = set(getattr(client, "_logpoints", {}).keys())
+        existing_bp = {
+            (ce.get("object_id"), ce.get("property_id"), L)
+            for ce in getattr(client, "_set_breakpoints_cache", [])
+            for L in ce.get("lines", [])
+        }
         for a in assigns:
             adj_line, applied_offset = _apply_line_offset(
                 client, object_id, a["line"], property_id=pid
             )
             key = (object_id, pid, adj_line)
+            if key in existing_lp or key in existing_bp:
+                skipped.append(
+                    {"src_line": a["line"], "line": adj_line, "reason": "user_bp_or_logpoint"}
+                )
+                continue
             keys.add(key)
             client._watchpoints[key] = {
                 "name": name,
@@ -5512,6 +5579,17 @@ async def debug_set_watchpoint(
             lines_by_mod.append(adj_line)
             lines_info.append(
                 {"src_line": a["line"], "line": adj_line, "applied_offset": applied_offset, "text": a["text"]}
+            )
+        if not keys:
+            return json.dumps(
+                {
+                    "status": "no_watchable_lines",
+                    "name": name,
+                    "skipped_collisions": skipped,
+                    "hint": "all assignment lines already carry a user BP/logpoint",
+                },
+                ensure_ascii=False,
+                indent=2,
             )
         await client.set_breakpoints(
             module_type=xml_mt, object_id=object_id, property_id=pid, lines=lines_by_mod
@@ -5540,6 +5618,7 @@ async def debug_set_watchpoint(
                 "mode": mode,
                 "run_id": run_id,
                 "lines": lines_info,
+                "skipped_collisions": skipped,  # M-5 (re-audit 260712 F-1)
                 "next": "trigger the code, then debug_watchpoint_result()",
             },
             ensure_ascii=False,
@@ -6330,6 +6409,7 @@ async def debug_replay_list() -> str:
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
+    await _drain_snapshot_tasks()  # F-2: don't truncate the deferred tail
     sess = getattr(client, "session_id", None)
     snapshots = snapshot.list_snapshots(sess) if sess else []
     return json.dumps(
@@ -6360,6 +6440,7 @@ async def debug_replay_seek(index: int = -1, query: str = "") -> str:
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
+    await _drain_snapshot_tasks()  # F-2: don't truncate the deferred tail
     sess = getattr(client, "session_id", None)
     if query:
         if snapshot.parse_seek_query(query) is None:
