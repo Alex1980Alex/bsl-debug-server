@@ -264,9 +264,12 @@ class TestSrcFingerprint:
     def test_fingerprint_shape(self, synthetic_src, tmp_path):
         idx = UUIDIndex(config_src=synthetic_src, cache_path=tmp_path / "c.json")
         fp = idx._src_fingerprint()
-        assert set(fp) == {"max_mtime", "count", "total_size"}
+        # W5 added "roots" (main + extension src roots): its presence also
+        # invalidates every pre-W5 cache file via strict fingerprint equality.
+        assert set(fp) == {"max_mtime", "count", "total_size", "roots"}
         assert fp["count"] >= 2
         assert fp["total_size"] > 0
+        assert isinstance(fp["roots"], list) and fp["roots"]
 
     def test_fingerprint_none_when_src_missing(self, tmp_path):
         idx = UUIDIndex(config_src=tmp_path / "nope", cache_path=tmp_path / "c.json")

@@ -11,6 +11,20 @@ Verified 2026-05-10 against `Documents/гкс_ЛабораторныйАнали
 
 Performance: ~0.4s cold scan of 2541 MDO files → ~7848 UUIDs (~1.5MB RAM).
 Lazy-build at first call, optional disk cache by `src/` mtime.
+
+Extensions (W5, 2026-08-12): an EDT workspace holds the main project at
+`<ws>/Конфигурация/src` plus sibling extension projects at
+`<ws>/Конфигурация.<ExtName>/src`. RDBG addresses extension modules by
+objectID + extensionName — a BP without extensionName lands in the main
+config namespace and silently never fires. The index therefore scans all
+sibling extension roots too, tags their entries with `extension`, and
+exposes `extension_of()` so the debug server can auto-fill extensionName.
+On a UUID collision the MAIN config wins. Note (review 260812): in live EDT
+exports adopted objects carry their OWN uuid plus extendedConfigurationObject
+(not the base uuid), so cross-root collisions are a defensive edge case, not
+the norm; main-first simply guarantees pre-W5 behaviour for main-config BPs.
+Misattribution escape hatch: pass extension_name="" to the debug server's
+set_breakpoints/debug_set_breakpoint to force the main-config namespace.
 """
 
 from __future__ import annotations
@@ -87,6 +101,54 @@ DEFAULT_CONFIG_SRC = Path(
 )
 CACHE_PATH = Path(r"C:\1С-Framework\cache\edt_uuid_index.json")
 
+# W5: first <name>…</name> in an extension project's Configuration.mdo is the
+# extension name as the platform knows it (= РасширенияКонфигурации.Имя).
+_CONFIG_NAME_RE = re.compile(r"<name>([^<]+)</name>")
+
+
+def _extension_name_of(src_root: Path) -> Optional[str]:
+    """Platform extension name for an EDT extension project src root.
+
+    Reads `src/Configuration/Configuration.mdo` <name>; falls back to the
+    project dir suffix after the first dot (`Конфигурация.Foo` → `Foo`).
+    """
+    mdo = src_root / "Configuration" / "Configuration.mdo"
+    try:
+        m = _CONFIG_NAME_RE.search(mdo.read_text(encoding="utf-8", errors="ignore"))
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    except OSError:
+        pass
+    parent = src_root.parent.name
+    if "." in parent:
+        suffix = parent.split(".", 1)[1].strip()
+        return suffix or None
+    return None
+
+
+def _discover_extension_roots(config_src: Path) -> list[tuple[str, Path]]:
+    """Sibling EDT extension projects of a main-config src root.
+
+    `<ws>/Конфигурация/src` → every `<ws>/Конфигурация.<Ext>/src` that exists.
+    Sorted for deterministic scan order; empty on any FS trouble (fail-soft —
+    behaviour without extensions is exactly pre-W5).
+    """
+    roots: list[tuple[str, Path]] = []
+    try:
+        ws = config_src.parent.parent
+        if not ws.exists():
+            return []
+        for src in sorted(ws.glob("Конфигурация.*/src")):
+            if not src.is_dir():
+                continue
+            name = _extension_name_of(src)
+            if name:
+                roots.append((name, src))
+    except OSError:
+        return []
+    return roots
+
+
 # Captures: <ns:tag uuid="X"> on root — first match per file is the parent object
 _ROOT_RE = re.compile(
     r'<(?:mdclass:)?(\w+)\b[^>]*\suuid="([0-9a-f-]{36})"',
@@ -107,7 +169,14 @@ class UUIDIndex:
         self.config_src = Path(config_src) if config_src else DEFAULT_CONFIG_SRC
         self.cache_path = Path(cache_path) if cache_path else CACHE_PATH
         self._lock = threading.Lock()
-        # uuid (lowercase) → {"mdo": str, "name": str, "kind": str, "child_kind": str|None}
+        # W5: sibling extension projects; "" key = main config root.
+        self.extension_roots: list[tuple[str, Path]] = _discover_extension_roots(
+            self.config_src
+        )
+        self._roots_by_ext: dict[str, Path] = {"": self.config_src}
+        self._roots_by_ext.update(dict(self.extension_roots))
+        # uuid (lowercase) → {"mdo": str, "name": str, "kind": str,
+        #                     "child_kind": str|None, "extension": str (W5, ""=main)}
         self._index: Optional[dict[str, dict]] = None
         # C2 (roadmap §8.2): lazy reverse map fqn_lower → (object_id, module_type)
         self._reverse: Optional[dict] = None
@@ -124,23 +193,38 @@ class UUIDIndex:
         at most once per process (the result is memoised in self._index).
         """
         try:
-            if not self.config_src.exists():
+            if not self.config_src.exists() and not self.extension_roots:
                 return None
             max_mtime = 0.0
             count = 0
             total_size = 0
-            for mdo in self.config_src.rglob("*.mdo"):
-                try:
-                    st = mdo.stat()
-                except OSError:
+            for _ext, root in self._iter_roots():
+                if not root.exists():
                     continue
-                count += 1
-                total_size += st.st_size
-                if st.st_mtime > max_mtime:
-                    max_mtime = st.st_mtime
-            return {"max_mtime": max_mtime, "count": count, "total_size": total_size}
+                for mdo in root.rglob("*.mdo"):
+                    try:
+                        st = mdo.stat()
+                    except OSError:
+                        continue
+                    count += 1
+                    total_size += st.st_size
+                    if st.st_mtime > max_mtime:
+                        max_mtime = st.st_mtime
+            return {
+                "max_mtime": max_mtime,
+                "count": count,
+                "total_size": total_size,
+                # W5: adding/removing an extension project invalidates the cache
+                # even if its tree is empty; also invalidates every pre-W5 cache
+                # (old fingerprints lack this key → strict != → rebuild).
+                "roots": [f"{ext}={root}" for ext, root in self._iter_roots()],
+            }
         except OSError:
             return None
+
+    def _iter_roots(self) -> list[tuple[str, Path]]:
+        """Scan order: main config first, then extensions (main wins collisions)."""
+        return [("", self.config_src)] + list(self.extension_roots)
 
     def _load_cache(self, fingerprint: Optional[dict]) -> Optional[dict[str, dict]]:
         if not self.cache_path.exists():
@@ -169,42 +253,61 @@ class UUIDIndex:
             log.warning("UUID cache save failed (%s); will rebuild next run", e)
 
     def _scan(self) -> dict[str, dict]:
-        """Cold scan all .mdo files; returns entries dict."""
-        if not self.config_src.exists():
+        """Cold scan all .mdo files across main + extension roots.
+
+        setdefault everywhere: main config is scanned first and WINS cross-root
+        UUID collisions. Side effect (review 260812): a duplicate UUID WITHIN
+        one tree now resolves first-by-rglob-order (was: last-wins). Valid EDT
+        exports have no intra-tree duplicates, so this only affects corrupt
+        trees — deterministic either way.
+        """
+        if not self.config_src.exists() and not self.extension_roots:
             log.warning("Config src not found: %s — UUID index will be empty",
                         self.config_src)
             return {}
         entries: dict[str, dict] = {}
-        for mdo in self.config_src.rglob("*.mdo"):
-            try:
-                text = mdo.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
+        for ext_name, root in self._iter_roots():
+            if not root.exists():
+                if not ext_name:
+                    log.warning("Config src not found: %s — scanning extensions only",
+                                root)
                 continue
-            m = _ROOT_RE.search(text)
-            if not m:
-                continue
-            root_kind, root_uuid = m.group(1), m.group(2).lower()
-            try:
-                rel_mdo = str(mdo.relative_to(self.config_src))
-            except ValueError:
-                rel_mdo = str(mdo)
-            entries[root_uuid] = {
-                "mdo": rel_mdo,
-                "name": mdo.stem,
-                "kind": root_kind,
-                "child_kind": None,
-            }
-            for cm in _CHILD_RE.finditer(text):
-                child_kind = cm.group(1).lower()
-                child_uuid = cm.group(2).lower()
-                child_name = cm.group(3)
-                entries[child_uuid] = {
+            for mdo in root.rglob("*.mdo"):
+                try:
+                    text = mdo.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                m = _ROOT_RE.search(text)
+                if not m:
+                    continue
+                root_kind, root_uuid = m.group(1), m.group(2).lower()
+                try:
+                    rel_mdo = str(mdo.relative_to(root))
+                except ValueError:
+                    rel_mdo = str(mdo)
+                # W5: setdefault — main config scanned first and WINS a UUID
+                # collision (adopted-in-extension objects may share the base
+                # object's UUID; see module docstring).
+                entries.setdefault(root_uuid, {
                     "mdo": rel_mdo,
-                    "name": child_name,
+                    "name": mdo.stem,
                     "kind": root_kind,
-                    "child_kind": child_kind,
-                }
-        log.info("UUID index built: %d entries from %s", len(entries), self.config_src)
+                    "child_kind": None,
+                    "extension": ext_name,
+                })
+                for cm in _CHILD_RE.finditer(text):
+                    child_kind = cm.group(1).lower()
+                    child_uuid = cm.group(2).lower()
+                    child_name = cm.group(3)
+                    entries.setdefault(child_uuid, {
+                        "mdo": rel_mdo,
+                        "name": child_name,
+                        "kind": root_kind,
+                        "child_kind": child_kind,
+                        "extension": ext_name,
+                    })
+        log.info("UUID index built: %d entries from %s (+%d extension roots)",
+                 len(entries), self.config_src, len(self.extension_roots))
         return entries
 
     def _ensure_index(self) -> dict[str, dict]:
@@ -249,7 +352,7 @@ class UUIDIndex:
         )
         if file_name is None:
             return None
-        mdo_path = self.config_src / rec["mdo"]
+        mdo_path = self._root_of(rec) / rec["mdo"]
         obj_dir = mdo_path.parent
         if rec["child_kind"] == "forms":
             # FormModule UUID is on the form itself; obj_dir is parent's dir
@@ -263,6 +366,19 @@ class UUIDIndex:
         """Raw entry lookup (for diagnostics)."""
         idx = self._ensure_index()
         return idx.get(object_id.lower())
+
+    def _root_of(self, rec: dict) -> Path:
+        """W5: source root the entry was scanned from ("" / missing = main)."""
+        return self._roots_by_ext.get(rec.get("extension", "") or "", self.config_src)
+
+    def extension_for(self, object_id: str) -> str:
+        """W5: platform extension name owning this UUID ("" = main config).
+
+        Feeds RDBG `extensionName` in BSLModuleId — without it a BP on an
+        extension module registers against the main config and never fires.
+        """
+        rec = self.lookup(object_id)
+        return (rec or {}).get("extension", "") or ""
 
     def get_source_info(self, object_id: str, property_id: str) -> Optional[dict]:
         """P0.C: return {fqn, file_path, exists} for (oid, pid). None if unknown."""
@@ -287,13 +403,15 @@ class UUIDIndex:
             suffix = _PROP_FQN.get((property_id or "").lower(), "")
             fqn = f"{kind_ru}.{rec['name']}" + (f".{suffix}" if suffix else "")
         try:
-            rel_path = str(path.relative_to(self.config_src)) if path else None
+            rel_path = str(path.relative_to(self._root_of(rec))) if path else None
         except (ValueError, AttributeError):
             rel_path = str(path) if path else None
         return {
             "fqn": fqn,
             "file_path": rel_path,
             "exists": bool(path and path.exists()),
+            # W5: "" = main config; non-empty = extension owning the module
+            "extension": rec.get("extension", "") or "",
         }
 
     def find_by_fqn(self, module_fqn: str) -> Optional[tuple]:
@@ -369,14 +487,45 @@ def set_active_config(alias: Optional[str]) -> None:
     _active_alias = alias
 
 
+# W5: root under which EDT workspaces live, named by infobase alias
+# (module-level so tests can monkeypatch it — review 260812).
+_WORKSPACE_PARENT = DEFAULT_CONFIG_SRC.parent.parent.parent
+
+
+def _workspace_candidate(alias: str) -> Optional[Path]:
+    """W5: derive an EDT workspace src root from the repo convention
+    `<repo>/<alias>/Конфигурация/src` (e.g. DEV_TAV_01_mss-dev1c02). Accepted
+    when the main src exists OR the workspace holds extension projects —
+    the latter covers workspaces where only extensions are exported.
+
+    The alias must be a single plain path segment: `:` is rejected too
+    (review 260812 — `Path(base) / "C:"` DISCARDS base on Windows, making the
+    candidate CWD-dependent), as are NUL and traversal characters. 1C cluster
+    infobase names never contain any of these.
+    """
+    if not alias or any(ch in alias for ch in ("/", "\\", ":", "\x00")) or ".." in alias:
+        return None
+    ws = _WORKSPACE_PARENT / alias
+    candidate = ws / "Конфигурация" / "src"
+    try:
+        if candidate.exists() or any(ws.glob("Конфигурация.*/src")):
+            return candidate
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def get_index_for_alias(alias: Optional[str]) -> UUIDIndex:
-    """UUIDIndex for infobase `alias`. A mapped alias gets a dedicated index
-    (its own cache file); everything else reuses the default singleton, so
-    behaviour is unchanged when BSL_DEBUG_CONFIG_SRC_MAP is unset."""
+    """UUIDIndex for infobase `alias`. Resolution order: explicit
+    BSL_DEBUG_CONFIG_SRC_MAP entry > repo-convention workspace autodiscovery
+    (W5, `<repo>/<alias>/Конфигурация/src`) > default singleton. Mapped and
+    autodiscovered aliases get dedicated indexes (own cache files)."""
     if not alias:
         return get_default_index()
     config_src = _parse_config_src_map().get(alias)
     if config_src is None:
+        config_src = _workspace_candidate(alias)
+    if config_src is None or config_src == DEFAULT_CONFIG_SRC:
         return get_default_index()
     key = str(config_src)
     with _alias_lock:
@@ -401,6 +550,13 @@ def get_source_info(object_id: str, property_id: str,
     return get_index_for_alias(
         alias if alias is not None else _active_alias
     ).get_source_info(object_id, property_id)
+
+
+def extension_of(object_id: str, alias: Optional[str] = None) -> str:
+    """W5: extension name owning `object_id` ("" = main config / unknown)."""
+    return get_index_for_alias(
+        alias if alias is not None else _active_alias
+    ).extension_for(object_id)
 
 
 def _reverse_fqn_entries(entries: dict) -> dict:

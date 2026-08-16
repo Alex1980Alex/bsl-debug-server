@@ -92,6 +92,22 @@ def _resolve_property_id(module_type: str, property_id: str = "") -> tuple[str, 
     return module_type, property_id
 
 
+def _auto_extension(object_id: str, alias: Optional[str] = None) -> str:
+    """W5 (2026-08-12): extension name owning `object_id` ("" = main config).
+
+    RDBG addresses extension modules by objectID + extensionName in
+    BSLModuleId — a BP without extensionName registers against the MAIN
+    config namespace and silently never fires (live incident: BP in
+    SodruEDExhangeRulesAcc30 common module, DEV_TAV_01). Resolved via
+    uuid_index multi-root workspace scan; fail-soft to "" so main-config
+    BPs behave exactly as before.
+    """
+    try:
+        return uuid_index.extension_of(object_id, alias=alias) or ""
+    except Exception:
+        return ""
+
+
 def _line_offset_key(object_id: str, property_id: str) -> tuple[str, str]:
     """H-6 (audit 260710): line-offset cache key. ObjectModule / ManagerModule /
     RecordSetModule of one object SHARE the object_id (they differ only by
@@ -162,6 +178,56 @@ def _auto(tag: str, text: str = "") -> str:
 
 def _bp(tag: str, text: str = "") -> str:
     return f"<debugBreakpoints:{tag}>{text}</debugBreakpoints:{tag}>"
+
+
+def _normalize_extension_module_type(module_type: str, extension_name: str) -> str:
+    """W5: extension-owned modules are addressed as ExtensionModule on the wire.
+
+    Live callStackFormed frames (DEV_TAV, 2026-08-12) show the platform itself
+    uses type=ExtensionModule + extensionName; the A/B check demonstrated that
+    ConfigModule+extensionName alone does NOT fire. Shared by set_breakpoints
+    and the calibrate keep-nearest fallback (review 260812: the fallback used
+    to append the pre-conversion type straight into the cache — a dead BP).
+    """
+    if extension_name and module_type == "ConfigModule":
+        return "ExtensionModule"
+    return module_type
+
+
+def _module_id_xml(
+    module_type: str,
+    object_id: str,
+    property_id: str,
+    url: str = "",
+    extension_name: str = "",
+    ext_id: int = 0,
+    version: str = "",
+) -> str:
+    """W5: serialize BSLModuleIdInternal for 8.3.27 dbgs.
+
+    Field order: type, objectID, propertyID, then optional trailing
+    url/extensionName/extId/version, empties omitted. This is the legacy
+    builder shape — PROVEN accepted by the server (main-config BPs fire,
+    live DEV_TAV 2026-08-12). The vendored debugBaseData.xsd prescribes
+    extensionName BEFORE objectID with mandatory empty URL/extId; live A/B
+    of that shape was inconclusive (runs were polluted by the RC1
+    pre-existing-rphost condition — see roadmap 260812), so we keep the
+    shape that demonstrably works and carry extensionName/version as
+    trailing optionals, mirroring how callStackFormed frames omit them.
+    """
+    xml = _base("type", module_type)
+    xml += _base("objectID", object_id) + _base("propertyID", property_id)
+    if url:
+        xml += _base("url", _escape_xml(url))
+    if extension_name:
+        # Platform extension names cannot contain XML specials, but the
+        # directory-suffix fallback in uuid_index could — escape defensively.
+        xml += _base("extensionName", _escape_xml(extension_name))
+    if ext_id:
+        xml += _base("extId", str(ext_id))
+    if version:
+        xml += _base("version", _escape_xml(version))
+    return xml
 
 
 def _rte(tag: str, text: str = "") -> str:
@@ -295,6 +361,11 @@ class RDBGClient:
         self._stop_reason_by_target: dict[str, str] = {}  # "breakpoint" | "step" | "exception"
         self._last_exception_by_target: dict[str, dict] = {}
         self._known_attached_targets: set[str] = set()  # idempotency for auto-attach
+        # W5 (2026-08-12): extensionName → version hash, harvested from live
+        # callStackFormed frames (type=ExtensionModule carries the extension's
+        # own version). Used to stamp `version` on extension-module BPs; ""
+        # until the first stop that touches the extension.
+        self._extension_versions: dict[str, str] = {}
         # M-1 (audit 260710): user-visible stops = targets that PASSED the suppress
         # gates (logpoint/coverage/hit-condition/exception-filter). `_stopped_targets`
         # is populated BEFORE those gates, so a suppressed (draining) stop transiently
@@ -1035,6 +1106,8 @@ class RDBGClient:
             elif isinstance(stack_raw, dict):
                 stack = [stack_raw]
             self._last_stack_by_target[target_id] = stack
+            if self._harvest_extension_versions(stack):
+                await self._refresh_extension_bp_versions()
             stop_by_bp = str(cmd.get("stopByBP", "")).lower() == "true"
             self._stop_reason_by_target[target_id] = "breakpoint" if stop_by_bp else "step"
             log.info(
@@ -1162,6 +1235,8 @@ class RDBGClient:
                 else []
             )
             self._last_stack_by_target[target_id] = stack
+            if self._harvest_extension_versions(stack):
+                await self._refresh_extension_bp_versions()
             self._stop_reason_by_target[target_id] = "exception"
             exc = cmd.get("exception")
             if isinstance(exc, dict):
@@ -1991,19 +2066,15 @@ class RDBGClient:
         """
         module_bp_infos: list = []
         for entry in self._set_breakpoints_cache:
-            mod_xml = (
-                _base("type", entry["module_type"])
-                + _base("objectID", entry["object_id"])
-                + _base("propertyID", entry["property_id"])
+            mod_xml = _module_id_xml(
+                entry["module_type"],
+                entry["object_id"],
+                entry["property_id"],
+                url=entry.get("url", ""),
+                extension_name=entry.get("extension_name", ""),
+                ext_id=entry.get("ext_id", 0),
+                version=entry.get("version", ""),
             )
-            if entry.get("url"):
-                mod_xml += _base("url", entry["url"])
-            if entry.get("extension_name"):
-                mod_xml += _base("extensionName", entry["extension_name"])
-            if entry.get("ext_id"):
-                mod_xml += _base("extId", str(entry["ext_id"]))
-            if entry.get("version"):
-                mod_xml += _base("version", entry["version"])
             # Preserve per-entry condition on re-apply (review PR#1 #2): use the
             # shared _build_bp_info_xml helper so conditional BPs do not silently
             # revert to unconditional during targetStarted / HMR-recovery re-apply.
@@ -2050,6 +2121,66 @@ class RDBGClient:
             key = (object_id, property_id, int(ln))
             self._logpoints[key] = template
 
+    def _harvest_extension_versions(self, stack: list) -> bool:
+        """W5: remember extension version hashes seen in live stack frames.
+
+        Frames of extension modules carry
+        `moduleID: {type: ExtensionModule, extensionName, version}` — the only
+        place the platform reveals the extension's version hash over RDBG.
+        Stashed per extension so subsequent set_breakpoints can stamp it.
+        Returns True when a new/changed version was learned (caller then
+        refreshes the BP workspace). Fail-soft: malformed frames are skipped.
+        """
+        learned = False
+        for frame in stack or []:
+            try:
+                mid = frame.get("moduleID") or {}
+                ext = mid.get("extensionName") or ""
+                ver = mid.get("version") or ""
+                if ext and ver and self._extension_versions.get(ext) != ver:
+                    self._extension_versions[ext] = ver
+                    learned = True
+            except AttributeError:
+                continue
+        return learned
+
+    def _restamp_extension_version(self, extension_name: str, version: str) -> bool:
+        """W5: bring every cached BP of `extension_name` to `version`.
+
+        Returns True if anything changed. Pure cache mutation — callers decide
+        whether to re-push. Shared by the set_breakpoints path (keeps one
+        aggregation group per module) and the post-stop refresh below.
+        """
+        changed = False
+        for entry in self._set_breakpoints_cache:
+            if (entry.get("extension_name") or "") != extension_name:
+                continue
+            if entry.get("version") != version:
+                entry["version"] = version
+                changed = True
+        return changed
+
+    async def _refresh_extension_bp_versions(self) -> None:
+        """W5: re-stamp cached extension BPs with freshly learned versions.
+
+        BPs set BEFORE the first stop go out with version="" (nothing to learn
+        from yet). Once a stop reveals the extension's version hash, update the
+        cached workspace entries and re-push — while the target is still
+        halted, so the corrected BPs are live before Continue.
+        """
+        changed = False
+        for ext, ver in self._extension_versions.items():
+            if ext and ver and self._restamp_extension_version(ext, ver):
+                changed = True
+        if changed:
+            try:
+                await self._reapply_bp_workspace()
+            except Exception as e:  # fail-soft: next explicit set re-pushes anyway
+                log.warning("W5 BP version refresh failed: %s", e)
+        # Persist the freshly learned versions so they survive an HMR restart
+        # (called on learned=True regardless of whether any BP entry changed).
+        _persist_active_session(self)
+
     async def set_breakpoints(
         self,
         module_type: str,
@@ -2058,7 +2189,7 @@ class RDBGClient:
         lines: list[int],
         ext_id: int = 0,
         url: str = "",
-        extension_name: str = "",
+        extension_name: Optional[str] = None,
         version: str = "",
         condition: str = "",
         hit_condition: str = "",
@@ -2083,6 +2214,34 @@ class RDBGClient:
         # await it FIRST — else its empty REPLACE could land after this BP and wipe
         # it (setBreakpoints REPLACES the whole workspace).
         await self._drain_hmr_clear()
+        # W5 (2026-08-12): central extensionName auto-fill — ALL nine BP-setting
+        # entry points (set_breakpoint / logpoint / watchpoint / calibrate /
+        # coverage / autotrace / hypothesis / trace_variable / held_job) funnel
+        # here, so resolving once at the protocol boundary covers them all.
+        # Semantics (review 260812): None = auto-resolve via uuid_index,
+        # ""   = EXPLICIT main config — auto-resolve suppressed (opt-out for
+        #        misattributed UUIDs, e.g. adopted objects in extension-only
+        #        workspaces where the index has no main root to win with).
+        if extension_name is None:
+            extension_name = _auto_extension(
+                object_id, getattr(self, "infobase_alias", None)
+            )
+        if extension_name:
+            # Live callStackFormed frames show how the platform itself addresses
+            # extension modules: type=ExtensionModule (NOT ConfigModule) + the
+            # extension's own version hash. A/B live check (DEV_TAV, 2026-08-12):
+            # ConfigModule+extensionName alone does NOT fire; the main-config BP
+            # on the same run does.
+            module_type = _normalize_extension_module_type(module_type, extension_name)
+            if not version:
+                version = self._extension_versions.get(extension_name, "")
+            if version:
+                # `version` is part of the _aggregate_breakpoints key, so a BP set
+                # BEFORE the version was learned and one set AFTER would split the
+                # SAME module into two moduleBPInfo groups — and the version-less
+                # group carries the shape that does not fire. Up-stamp the whole
+                # extension so aggregation keeps one group per module.
+                self._restamp_extension_version(extension_name, version)
         # Fix #5 (live finding 2026-05-10): RDBG setBreakpoints REPLACES the
         # workspace each call. Aggregating cache + new entry → submit FULL
         # workspace XML с multiple moduleBPInfo, иначе предыдущие BPs теряются.
@@ -2104,20 +2263,30 @@ class RDBGClient:
         groups = _aggregate_breakpoints(self._set_breakpoints_cache, new_entry)
         module_bp_infos: list = []
         for (mt, oid, pid, eid, url_, ext_, ver_), bp_lines in groups.items():
-            mod_xml = _base("type", mt) + _base("objectID", oid) + _base("propertyID", pid)
-            if url_:
-                mod_xml += _base("url", url_)
-            if ext_:
-                mod_xml += _base("extensionName", ext_)
-            if eid:
-                mod_xml += _base("extId", str(eid))
-            if ver_:
-                mod_xml += _base("version", ver_)
+            mod_xml = _module_id_xml(
+                mt, oid, pid,
+                url=url_, extension_name=ext_, ext_id=eid, version=ver_,
+            )
             bp_xml = "".join(_build_bp_info_xml(L, cond) for L, cond in bp_lines.items())
             module_bp_infos.append(_bp("moduleBPInfo", _bp("id", mod_xml) + bp_xml))
         workspace_xml = _rdbg("bpWorkspace", "".join(module_bp_infos))
         body = _build_request(self._base_fields(), workspace_xml)
         root = await self._post("setBreakpoints", body)
+        # W5 diagnostic (opt-in): wire-dump setBreakpoints request/response to
+        # correlate silent BP drops with the exact XML shape. Enable with
+        # BSL_DEBUG_WIRE_DUMP=1; keeps the extension-BP investigation
+        # reproducible (roadmap 260812) at zero default cost.
+        import os
+        if os.environ.get("BSL_DEBUG_WIRE_DUMP", "") == "1":
+            try:
+                import time as _wire_ts
+                _dump = Path(__file__).parent / "data" / "debug_logs" / "bp_wire.log"
+                _dump.parent.mkdir(parents=True, exist_ok=True)
+                with open(_dump, "a", encoding="utf-8") as fh:
+                    fh.write(f"--- setBreakpoints {_wire_ts.time():.0f} ---\n{body}\n"
+                             f"--- response ---\n{ET.tostring(root, encoding='unicode') if root is not None else 'None'}\n")
+            except Exception:
+                pass
         # Reconcile cache from groups (consolidates duplicate entries и
         # сохраняет full state для следующего set call).
         self._set_breakpoints_cache = [
@@ -2189,6 +2358,12 @@ def _get_client() -> RDBGClient:
             # A6.3: restore correlation id across HMR restart.
             if state.get("correlation_id"):
                 _client._correlation_id = state["correlation_id"]
+            # W5: restore harvested extension version hashes.
+            ev = state.get("extension_versions")
+            if isinstance(ev, dict):
+                _client._extension_versions = {
+                    str(k): str(v) for k, v in ev.items() if k and v
+                }
             try:
                 # FastMCP tool handlers run inside an active event loop, so
                 # asyncio.get_running_loop() succeeds here. RuntimeError only
@@ -3591,6 +3766,10 @@ def _persist_active_session(client: "RDBGClient") -> None:
         # artifact trail (logpoint/watch JSONL, snapshot, coverage, summary) stays
         # groupable by one id across the whole task.
         "correlation_id": getattr(client, "_correlation_id", None),
+        # W5: extension version hashes survive HMR restart — they are learnable
+        # only from a live stop, so losing them would force an extra
+        # stop-and-harvest round before extension BPs get their version stamp.
+        "extension_versions": dict(getattr(client, "_extension_versions", {}) or {}),
     }
     try:
         os.makedirs(os.path.dirname(_ACTIVE_SESSION_PATH) or ".", exist_ok=True)
@@ -4970,6 +5149,7 @@ async def debug_set_breakpoint(
     condition: str = "",
     hit_condition: str = "",
     apply_offset: bool = True,
+    extension_name: Optional[str] = None,
 ) -> str:
     """Set a breakpoint in a BSL module.
 
@@ -4978,6 +5158,8 @@ async def debug_set_breakpoint(
     - `hit_condition`: VS Code DAP syntax `>N`/`>=N`/`<N`/`<=N`/`=N`/`%N`
       (wrapper enforce'ит counter в _handle_command, auto-Continue if не satisfied).
 
+    W5 (2026-08-12): extension modules supported.
+
     Args:
         object_id: UUID of metadata object.
         property_id: Optional explicit propertyID UUID. Auto-resolves from module_type.
@@ -4985,10 +5167,20 @@ async def debug_set_breakpoint(
         module_type: CommonModule|ManagerModule|ObjectModule|RecordSetModule|FormModule|CommandModule.
         condition: BSL conditional expression (e.g. `Контрагент.ИНН = "1234567890"`).
         hit_condition: hit-count predicate `>N`/`%N`/`=N`.
+        extension_name: configuration extension owning the module. Omit/None =
+            auto-resolve via uuid_index (multi-root EDT workspace scan);
+            "" = FORCE main config (suppress auto-resolve — opt-out for a
+            misattributed UUID); non-empty = explicit extension name.
     """
     client = _get_client()
     if not client._attached:
         return json.dumps({"error": "Not connected. Call debug_connect first."})
+    # W5: resolve here (not only inside set_breakpoints) so the response can
+    # honestly report which namespace the BP was registered against.
+    if extension_name is None:
+        extension_name = _auto_extension(
+            object_id, getattr(client, "infobase_alias", None)
+        )
     # Auto-resolve propertyID from MODULE_PROPERTY_IDS when zero/empty (RDBG silently
     # ignores BPs with zero propertyID — see cache/dbgs-rdbg-debug-server.md §11).
     # Re-attach moved out: debug_connect handles initial attach; повторный attach
@@ -5009,6 +5201,7 @@ async def debug_set_breakpoint(
         object_id=object_id,
         property_id=property_id,
         lines=[line],
+        extension_name=extension_name,
         condition=condition,
         hit_condition=hit_condition,
     )
@@ -5020,6 +5213,7 @@ async def debug_set_breakpoint(
             "line": line,
             "applied_offset": applied_offset,
             "module_type": module_type,
+            "extension_name": extension_name,
             "response": result,
             "location": _classify_bp_line(object_id, property_id, module_type, requested_line),
         },
@@ -6339,17 +6533,29 @@ async def debug_calibrate_result(
                     if not cache_entry["lines"]:
                         client._set_breakpoints_cache.remove(cache_entry)
             if keep_bp_on_nearest and nearest is not None and not nearest_kept:
-                # кэш мог не содержать веер (HMR-restart) — создаём запись явно
+                # кэш мог не содержать веер (HMR-restart) — создаём запись явно.
+                # W5 (review 260812): keep the nearest-BP in the module's own
+                # namespace — this branch bypasses set_breakpoints(), so the
+                # ConfigModule→ExtensionModule conversion and the version stamp
+                # must be applied here too; the pre-review code appended the
+                # pre-conversion type and produced a documented-dead BP shape.
+                _kept_ext = _auto_extension(
+                    oid, getattr(client, "infobase_alias", None)
+                )
                 client._set_breakpoints_cache.append(
                     {
-                        "module_type": meta["xml_module_type"],
+                        "module_type": _normalize_extension_module_type(
+                            meta["xml_module_type"], _kept_ext
+                        ),
                         "object_id": oid,
                         "property_id": pid,
                         "lines": [nearest],
                         "ext_id": 0,
                         "url": "",
-                        "extension_name": "",
-                        "version": "",
+                        "extension_name": _kept_ext,
+                        "version": client._extension_versions.get(_kept_ext, "")
+                        if _kept_ext
+                        else "",
                         "condition": "",
                     }
                 )
